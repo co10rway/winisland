@@ -482,24 +482,20 @@ pub fn run() {
             })
         });
 
-        // OLE 拖放要求调用线程已初始化 COM 为 STA。主线程此前从未初始化，
-        // 导致 RegisterDragDrop 静默失败、文件根本拖不进来。
-        // CoInitializeEx(APARTMENTTHREADED) 等效于 OleInitialize，满足拖放/剪贴板要求；
-        // S_FALSE（已初始化）同样可接受。audio.rs 的 MTA 初始化在独立采样线程，与此不冲突。
-        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        // OLE 拖放必须在注册线程调用 OleInitialize（它比 CoInitializeEx 多初始化
+        // OLE 拖放/剪贴板所需的设施）。主线程此前从未初始化 COM，
+        // 导致 RegisterDragDrop 静默失败、光标显示"禁止"、文件根本拖不进来。
+        // 注意：audio.rs 的 CoInitializeEx(MTA) 在独立采样线程，与此不冲突。
+        match windows::Win32::System::Ole::OleInitialize(None) {
+            Ok(()) => diag_log("OleInitialize: OK"),
+            Err(e) => diag_log(&format!("OleInitialize: 失败 {:?}", e)),
+        }
 
         DragAcceptFiles(hwnd, false); // 我们使用 OLE 拖放
         if let Err(e) = ui::register_ole_drop(hwnd) {
-            // 注册失败时落盘一行日志，便于排查「文件拖不进来」（GUI 无控制台）
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(data_dir().join("error.log"))
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[{}] RegisterDragDrop 失败: {:?}", files::now_unix(), e);
-                    Ok(())
-                });
+            diag_log(&format!("RegisterDragDrop 失败: {:?}", e));
+        } else {
+            diag_log("RegisterDragDrop: OK");
         }
 
         // 启动时先判一次遮挡：面板区域已被窗口压住就直接以小黑条出现，
@@ -1227,6 +1223,20 @@ fn ensure_topmost(app: &App) {
             );
         }
     }
+}
+
+/// 诊断日志：追加到 %APPDATA%\WinIsland\drag.log（GUI 程序无控制台）。
+/// 用于排查拖放问题，仅在拖放相关路径调用，平时不产生噪音。
+pub fn diag_log(msg: &str) {
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir().join("drag.log"))
+        .and_then(|mut f| {
+            use std::io::Write;
+            let _ = writeln!(f, "[{}] {}", files::now_unix(), msg);
+            Ok(())
+        });
 }
 
 pub fn redraw() {
@@ -2190,6 +2200,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CLIPBOARDUPDATE => {
             on_clipboard_update();
+            LRESULT(0)
+        }
+        // OLE 拖放回调通过消息把 UI 操作切回主线程（回调里严禁同步重绘）
+        ui::WM_DRAG_ENTER => {
+            set_drag_hover(true);
+            LRESULT(0)
+        }
+        ui::WM_DRAG_LEAVE => {
+            set_drag_hover(false);
+            LRESULT(0)
+        }
+        ui::WM_DROP_FILES => {
+            // lParam 是在 OLE 回调里 Box 出来的路径列表堆指针，这里接管并释放
+            let paths = lparam.0 as *mut Vec<String>;
+            if !paths.is_null() {
+                let list = unsafe { Box::from_raw(paths) };
+                for path in list.iter() {
+                    push_file_external(path.clone());
+                }
+            }
+            set_drag_hover(false);
             LRESULT(0)
         }
         WM_SETCURSOR => {

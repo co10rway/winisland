@@ -1,8 +1,11 @@
 //! UI：胶囊态 + 展开面板的布局、绘制与命中测试
 
-use windows::Win32::Foundation::{HWND, POINTL, RECT};
-use windows::Win32::System::Ole::{IDropTarget, IDropTarget_Impl, RegisterDragDrop, RevokeDragDrop, DROPEFFECT};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use windows::Win32::Foundation::{HWND, LPARAM, POINTL, RECT, WPARAM};
+use windows::Win32::System::Ole::{IDropTarget, IDropTarget_Impl, RegisterDragDrop, RevokeDragDrop, DROPEFFECT, DROPEFFECT_COPY};
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 use windows::core::{implement, Ref};
 
 use crate::anim::mix;
@@ -1242,36 +1245,65 @@ fn pager_btn(cv: &mut Canvas, x: f32, y: f32, sz: f32, left: bool, enabled: bool
 
 // ---------------- OLE 拖放（文件中转站）----------------
 
+/// OLE 拖放回调所在线程发往主窗口的自定义消息（TRAY_MSG 已占 WM_APP+1）。
+/// 关键：绝不能在 OLE 回调里直接重绘（D2D + UpdateLayeredWindow 很慢，
+/// 会阻塞拖放循环、导致系统判定为拒绝并显示"禁止"光标），
+/// 必须 PostMessage 到主线程消息循环再处理。
+pub const WM_DRAG_ENTER: u32 = WM_APP + 2;
+pub const WM_DRAG_LEAVE: u32 = WM_APP + 3;
+pub const WM_DROP_FILES: u32 = WM_APP + 4;
+
+thread_local! {
+    /// 必须持有 IDropTarget 强引用直到 RevokeDragDrop ——
+    /// RegisterDragDrop 不会 AddRef，局部变量释放后系统内指针悬空，
+    /// 拖放直接失效（"禁止"光标、不触发 DragEnter）。这是上一版失效的根因。
+    static DROP_TARGET: RefCell<Option<IDropTarget>> = const { RefCell::new(None) };
+}
+static DROP_HWND: AtomicIsize = AtomicIsize::new(0);
+
 #[implement(IDropTarget)]
 struct DropTarget;
 
+/// 把自定义消息投递到主窗口；HWND 存原子量避免回调里访问 thread_local APP。
+fn post_drag_msg(msg: u32) {
+    let h = DROP_HWND.load(Ordering::Acquire);
+    if h != 0 {
+        unsafe {
+            let _ = PostMessageW(Some(HWND(h as *mut _)), msg, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
 impl IDropTarget_Impl for DropTarget_Impl {
     fn DragEnter(&self, _pdataobj: Ref<'_, windows::Win32::System::Com::IDataObject>, _grfkeystate: MODIFIERKEYS_FLAGS, _pt: &POINTL, pdweffect: *mut DROPEFFECT) -> windows::core::Result<()> {
-        unsafe { *pdweffect = DROPEFFECT(1) }; // DROPEFFECT_COPY
-        // 文件拖到岛上：自动展开中转站页 + 高亮（幂等）
-        crate::app::set_drag_hover(true);
+        // 告诉系统接受复制操作 —— 光标从"禁止"变为"复制"
+        unsafe { *pdweffect = DROPEFFECT_COPY };
+        crate::app::diag_log("DragEnter: 接受拖放");
+        post_drag_msg(WM_DRAG_ENTER);
         Ok(())
     }
     fn DragOver(&self, _grfkeystate: MODIFIERKEYS_FLAGS, _pt: &POINTL, pdweffect: *mut DROPEFFECT) -> windows::core::Result<()> {
-        unsafe { *pdweffect = DROPEFFECT(1) };
-        // 某些情况下 DragLeave 未触发但仍需维持高亮；幂等，无副作用
-        crate::app::set_drag_hover(true);
+        unsafe { *pdweffect = DROPEFFECT_COPY };
         Ok(())
     }
     fn DragLeave(&self) -> windows::core::Result<()> {
-        // 文件拖离岛屿：取消高亮
-        crate::app::set_drag_hover(false);
+        crate::app::diag_log("DragLeave: 取消高亮");
+        post_drag_msg(WM_DRAG_LEAVE);
         Ok(())
     }
     fn Drop(&self, pdataobj: Ref<'_, windows::Win32::System::Com::IDataObject>, _grfkeystate: MODIFIERKEYS_FLAGS, _pt: &POINTL, pdweffect: *mut DROPEFFECT) -> windows::core::Result<()> {
         use windows::Win32::System::Com::{FORMATETC, DVASPECT_CONTENT, TYMED_HGLOBAL};
         use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
         use windows::Win32::System::Ole::ReleaseStgMedium;
-        unsafe { *pdweffect = DROPEFFECT(1) };
+        unsafe { *pdweffect = DROPEFFECT_COPY };
         let obj = match pdataobj.ok() {
             Ok(o) => o,
-            Err(_) => return Ok(()),
+            Err(e) => {
+                crate::app::diag_log(&format!("Drop: IDataObject 无效 {:?}", e));
+                return Ok(());
+            }
         };
+        let mut paths: Vec<String> = Vec::new();
         unsafe {
             let fmt = FORMATETC {
                 cfFormat: 15, // CF_HDROP
@@ -1282,10 +1314,14 @@ impl IDropTarget_Impl for DropTarget_Impl {
             };
             let mut medium = match obj.GetData(&fmt) {
                 Ok(m) => m,
-                Err(_) => return Ok(()),
+                Err(e) => {
+                    crate::app::diag_log(&format!("Drop: GetData(CF_HDROP) 失败 {:?}", e));
+                    return Ok(());
+                }
             };
             let hdrop = HDROP(medium.u.hGlobal.0);
             let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
+            crate::app::diag_log(&format!("Drop: 收到 {} 个文件", count));
             for i in 0..count {
                 let len = DragQueryFileW(hdrop, i, None) as usize;
                 if len == 0 {
@@ -1294,13 +1330,24 @@ impl IDropTarget_Impl for DropTarget_Impl {
                 let mut buf = vec![0u16; len + 1];
                 let n = DragQueryFileW(hdrop, i, Some(&mut buf)) as usize;
                 buf.truncate(n);
-                let path = String::from_utf16_lossy(&buf);
-                crate::app::push_file_external(path);
+                paths.push(String::from_utf16_lossy(&buf));
             }
             ReleaseStgMedium(&mut medium);
         }
-        // 松手后取消拖入高亮
-        crate::app::set_drag_hover(false);
+        // 解析结果交给主线程处理（用 Box 传堆指针，避免回调里重绘/长时间占用）
+        if !paths.is_empty() {
+            let boxed = Box::new(paths);
+            let ptr = Box::into_raw(boxed) as isize;
+            let h = DROP_HWND.load(Ordering::Acquire);
+            if h != 0 {
+                unsafe {
+                    let _ = PostMessageW(Some(HWND(h as *mut _)), WM_DROP_FILES, WPARAM(0), LPARAM(ptr));
+                }
+            } else {
+                unsafe { drop(Box::from_raw(ptr as *mut Vec<String>)); }
+            }
+        }
+        post_drag_msg(WM_DRAG_LEAVE);
         Ok(())
     }
 }
@@ -1309,6 +1356,9 @@ pub fn register_ole_drop(hwnd: HWND) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         let dt: IDropTarget = DropTarget.into();
         RegisterDragDrop(hwnd, &dt)?;
+        // 关键：持有强引用到 RevokeDragDrop，防止 COM 对象被释放导致悬空指针
+        DROP_TARGET.with(|c| *c.borrow_mut() = Some(dt));
+        DROP_HWND.store(hwnd.0 as isize, Ordering::Release);
     }
     Ok(())
 }
@@ -1317,6 +1367,8 @@ pub fn revoke_ole_drop(hwnd: HWND) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         RevokeDragDrop(hwnd)?;
     }
+    DROP_TARGET.with(|c| *c.borrow_mut() = None);
+    DROP_HWND.store(0, Ordering::Release);
     Ok(())
 }
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.1 — 2026-11-17
+
+### 修复
+- **文件中转站拖放完全失效（禁止光标 / 拖不进 / 不自动展开）**：三个叠加根因一次性修复。
+  1. `IDropTarget` 是局部变量，`RegisterDragDrop` 返回后被释放导致系统内 COM 指针悬空（MSDN 要求调用方持有到 `RevokeDragDrop`）——改为全局强引用持有。
+  2. 主线程 COM 初始化改用 `OleInitialize`（拖放专用），替代不够用的 `CoInitializeEx`。
+  3. OLE 回调里同步重绘会阻塞拖放循环——改为 `PostMessage` 把 UI 操作切回主线程，回调只设置 `DROPEFFECT_COPY` 让光标变"复制"。
+- 拖放关键路径写入 `%APPDATA%\WinIsland\drag.log`（初始化/注册/DragEnter/Drop 文件数），便于实机排查。
+
 ## 0.6.0 — 2026-11-17
 
 ### 新增 / 增强
