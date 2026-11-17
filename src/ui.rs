@@ -446,20 +446,20 @@ fn pill_bar_w() -> f32 {
 fn pill_nu_gap() -> f32 {
     s(2.0)
 }
-/// 时长分段之间（H / M / S）的间距
+/// 时长分段之间（时 / 分 / 秒）的间距
 fn pill_seg_gap() -> f32 {
-    s(3.0)
+    s(1.5)
 }
 /// 中文标签与数值之间的间距
 fn pill_label_gap() -> f32 {
-    s(6.0)
+    s(3.0)
 }
 
 impl PillValue {
     /// 值区估算宽度（与绘制保持一致，略偏保守）
     fn width(&self) -> f32 {
         match self {
-            PillValue::Plain(v, _) => text_w(v, 13.0) * 1.25 + s(8.0),
+            PillValue::Plain(v, _) => text_w(v, 13.0) + s(6.0),
             PillValue::Segs(segs, _) => {
                 let mut w = 0.0f32;
                 for (num, unit) in segs {
@@ -518,7 +518,7 @@ fn draw_pill_info(cv: &mut Canvas, app: &App, right: f32, y: f32, ph: f32, now_f
     let mut block = s(74.0);
     for (label, val) in items.iter() {
         // 值区宽 + 标签间距 + 标签实宽 + 余量；不要高估，否则会挤掉左侧日期
-        block = block.max(val.width() + pill_label_gap() + text_w(label, 10.5) + s(6.0));
+        block = block.max(val.width() + pill_label_gap() + text_w(label, 10.5) + s(4.0));
     }
     let block = block.min(s(178.0));
     let p = app.anims.rot.v.clamp(0.0, 1.0);
@@ -550,9 +550,11 @@ fn draw_info_line(cv: &mut Canvas, item: &(String, PillValue), right: f32, y0: f
             while size > 9.0 && text_w(value, size) * 1.25 > s(126.0) {
                 size -= 0.5;
             }
-            let w = text_w(value, size) * 1.25 + s(8.0);
-            cv.text_ex(vr - w, y0, w + s(2.0), ph, value, size, W_SEMI, *col, alpha, 2, 1);
-            vr - w
+            // 用真实文字宽（text_ex 右对齐、盒略加宽），不要拿含 1.25 余量的盒宽当左缘，
+            // 否则标签会被推远一大截。金额那样 ASCII 为主的串，text_w 已足够接近真实宽度。
+            let tw = text_w(value, size);
+            cv.text_ex(vr - tw - s(2.0), y0, tw + s(6.0), ph, value, size, W_SEMI, *col, alpha, 2, 1);
+            vr - tw - s(2.0)
         }
         PillValue::Segs(segs, col) => {
             // 从右往左依次画：单位(小字灰) → 数值(大字彩色)
