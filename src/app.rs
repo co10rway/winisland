@@ -135,6 +135,8 @@ pub struct App {
     pub panel_scroll: f32,
     /// 滚轮累积量（一格 120）
     pub wheel_acc: f32,
+    /// 待办的「二次确认删除」待确认行下标（防止误删；None = 无待确认）
+    pub todo_del_arm: Option<usize>,
     pub hits: Vec<ui::Hit>,
     #[allow(dead_code)]
     pub mouse: POINT,
@@ -450,6 +452,7 @@ pub fn run() {
                 scroll_max: 0.0,
                 panel_scroll: 0.0,
                 wheel_acc: 0.0,
+                todo_del_arm: None,
                 hits: Vec::new(),
                 mouse: POINT { x: 0, y: 0 },
                 hover: None,
@@ -668,6 +671,7 @@ fn preview_app(demo: bool) -> App {
         scroll_max: 0.0,
         panel_scroll: 0.0,
         wheel_acc: 0.0,
+        todo_del_arm: None,
         hits: Vec::new(),
         mouse: POINT::default(),
         hover: None,
@@ -1391,6 +1395,10 @@ fn tick_second() {
             Some(x) => x,
             None => return,
         };
+        // 面板已收起时，待办的「二次确认删除」态一并失效，避免下次打开误删
+        if app.todo_del_arm.is_some() && !app.panel_open {
+            app.todo_del_arm = None;
+        }
         // 打字统计入库
         let st = clock::local_time();
         let today = clock::today_str(&st);
@@ -1525,6 +1533,11 @@ fn click(h: &HitId) {
             Some(x) => x,
             None => return,
         };
+        // 除「继续点同一个删除按钮」外，任何点击都取消二次确认态（防误删残留）
+        let keep_arm = matches!(h, HitId::TodoDel(i) if app.todo_del_arm == Some(*i));
+        if !keep_arm {
+            app.todo_del_arm = None;
+        }
         let n = ui::effective_pages(&app.cfg).len().max(1);
         match h {
             HitId::Pill => {
@@ -1563,6 +1576,7 @@ fn click(h: &HitId) {
                 // 收起下拉面板，回到主面板胶囊（被遮挡时自然落回小黑条）
                 app.panel_open = false;
                 app.leave_at = None;
+                app.todo_del_arm = None;
                 app.apply_vis();
             }
             HitId::TodoToggle(i) => {
@@ -1574,10 +1588,16 @@ fn click(h: &HitId) {
             // 已在 click 开头单独处理（模态对话框需在 APP 借用之外运行）
             HitId::TodoAdd => {} 
             HitId::TodoDel(i) => {
-                // 悬停行尾 × 删除：只删、不误触完成切换
-                if *i < app.store.todos.len() {
-                    app.store.todos.remove(*i);
-                    app.save_now_quiet();
+                // 二次确认删除：第一次点 → 该行进入「确认删除」态；再点同一行才真删。
+                // 防止悬停 × 误触直接丢数据。
+                if app.todo_del_arm == Some(*i) {
+                    if *i < app.store.todos.len() {
+                        app.store.todos.remove(*i);
+                        app.save_now_quiet();
+                    }
+                    app.todo_del_arm = None;
+                } else {
+                    app.todo_del_arm = Some(*i);
                 }
             }
             HitId::FileOpen(i) => {
@@ -1733,6 +1753,8 @@ fn go_page(app: &mut App, new: usize) {
     app.anims.page_to(app.page, dir);
     app.page = new;
     app.panel_scroll = 0.0;
+    // 翻页后行下标可能指向别的待办，清掉未完成的删除确认
+    app.todo_del_arm = None;
 }
 
 /// 把界面状态同步到各弹簧的目标值。

@@ -254,13 +254,13 @@ fn draw(cv: &mut Canvas, w: f32, h: f32) {
     cv.rrect(s(24.0), s(TITLE_H + 8.0), w - s(48.0), s(INPUT_H), s(9.0), CARD, 1.0);
     // 底部按钮区
     let cyy = h - s(16.0) - s(BTN_H);
-    // 取消（左）
+    // 取消（左）——文字水平/垂直居中
     cv.rrect(s(24.0), cyy, s(BTN_W), s(BTN_H), s(9.0), BTN_BG, 1.0);
-    cv.text1(s(24.0), cyy, s(BTN_W), s(BTN_H), "取消", 12.5, W_NORMAL, TXT2, 1.0);
+    cv.text_ex(s(24.0), cyy, s(BTN_W), s(BTN_H), "取消", 12.5, W_NORMAL, TXT2, 1.0, 1, 1);
     // 添加（右，强调色）
     let apex = w - s(24.0) - s(BTN_W);
     cv.rrect(apex, cyy, s(BTN_W), s(BTN_H), s(9.0), crate::theme::main(), 0.95);
-    cv.text1(apex, cyy, s(BTN_W), s(BTN_H), "添加", 12.5, W_SEMI, crate::theme::tint(), 1.0);
+    cv.text_ex(apex, cyy, s(BTN_W), s(BTN_H), "添加", 12.5, W_SEMI, crate::theme::tint(), 1.0, 1, 1);
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {

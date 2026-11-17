@@ -88,7 +88,12 @@ fn body_clip_bottom() -> f32 {
 
 /// 推入命中区并纵向裁到内容可视带——滚动后移出可视区的行不可见也不可点
 fn push_hit_body(hits: &mut Vec<Hit>, id: HitId, x: f32, y: f32, w: f32, h: f32) {
-    let vtop = y.max(s(BODY_CLIP_TOP));
+    push_hit_body_from(hits, id, x, y, w, h, s(BODY_CLIP_TOP));
+}
+
+/// 同上，但可视带顶部可指定（待办页列表在固定按钮之下才开始露出）
+fn push_hit_body_from(hits: &mut Vec<Hit>, id: HitId, x: f32, y: f32, w: f32, h: f32, vtop_min: f32) {
+    let vtop = y.max(vtop_min);
     let vbot = (y + h).min(body_clip_bottom());
     if vbot > vtop + 1.0 {
         push_hit(hits, id, x, vtop, w, vbot - vtop);
@@ -880,8 +885,12 @@ fn page_todo(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>
     }
     let row_h = s(27.0);
     let sc = app.panel_scroll.min(panel_scroll_max(app, "todo"));
-    let mut y = s(BODY_TOP) + s(TODO_ADD_H) + s(6.0) - sc;
+    let list_top = s(BODY_TOP) + s(TODO_ADD_H) + s(6.0);
+    let mut y = list_top - sc;
     let r = s(6.5);
+
+    // 列表独立裁剪：滚动时行不会画到上方「＋ 新增待办」按钮上（此前的文字遮挡）
+    cv.push_clip(0.0, list_top - s(2.0), w, (body_clip_bottom() - list_top + s(2.0)).max(0.0));
 
     // 完成/未完成
     for want_done in [false, true] {
@@ -901,26 +910,43 @@ fn page_todo(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>
                 cv.circle(cxx, cyy, rr, ROW2, alpha);
                 cv.circle_stroke(cxx, cyy, rr, mix(TXT3, crate::theme::light(), hp), alpha * 0.85, s(1.0));
             }
-            // 标题（右侧预留删除按钮空间）
-            cv.text1(pad + s(20.0), y, iw - s(34.0), row_h, &it.title, 11.5, W_NORMAL, if it.done { TXT3 } else { TXT }, alpha);
-            // 行尾「×」删除：只在悬停该行时显示（柔和高亮随悬停淡入淡出）
-            let del_x = pad + iw - s(24.0);
-            let dhp = app.anims.hover_p(&HitId::TodoDel(idx));
-            let dvisible = dhp.max(hp);
-            if dvisible > 0.004 {
-                let dcx = del_x + s(8.0);
-                let dcy = y + row_h / 2.0;
-                cv.circle(dcx, dcy, s(8.5), mix(0x2C2C36, 0xFF5A5A, dhp), alpha * 0.95 * dvisible);
-                cv.line(dcx - s(3.2), dcy, dcx + s(3.2), dcy, 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
-                cv.line(dcx - s(3.2), dcy - s(3.2), dcx + s(3.2), dcy + s(3.2), 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
-                cv.line(dcx - s(3.2), dcy + s(3.2), dcx + s(3.2), dcy - s(3.2), 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+            // 该行是否处于「待二次确认删除」态
+            let armed = app.todo_del_arm == Some(idx);
+            // 标题（右侧预留删除按钮空间；确认态下多留出「确认删除」文字宽度）
+            let reserve = if armed { s(78.0) } else { s(34.0) };
+            cv.text1(pad + s(20.0), y, iw - reserve, row_h, &it.title, 11.5, W_NORMAL, if it.done { TXT3 } else { TXT }, alpha);
+
+            if armed {
+                // 二次确认条：整行右侧浮出红色「确认删除」胶囊，必须再点一次才真删
+                let by = y + s(2.5);
+                let bh = row_h - s(5.0);
+                let bw = s(64.0);
+                let bx = pad + iw - bw;
+                cv.rrect(bx, by, bw, bh, s(6.0), 0xE2453E, alpha * 0.95);
+                cv.text_ex(bx, by, bw, bh, "确认删除", 10.0, W_SEMI, 0xFFFFFF, alpha, 1, 1);
+            } else {
+                // 行尾「×」删除：只在悬停该行时显示（柔和高亮随悬停淡入淡出）
+                let del_x = pad + iw - s(24.0);
+                let dhp = app.anims.hover_p(&HitId::TodoDel(idx));
+                let dvisible = dhp.max(hp);
+                if dvisible > 0.004 {
+                    let dcx = del_x + s(8.0);
+                    let dcy = y + row_h / 2.0;
+                    cv.circle(dcx, dcy, s(8.5), mix(0x2C2C36, 0xFF5A5A, dhp), alpha * 0.95 * dvisible);
+                    cv.line(dcx - s(3.2), dcy, dcx + s(3.2), dcy, 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+                    cv.line(dcx - s(3.2), dcy - s(3.2), dcx + s(3.2), dcy + s(3.2), 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+                    cv.line(dcx - s(3.2), dcy + s(3.2), dcx + s(3.2), dcy - s(3.2), 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+                }
             }
-            // 命中区：整行切换完成；行尾小方块删除
-            push_hit_body(hits, HitId::TodoToggle(idx), pad, y, iw, row_h);
-            push_hit_body(hits, HitId::TodoDel(idx), del_x, y, s(24.0), row_h);
+            // 命中区：整行切换完成；行尾删除（确认态下命中区扩展到「确认删除」胶囊）
+            push_hit_body_from(hits, HitId::TodoToggle(idx), pad, y, iw, row_h, list_top);
+            let del_w = if armed { s(64.0) } else { s(24.0) };
+            let del_x0 = pad + iw - del_w;
+            push_hit_body_from(hits, HitId::TodoDel(idx), del_x0, y, del_w, row_h, list_top);
             y += row_h;
         }
     }
+    cv.pop_clip();
 }
 
 // ---- 3 文件 ----
