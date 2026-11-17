@@ -414,9 +414,16 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
         }
     }
 
-    // 时间（最右，紧跟状态徽标）：时分秒统一大字同色
-    let tx = if cx + time_w <= money_left { cx } else { money_left - time_w };
-    cv.text_ex(tx, y, time_w, ph, &time_str, 21.0, W_BOLD, TXT, alpha, 0, 1);
+    // 时间（整体居中于胶囊）：以胶囊水平中线为基准定位，再夹逼到
+    // 「不压住左侧日期/徽标」与「不碰右侧打工人信息」之间；空间不足时贴左内容右侧。
+    let min_tx = cx;
+    let max_tx = money_left - time_w;
+    let time_x = if max_tx >= min_tx {
+        (x + (pw - time_w) / 2.0).clamp(min_tx, max_tx)
+    } else {
+        min_tx
+    };
+    cv.text_ex(time_x, y, time_w, ph, &time_str, 21.0, W_BOLD, TXT, alpha, 0, 1);
 }
 
 /// 胶囊右侧「打工人信息」轮播条目：(标签, 值, 颜色)
