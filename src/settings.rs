@@ -122,6 +122,8 @@ enum RowKind {
     Sound,
     /// 工作日：一排「一二三四五六日」可点方块
     Weekday,
+    /// 时间选择器：点击弹出时/分选择面板（不创建原生 EDIT）
+    Time,
 }
 
 struct Row {
@@ -144,6 +146,9 @@ impl Row {
     }
     fn field(slot: i32, label: &'static str, desc: &'static str, fw: f32) -> Row {
         Row { kind: RowKind::Field, slot, label, desc, suffix: "", placeholder: "", fw, int: false, pwd: false, btns: Vec::new() }
+    }
+    fn time(slot: i32, label: &'static str, desc: &'static str) -> Row {
+        Row { kind: RowKind::Time, slot, label, desc, suffix: "", placeholder: "", fw: 100.0, int: false, pwd: false, btns: Vec::new() }
     }
     fn int(mut self) -> Row {
         self.int = true;
@@ -258,6 +263,7 @@ fn layout(page: &Page) -> Layout {
                         rows[i].kind,
                         RowKind::Toggle
                             | RowKind::Field
+                            | RowKind::Time
                             | RowKind::Action
                             | RowKind::PageRow
                             | RowKind::Theme
@@ -317,10 +323,10 @@ fn pages() -> Vec<Page> {
                 Row::toggle(0, "启用打工鼓励器", "关闭后胶囊右侧改为显示打字速度"),
                 Row::field(1, "月薪", "用于折算每秒收入", 128.0).suffix("元"),
                 Row::field(2, "每日工时", "", 100.0).suffix("小时"),
-                Row::field(4, "上午上班", "留空用默认 09:00", 100.0).ph("09:00"),
-                Row::field(6, "午休开始", "去吃饭的时间", 100.0).ph("12:00"),
-                Row::field(7, "下午上班", "午休结束时间", 100.0).ph("13:00"),
-                Row::field(5, "下班时间", "留空用默认 18:00", 100.0).ph("18:00"),
+                Row::time(4, "上午上班", "点击选择上下班时刻"),
+                Row::time(6, "午休开始", "去吃饭的时间"),
+                Row::time(7, "下午上班", "午休结束时间"),
+                Row::time(5, "下班时间", "点击选择下班时刻"),
                 Row::weekday(),
                 Row::note("上班状态 = 勾选的星期 + 官方节假日 / 调休；金额只在上下班区间内增长，午休不计。节假日联网自动同步，同步失败时不展示。"),
             ],
@@ -467,6 +473,13 @@ enum HitId {
     Sound,
     /// 底部「同步」按钮：保存所有页配置 + 刷新面板数据
     Sync,
+    /// 时间选择器字段（点击弹出面板）
+    Time(usize, i32),
+    /// 时间选择面板内的步进按钮：参数 (部件, 方向)，部件 0=时 1=分；方向 +1/-1
+    TimeStep(usize, i32),
+    /// 时间选择面板确定 / 取消
+    TimeOk,
+    TimeCancel,
     Min,
     Close,
 }
@@ -497,6 +510,13 @@ thread_local! {
     static STATUS: RefCell<Option<(String, Instant)>> = const { RefCell::new(None) };
     /// 当前页的滚动偏移（逻辑 px）
     static SCROLL: Cell<f32> = const { Cell::new(0.0) };
+    /// 时间选择器字段的草稿值：(page, slot) -> "HH:MM"。不创建原生 EDIT，用自绘选择器赋值。
+    static TIME_VALS: RefCell<Vec<((usize, i32), String)>> = const { RefCell::new(Vec::new()) };
+    /// 当前打开的时间选择器字段（page, slot），None 表示未打开
+    static TIME_PICK: Cell<Option<(usize, i32)>> = const { Cell::new(None) };
+    /// 选择器里正在调整的时 / 分
+    static TIME_H: Cell<u32> = const { Cell::new(9) };
+    static TIME_M: Cell<u32> = const { Cell::new(0) };
 }
 
 fn tw(txt: &str, size: f32) -> f32 {
@@ -589,7 +609,31 @@ fn edit_hwnd(page: usize, slot: i32) -> Option<HWND> {
     })
 }
 
+fn time_val_get(page: usize, slot: i32) -> String {
+    TIME_VALS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|((p, s), _)| *p == page && *s == slot)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    })
+}
+
+fn time_val_set(page: usize, slot: i32, txt: &str) {
+    TIME_VALS.with(|c| {
+        let mut m = c.borrow_mut();
+        if let Some((_, v)) = m.iter_mut().find(|((p, s), _)| *p == page && *s == slot) {
+            *v = txt.to_string();
+        } else {
+            m.push(((page, slot), txt.to_string()));
+        }
+    });
+}
+
 fn field_text(page: usize, slot: i32) -> String {
+    if is_time_slot(page, slot) {
+        return time_val_get(page, slot);
+    }
     unsafe {
         match edit_hwnd(page, slot) {
             Some(h) => {
@@ -604,11 +648,20 @@ fn field_text(page: usize, slot: i32) -> String {
 }
 
 fn set_field(page: usize, slot: i32, txt: &str) {
+    if is_time_slot(page, slot) {
+        time_val_set(page, slot, txt);
+        return;
+    }
     unsafe {
         if let Some(h) = edit_hwnd(page, slot) {
             let _ = SetWindowTextW(h, &HSTRING::from(txt));
         }
     }
+}
+
+/// 判断某字段是否是自绘时间选择器（打工鼓励器页的 4 个时间字段）
+fn is_time_slot(page: usize, slot: i32) -> bool {
+    page == 2 && matches!(slot, 4 | 5 | 6 | 7)
 }
 
 fn flash(msg: &str) {
@@ -768,7 +821,7 @@ fn apply_page(page: usize) {
 fn sync_page(page: usize) {
     let list = pages();
     let Some(p) = list.get(page) else { return };
-    for r in p.rows.iter().filter(|r| r.kind == RowKind::Field) {
+    for r in p.rows.iter().filter(|r| r.kind == RowKind::Field || r.kind == RowKind::Time) {
         let v = crate::app::with_cfg(|c| match (page, r.slot) {
             (1, 1) => c.health.sedentary_minutes.to_string(),
             (1, 2) => c.health.water_interval_minutes.to_string(),
@@ -813,6 +866,19 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
+/// 解析 "HH:MM" 为 (时, 分)，非法返回 None
+fn parse_hhmm(s: &str) -> Option<(u32, u32)> {
+    let s = s.trim();
+    let (h, m) = s.split_once(':')?;
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = m.trim().parse().ok()?;
+    if h < 24 && m < 60 {
+        Some((h, m))
+    } else {
+        None
+    }
+}
+
 fn sync_all() {
     for i in 0..12 {
         sync_page(i);
@@ -838,6 +904,75 @@ fn draw_all(cv: &mut Canvas, w: f32, h: f32, page: usize, hover: HitId, hits: &m
         draw_page(cv, p, page, hover, hits);
     }
     draw_footer(cv, w, h, hover, hits);
+    draw_time_picker(cv, w, h, hover, hits);
+}
+
+/// 自绘时间选择浮层：半透明遮罩 + 居中卡片 + 时/分步进 + 确定/取消
+fn draw_time_picker(cv: &mut Canvas, w: f32, h: f32, hover: HitId, hits: &mut Vec<Hit>) {
+    let Some((page, slot)) = TIME_PICK.with(|c| c.get()) else { return };
+    // 遮罩：点击空白处取消
+    cv.rrect(0.0, 0.0, w, h, 0.0, 0x000000, 0.55);
+    push_hit(hits, HitId::TimeCancel, 0.0, 0.0, w, h);
+
+    let pw = s(300.0);
+    let ph = s(288.0);
+    let px = (w - pw) / 2.0;
+    let py = (h - ph) / 2.0;
+    cv.rrect(px, py, pw, ph, s(16.0), 0x1C1C23, 1.0);
+    cv.rrect_stroke(px + 0.5, py + 0.5, pw - 1.0, ph - 1.0, s(16.0), 0x3A3A48, 1.0, s(1.0));
+
+    let title = match slot { 4 => "上午上班", 5 => "下班时间", 6 => "午休开始", _ => "下午上班" };
+    cv.text_c(px, py + s(16.0), pw, s(28.0), title, 15.0, W_SEMI, TXT, 1.0);
+    cv.text_c(px, py + s(46.0), pw, s(18.0), "点击 ▲ ▼ 调整时 / 分", 10.5, W_NORMAL, TXT3, 0.9);
+
+    // 时 / 分两列
+    let col_y = py + s(76.0);
+    let col_w = s(96.0);
+    let gap = s(20.0);
+    let hx = px + (pw - col_w * 2.0 - gap) / 2.0;
+    let mx = hx + col_w + gap;
+
+    draw_time_col(cv, hx, col_y, col_w, TIME_H.with(|c| c.get()), "时", hover, HitId::TimeStep(0, 1), HitId::TimeStep(0, -1), hits);
+    draw_time_col(cv, mx, col_y, col_w, TIME_M.with(|c| c.get()), "分", hover, HitId::TimeStep(1, 1), HitId::TimeStep(1, -1), hits);
+    cv.text_c(px + (pw - s(20.0)) / 2.0, col_y + s(40.0), s(20.0), s(56.0), ":", 24.0, W_MED, TXT3, 0.9);
+
+    // 底部按钮：取消 / 确定
+    let bw = s(110.0);
+    let by = py + ph - s(58.0);
+    let cancel_x = px + (pw - bw * 2.0 - s(16.0)) / 2.0;
+    let ok_x = cancel_x + bw + s(16.0);
+    let cancel_hov = hover == HitId::TimeCancel;
+    let ok_hov = hover == HitId::TimeOk;
+    draw_button(cv, cancel_x, by, bw, s(38.0), "取消", false, cancel_hov, 1.0);
+    draw_button(cv, ok_x, by, bw, s(38.0), "确定", true, ok_hov, 1.0);
+    push_hit(hits, HitId::TimeCancel, cancel_x, by, bw, s(38.0));
+    push_hit(hits, HitId::TimeOk, ok_x, by, bw, s(38.0));
+    // 防止 page / slot 未使用警告（title 已用 slot）
+    let _ = page;
+}
+
+/// 时间选择器的一列：上箭头 + 大数字 + 下箭头 + 单位标签
+fn draw_time_col(cv: &mut Canvas, x: f32, y: f32, w: f32, val: u32, unit: &str, hover: HitId, up: HitId, down: HitId, hits: &mut Vec<Hit>) {
+    let bh = s(30.0);
+    let num_y = y + bh;
+    let num_h = s(56.0);
+    // 数字框
+    cv.rrect(x, num_y, w, num_h, s(10.0), INPUT_BG, 1.0);
+    cv.rrect_stroke(x + 0.5, num_y + 0.5, w - 1.0, num_h - 1.0, s(10.0), INPUT_BD, 1.0, s(1.0));
+    cv.text_c(x, num_y, w, num_h, &format!("{val:02}"), 26.0, W_SEMI, TXT, 1.0);
+    // 单位
+    cv.text_c(x, y + bh + num_h + s(4.0), w, s(18.0), unit, 10.5, W_NORMAL, TXT3, 0.9);
+    // 上 / 下箭头按钮
+    let ah = s(26.0);
+    let up_hov = hover == up;
+    let down_hov = hover == down;
+    cv.rrect(x, y, w, ah, s(7.0), if up_hov { 0x2C2C36 } else { 0x23232B }, 1.0);
+    cv.text_c(x, y, w, ah, "▲", 11.0, W_MED, if up_hov { TXT } else { TXT2 }, 1.0);
+    let dy = y + bh + num_h + s(24.0);
+    cv.rrect(x, dy, w, ah, s(7.0), if down_hov { 0x2C2C36 } else { 0x23232B }, 1.0);
+    cv.text_c(x, dy, w, ah, "▼", 11.0, W_MED, if down_hov { TXT } else { TXT2 }, 1.0);
+    push_hit(hits, up, x, y, w, ah);
+    push_hit(hits, down, x, dy, w, ah);
 }
 
 /// --preview-settings [输出目录] [--scroll=N]：把每一页离屏渲染成 BMP（仅调试用）。
@@ -857,6 +992,13 @@ pub fn preview_pages() {
             return;
         }
     };
+    // 调试：--preview-timepick 让 page2 渲染时打开「下班时间」选择器
+    if std::env::args().any(|a| a == "--preview-timepick") {
+        TIME_H.with(|c| c.set(18));
+        TIME_M.with(|c| c.set(30));
+        TIME_PICK.with(|c| c.set(Some((2, 5))));
+        time_val_set(2, 5, "18:30");
+    }
     let (w, h) = client_size();
     let n = pages().len();
     for i in 0..n {
@@ -992,7 +1134,7 @@ fn draw_page(cv: &mut Canvas, page: &Page, idx: usize, hover: HitId, hits: &mut 
         let row = &page.rows[pl.row];
         let is_card_row = matches!(
             row.kind,
-            RowKind::Toggle | RowKind::Field | RowKind::Action | RowKind::PageRow | RowKind::Theme | RowKind::IconPick | RowKind::Sound | RowKind::Weekday
+            RowKind::Toggle | RowKind::Field | RowKind::Time | RowKind::Action | RowKind::PageRow | RowKind::Theme | RowKind::IconPick | RowKind::Sound | RowKind::Weekday
         );
         if is_card_row {
             if let Some(py) = prev {
@@ -1267,6 +1409,40 @@ fn draw_row(cv: &mut Canvas, row: &Row, page: usize, pl: &Placed, cx: f32, cw: f
                     let _ = SetFocus(None);
                 }
             }
+        }
+        RowKind::Time => {
+            let bw = s(118.0);
+            let bx = cx + cw - s(18.0) - bw;
+            let by = ry + (rh - s(INPUT_H)) / 2.0;
+            let text_w = (inner_w - bw - s(16.0)).max(s(40.0));
+            cv.text1(inner_l, ly, text_w, s(19.0), row.label, 13.0, W_MED, TXT, ta);
+            if has_desc {
+                cv.text1(inner_l, dy, text_w, s(16.0), row.desc, 11.0, W_NORMAL, TXT3, ta);
+            }
+            let hov = hover == HitId::Time(page, row.slot);
+            let open = TIME_PICK.with(|c| c.get()) == Some((page, row.slot));
+            draw_input_box(cv, bx, by, bw, s(INPUT_H), hov || open, ta);
+            // 显示当前值（草稿），未配置则读配置默认
+            let mut val = field_text(page, row.slot);
+            if val.trim().is_empty() {
+                val = crate::app::with_cfg(|c| match row.slot {
+                    4 => c.salary.work_start.clone(),
+                    5 => c.salary.work_end.clone(),
+                    6 => c.salary.lunch_start.clone(),
+                    _ => c.salary.lunch_end.clone(),
+                });
+            }
+            if val.trim().is_empty() {
+                val = match row.slot { 5 => "18:00".into(), 6 => "12:00".into(), 7 => "13:00".into(), _ => "09:00".into() };
+            }
+            cv.text1(bx + s(12.0), by, bw - s(46.0), s(INPUT_H), &val, 13.0, W_MED, TXT, ta);
+            // 右侧时钟图标（圆环 + 指针）
+            let icx = bx + bw - s(19.0);
+            let icy = by + s(INPUT_H) / 2.0;
+            cv.circle_stroke(icx, icy, s(6.2), TXT2, 0.85 * ta, s(1.2));
+            cv.line(icx, icy, icx, icy - s(3.6), TXT2, 0.85 * ta, s(1.2));
+            cv.line(icx, icy, icx + s(2.8), icy + s(1.0), TXT2, 0.85 * ta, s(1.2));
+            push_hit(hits, HitId::Time(page, row.slot), bx, by, bw, s(INPUT_H));
         }
         RowKind::Action => {
             let mut total = s(10.0) * (row.btns.len() as f32 - 1.0).max(0.0);
@@ -1769,6 +1945,51 @@ fn on_click(hwnd: HWND, id: HitId) {
             flash("已保存并同步到面板");
             invalidate(hwnd);
         }
+        HitId::Time(page, slot) => {
+            // 打开选择器：读取当前值（草稿优先，其次配置）初始化时/分
+            let mut val = field_text(page, slot);
+            if val.trim().is_empty() {
+                val = crate::app::with_cfg(|c| match slot {
+                    4 => c.salary.work_start.clone(),
+                    5 => c.salary.work_end.clone(),
+                    6 => c.salary.lunch_start.clone(),
+                    _ => c.salary.lunch_end.clone(),
+                });
+            }
+            let (hh, mm) = parse_hhmm(&val).unwrap_or((9, 0));
+            TIME_H.with(|c| c.set(hh));
+            TIME_M.with(|c| c.set(mm));
+            TIME_PICK.with(|c| c.set(Some((page, slot))));
+            invalidate(hwnd);
+        }
+        HitId::TimeStep(part, dir) => {
+            if part == 0 {
+                TIME_H.with(|c| {
+                    let v = c.get() as i32 + dir;
+                    c.set((((v % 24) + 24) % 24) as u32);
+                });
+            } else {
+                TIME_M.with(|c| {
+                    let v = c.get() as i32 + dir;
+                    c.set((((v % 60) + 60) % 60) as u32);
+                });
+            }
+            invalidate(hwnd);
+        }
+        HitId::TimeOk => {
+            if let Some((page, slot)) = TIME_PICK.with(|c| c.get()) {
+                let hh = TIME_H.with(|c| c.get());
+                let mm = TIME_M.with(|c| c.get());
+                set_field(page, slot, &format!("{hh:02}:{mm:02}"));
+                flash("时间已选择 · 点底部「同步」生效");
+            }
+            TIME_PICK.with(|c| c.set(None));
+            invalidate(hwnd);
+        }
+        HitId::TimeCancel => {
+            TIME_PICK.with(|c| c.set(None));
+            invalidate(hwnd);
+        }
         HitId::Weekday(i) => {
             crate::app::with_cfg(|c| {
                 let mut w = c.salary.weekdays_view();
@@ -1892,6 +2113,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         0x020A => {
+            // 时间选择面板打开时不滚动背景
+            if TIME_PICK.with(|c| c.get()).is_some() {
+                return LRESULT(0);
+            }
             // WM_MOUSEWHEEL：滚动右侧配置区（原生输入框跟随移动）
             let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
             let cur = PAGE.with(|c| c.get());
@@ -1964,7 +2189,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_KEYDOWN => {
             if wparam.0 == 0x1B {
-                hide_and_restore(hwnd); // Esc 关闭
+                // Esc：优先关闭时间选择面板，否则关闭设置窗口
+                if TIME_PICK.with(|c| c.get()).is_some() {
+                    TIME_PICK.with(|c| c.set(None));
+                    invalidate(hwnd);
+                } else {
+                    hide_and_restore(hwnd);
+                }
             }
             LRESULT(0)
         }

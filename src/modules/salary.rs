@@ -67,7 +67,8 @@ impl SalaryCalc {
         } else if now < e {
             ("距下班还有", (e - now).max(0.0))
         } else {
-            ("已下班", 0.0)
+            // 已下班：统计下班后经过的秒数（时分秒实时跳动）
+            ("已下班", (now - e).max(0.0))
         }
     }
 }
@@ -107,4 +108,35 @@ pub const MONEY_DECIMALS: usize = 2;
 
 pub fn fmt_money(v: f64) -> String {
     format!("{:.*}", MONEY_DECIMALS, v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn calc() -> SalaryCalc {
+        SalaryCalc { per_sec: 0.0, start_min: 9 * 60, end_min: 18 * 60, lunch_start: 12.0 * 60.0, lunch_end: 13.0 * 60.0 }
+    }
+
+    #[test]
+    fn after_work_elapsed_seconds_grow() {
+        let c = calc();
+        let end = 18.0 * 3600.0;
+        // 18:05:00 下班后 5 分钟 = 300 秒，且随时钟递增
+        let (lbl1, s1) = c.next_break_secs(end + 300.0);
+        assert_eq!(lbl1, "已下班");
+        assert!((s1 - 300.0).abs() < 0.01, "下班后应为 300 秒, got {s1}");
+        let (lbl2, s2) = c.next_break_secs(end + 3723.0);
+        assert_eq!(lbl2, "已下班");
+        assert!((s2 - 3723.0).abs() < 0.01, "1时2分3秒后应为 3723 秒, got {s2}");
+        assert!(s2 > s1, "已下班时长应随时间递增");
+    }
+
+    #[test]
+    fn before_end_counts_down() {
+        let c = calc();
+        let (lbl, s) = c.next_break_secs(17.0 * 3600.0);
+        assert_eq!(lbl, "距下班还有");
+        assert!((s - 3600.0).abs() < 0.01, "距下班 1 小时, got {s}");
+    }
 }
