@@ -1736,7 +1736,7 @@ fn click(h: &HitId) {
         redraw();
     });
     if let Some(p) = open_file {
-        open_in_explorer(&p);
+        open_file_direct(&p);
     }
 }
 
@@ -1811,17 +1811,18 @@ fn open_path(path: &str) {
     }
 }
 
-/// 在资源管理器中定位文件（文件不存在则退回打开其父目录）
-fn open_in_explorer(path: &str) {
+/// 用系统默认关联程序直接打开文件（等价双击）。
+/// lpOperation 传 None 让 Shell 选用默认动词，覆盖各类文件；
+/// 若原文件已被移动/删除，则退回打开其父目录，避免无响应。
+fn open_file_direct(path: &str) {
     let p = std::path::Path::new(path);
     if p.exists() {
-        let arg = format!("/select,\"{}\"", path);
         unsafe {
             ShellExecuteW(
                 None,
-                w!("open"),
-                w!("explorer.exe"),
-                &windows::core::HSTRING::from(arg),
+                None,
+                &windows::core::HSTRING::from(path),
+                None,
                 None,
                 SW_SHOWNORMAL,
             );

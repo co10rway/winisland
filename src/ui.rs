@@ -56,7 +56,7 @@ pub enum HitId {
     TodoToggle(usize),
     /// 待办行尾「×」删除按钮（悬停显示）
     TodoDel(usize),
-    /// 文件条目「打开所在目录」
+    /// 文件条目「用默认程序直接打开文件」
     FileOpen(usize),
     /// 文件条目行尾「×」删除按钮（悬停显示，二次确认）
     FileDel(usize),
