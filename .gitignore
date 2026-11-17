@@ -1,0 +1,9 @@
+/target
+Cargo.lock.orig
+*.pdb
+/preview
+/preview_set
+
+# 编译产物与历史归档（不进版本库）
+/winisland.exe
+/winisland-git-history.zip

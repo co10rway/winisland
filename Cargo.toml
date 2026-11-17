@@ -1,0 +1,54 @@
+[package]
+name = "winisland"
+version = "0.4.18"
+edition = "2021"
+description = "Windows 灵动岛 — 单一原生 exe、零运行时依赖的桌面灵动岛"
+license = "MIT"
+rust-version = "1.75"
+
+[dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_SystemServices",
+    "Win32_Security",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Time",
+    "Win32_Media",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows-core = "0.62"
+windows-numerics = "0.3"
+
+# 邮箱验证码（IMAPS），静态编译进 exe，无外部依赖
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
+opt-level = "s"
