@@ -12,14 +12,33 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn push_file(files: &mut Vec<FileItem>, path: &str, cap: usize) {
+/// 文件中转站容量上限（只存路径引用，限制条目数避免列表过长）。
+/// 只存引用不占内存，所以这里限制的是"条目数"而非字节数。
+pub const FILEHUB_CAP: usize = 5;
+
+/// 加入中转站的结果。
+#[derive(PartialEq, Eq, Debug)]
+pub enum PushResult {
+    /// 新文件已加入
+    Added,
+    /// 已存在的路径被刷新到顶部（不算新增，满也允许）
+    Refreshed,
+    /// 中转站已满且是新文件 —— 拒绝，不挤掉已有条目
+    Full,
+}
+
+/// 中转站专用：满额时拒绝新文件（不淘汰旧条目），但允许刷新已存在的路径。
+pub fn try_push_file(files: &mut Vec<FileItem>, path: &str, cap: usize) -> PushResult {
+    let existed = files.iter().any(|f| f.path == path);
+    if !existed && files.len() >= cap {
+        return PushResult::Full;
+    }
     let p = Path::new(path);
     let name = p
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string());
     let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    // 去重
     files.retain(|f| f.path != path);
     files.insert(
         0,
@@ -33,6 +52,7 @@ pub fn push_file(files: &mut Vec<FileItem>, path: &str, cap: usize) {
     if files.len() > cap {
         files.truncate(cap);
     }
+    if existed { PushResult::Refreshed } else { PushResult::Added }
 }
 
 #[allow(dead_code)]

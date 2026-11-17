@@ -137,11 +137,15 @@ pub struct App {
     pub wheel_acc: f32,
     /// 待办的「二次确认删除」待确认行下标（防止误删；None = 无待确认）
     pub todo_del_arm: Option<usize>,
+    /// 文件的「二次确认删除」待确认行下标
+    pub file_del_arm: Option<usize>,
     pub hits: Vec<ui::Hit>,
     #[allow(dead_code)]
     pub mouse: POINT,
     /// 当前鼠标悬停的控件（用于翻页箭头等的高亮）
     pub hover: Option<ui::HitId>,
+    /// 文件正拖到岛上（OLE DragEnter→DragLeave/Drop 之间），用于面板高亮
+    pub drag_hover: bool,
 
     /// 待用户确认的提醒（久坐 / 喝水 / 日程）。存在期间胶囊常亮显示提醒内容：
     /// 不自动过期、不被遮挡收成小黑条、不被悬停/轮播顶掉，
@@ -453,9 +457,11 @@ pub fn run() {
                 panel_scroll: 0.0,
                 wheel_acc: 0.0,
                 todo_del_arm: None,
+                file_del_arm: None,
                 hits: Vec::new(),
                 mouse: POINT { x: 0, y: 0 },
                 hover: None,
+                drag_hover: false,
                 reminder: None,
                 last_water_unix: now_unix,
                 sed_ack_idle: 0,
@@ -476,8 +482,25 @@ pub fn run() {
             })
         });
 
+        // OLE 拖放要求调用线程已初始化 COM 为 STA。主线程此前从未初始化，
+        // 导致 RegisterDragDrop 静默失败、文件根本拖不进来。
+        // CoInitializeEx(APARTMENTTHREADED) 等效于 OleInitialize，满足拖放/剪贴板要求；
+        // S_FALSE（已初始化）同样可接受。audio.rs 的 MTA 初始化在独立采样线程，与此不冲突。
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+
         DragAcceptFiles(hwnd, false); // 我们使用 OLE 拖放
-        let _ = ui::register_ole_drop(hwnd);
+        if let Err(e) = ui::register_ole_drop(hwnd) {
+            // 注册失败时落盘一行日志，便于排查「文件拖不进来」（GUI 无控制台）
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(data_dir().join("error.log"))
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    let _ = writeln!(f, "[{}] RegisterDragDrop 失败: {:?}", files::now_unix(), e);
+                    Ok(())
+                });
+        }
 
         // 启动时先判一次遮挡：面板区域已被窗口压住就直接以小黑条出现，
         // 不做「先弹出来再缩回去」的闪动
@@ -672,9 +695,11 @@ fn preview_app(demo: bool) -> App {
         panel_scroll: 0.0,
         wheel_acc: 0.0,
         todo_del_arm: None,
+        file_del_arm: None,
         hits: Vec::new(),
         mouse: POINT::default(),
         hover: None,
+        drag_hover: false,
         reminder: None,
         last_water_unix: 0,
         sed_ack_idle: 0,
@@ -1305,19 +1330,62 @@ pub fn now_idle_secs() -> u32 {
     }
 }
 
-/// 外部（OLE 拖放线程）推入文件
+/// 外部（OLE 拖放回调，运行在主线程消息循环）推入文件。
+/// 容量上限 5；满额时拒绝新文件并给出提示，不淘汰已有条目。
 pub fn push_file_external(path: String) {
     APP.with(|a| {
         let mut b = a.borrow_mut();
-        if let Some(app) = b.as_mut() {
-            if !app.cfg.modules.filehub {
+        let Some(app) = b.as_mut() else { return };
+        if !app.cfg.modules.filehub {
+            return;
+        }
+        let result = files::try_push_file(&mut app.store.files, &path, files::FILEHUB_CAP);
+        let msg = match result {
+            files::PushResult::Added => Some("已暂存到中转站"),
+            files::PushResult::Refreshed => Some("已更新（原已暂存）"),
+            files::PushResult::Full => Some("中转站已满（最多 5 个），请先移除"),
+        };
+        if result != files::PushResult::Full {
+            app.dirty = true;
+        }
+        app.flash = Some(Flash::new(msg.unwrap_or(""), 1600));
+        drop(b);
+        redraw();
+    });
+}
+
+/// OLE 拖动文件进入/离开岛屿：设置高亮态，并在进入时自动展开面板、
+/// 切到「文件中转站」页，方便用户看到暂存位置。
+/// enter=true 为 DragEnter/DragOver，false 为 DragLeave/Drop。
+pub fn set_drag_hover(enter: bool) {
+    APP.with(|a| {
+        let mut b = a.borrow_mut();
+        let Some(app) = b.as_mut() else { return };
+        if !app.cfg.modules.filehub {
+            return;
+        }
+        if enter {
+            if app.drag_hover {
+                return; // 已在拖动态，避免重复触发展开
+            }
+            app.drag_hover = true;
+            // 自动展开面板并跳到文件中转站页
+            let pages = ui::effective_pages(&app.cfg);
+            if let Some(idx) = pages.iter().position(|p| *p == "files") {
+                if idx != app.page {
+                    go_page(app, idx);
+                }
+            }
+            app.panel_open = true;
+            app.apply_vis();
+        } else {
+            if !app.drag_hover {
                 return;
             }
-            files::push_file(&mut app.store.files, &path, 10);
-            app.dirty = true;
-            drop(b);
-            redraw();
+            app.drag_hover = false;
         }
+        drop(b);
+        redraw();
     });
 }
 
@@ -1395,9 +1463,10 @@ fn tick_second() {
             Some(x) => x,
             None => return,
         };
-        // 面板已收起时，待办的「二次确认删除」态一并失效，避免下次打开误删
-        if app.todo_del_arm.is_some() && !app.panel_open {
+        // 面板已收起时，待办/文件的「二次确认删除」态一并失效，避免下次打开误删
+        if !app.panel_open {
             app.todo_del_arm = None;
+            app.file_del_arm = None;
         }
         // 打字统计入库
         let st = clock::local_time();
@@ -1534,9 +1603,13 @@ fn click(h: &HitId) {
             None => return,
         };
         // 除「继续点同一个删除按钮」外，任何点击都取消二次确认态（防误删残留）
-        let keep_arm = matches!(h, HitId::TodoDel(i) if app.todo_del_arm == Some(*i));
-        if !keep_arm {
+        let keep_todo_arm = matches!(h, HitId::TodoDel(i) if app.todo_del_arm == Some(*i));
+        if !keep_todo_arm {
             app.todo_del_arm = None;
+        }
+        let keep_file_arm = matches!(h, HitId::FileDel(i) if app.file_del_arm == Some(*i));
+        if !keep_file_arm {
+            app.file_del_arm = None;
         }
         let n = ui::effective_pages(&app.cfg).len().max(1);
         match h {
@@ -1603,6 +1676,19 @@ fn click(h: &HitId) {
             HitId::FileOpen(i) => {
                 if let Some(f) = app.store.files.get(*i) {
                     open_file = Some(f.path.clone());
+                }
+            }
+            HitId::FileDel(i) => {
+                // 二次确认删除：第一次点 → 进入确认态；再点同一行才真删。
+                if app.file_del_arm == Some(*i) {
+                    if *i < app.store.files.len() {
+                        app.store.files.remove(*i);
+                        app.save_now_quiet();
+                        app.flash = Some(Flash::new("已从中转站移除", 1500));
+                    }
+                    app.file_del_arm = None;
+                } else {
+                    app.file_del_arm = Some(*i);
                 }
             }
             HitId::ClipCopy(i) => {
@@ -1753,8 +1839,9 @@ fn go_page(app: &mut App, new: usize) {
     app.anims.page_to(app.page, dir);
     app.page = new;
     app.panel_scroll = 0.0;
-    // 翻页后行下标可能指向别的待办，清掉未完成的删除确认
+    // 翻页后行下标可能指向别的条目，清掉未完成的删除确认
     app.todo_del_arm = None;
+    app.file_del_arm = None;
 }
 
 /// 把界面状态同步到各弹簧的目标值。

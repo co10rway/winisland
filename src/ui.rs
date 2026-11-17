@@ -53,7 +53,10 @@ pub enum HitId {
     TodoToggle(usize),
     /// 待办行尾「×」删除按钮（悬停显示）
     TodoDel(usize),
+    /// 文件条目「打开所在目录」
     FileOpen(usize),
+    /// 文件条目行尾「×」删除按钮（悬停显示，二次确认）
+    FileDel(usize),
     ClipCopy(usize),
     WaterOk,
     WaterAdd,
@@ -954,26 +957,79 @@ fn page_todo(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>
 fn page_files(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>) {
     let pad = s(18.0);
     let iw = w - pad * 2.0;
-    draw_label(app, cv, w, crate::config::panel_name("files"), Some(format!("{} 个", app.store.files.len())), alpha);
+    let dragging = app.drag_hover;
+    let cap = crate::modules::files::FILEHUB_CAP;
+    draw_label(
+        app,
+        cv,
+        w,
+        crate::config::panel_name("files"),
+        Some(format!("{}/{} 个", app.store.files.len(), cap)),
+        alpha,
+    );
+
+    // 拖动文件悬停时，页面顶部浮出一条醒目的投放引导
+    if dragging {
+        let hy = s(BODY_TOP) - s(2.0);
+        let hh = s(24.0);
+        cv.rrect(pad, hy, iw, hh, s(8.0), mix(0x1E1E25, crate::theme::main(), 0.28), alpha);
+        cv.rrect_stroke(pad, hy, iw, hh, s(8.0), crate::theme::main(), alpha * 0.9, s(1.4));
+        cv.text_c(pad, hy, iw, hh, "松开鼠标，暂存到中转站", 11.0, W_SEMI, crate::theme::tint(), alpha);
+    }
+    let list_top = if dragging { s(BODY_TOP) + s(24.0) + s(2.0) } else { s(BODY_TOP) };
 
     if app.store.files.is_empty() {
-        empty_hint(cv, w, "把文件拖到灵动岛上即可暂存", alpha);
+        let hy = list_top + s(6.0);
+        cv.text_ex(pad, hy, iw, s(24.0), "把文件拖到灵动岛上即可暂存", 10.5, W_NORMAL, TXT3, alpha, 1, 1);
         return;
     }
     let row_h = s(27.0);
     let sc = app.panel_scroll.min(panel_scroll_max(app, "files"));
-    let mut y = s(BODY_TOP) - sc;
+    let mut y = list_top - sc;
+
+    cv.push_clip(0.0, list_top - s(2.0), w, (body_clip_bottom() - list_top + s(2.0)).max(0.0));
     for (i, f) in app.store.files.iter().enumerate() {
+        let armed = app.file_del_arm == Some(i);
         let sz = crate::modules::files::fmt_size(f.size);
         let szw = text_w(&sz, 9.5);
-        let name_w = iw - szw - s(22.0);
+        // 右侧给删除按钮/确认胶囊预留空间
+        let del_reserve = if armed { s(78.0) } else { s(28.0) };
+        let name_w = iw - szw - del_reserve - s(10.0);
         let hp = row_hover(app, cv, pad - s(6.0), y + s(1.0), iw + s(12.0), row_h - s(2.0), &HitId::FileOpen(i), alpha);
         cv.rrect(pad, y + s(7.0), s(12.0), row_h - s(14.0), s(3.0), crate::theme::main(), alpha * (0.22 + 0.68 * hp));
         cv.text1(pad + s(20.0), y, name_w, row_h, &ellipsize(&f.name, 11.5, name_w), 11.5, W_NORMAL, mix(TXT, 0xFFFFFF, hp * 0.6), alpha);
-        cv.text_ex(pad, y, iw, row_h, &sz, 9.5, W_NORMAL, mix(TXT3, TXT2, hp), alpha, 2, 1);
-        push_hit_body(hits, HitId::FileOpen(i), pad, y, iw, row_h);
+        // 大小文字右移到删除按钮左侧
+        cv.text_ex(pad + s(20.0) + name_w, y, szw + s(4.0), row_h, &sz, 9.5, W_NORMAL, mix(TXT3, TXT2, hp), alpha, 2, 1);
+
+        if armed {
+            // 二次确认：红色「确认删除」胶囊
+            let by = y + s(2.5);
+            let bh = row_h - s(5.0);
+            let bw = s(64.0);
+            let bx = pad + iw - bw;
+            cv.rrect(bx, by, bw, bh, s(6.0), 0xE2453E, alpha * 0.95);
+            cv.text_ex(bx, by, bw, bh, "确认删除", 10.0, W_SEMI, 0xFFFFFF, alpha, 1, 1);
+        } else {
+            // 行尾「×」删除：悬停该行时淡入
+            let del_cx = pad + iw - s(10.0);
+            let dhp = app.anims.hover_p(&HitId::FileDel(i));
+            let dvisible = dhp.max(hp);
+            if dvisible > 0.004 {
+                let dcy = y + row_h / 2.0;
+                cv.circle(del_cx, dcy, s(8.5), mix(0x2C2C36, 0xFF5A5A, dhp), alpha * 0.95 * dvisible);
+                cv.line(del_cx - s(3.2), dcy, del_cx + s(3.2), dcy, 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+                cv.line(del_cx - s(3.2), dcy - s(3.2), del_cx + s(3.2), dcy + s(3.2), 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+                cv.line(del_cx - s(3.2), dcy + s(3.2), del_cx + s(3.2), dcy - s(3.2), 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+            }
+        }
+        // 命中区：整行打开目录；行尾删除（确认态扩展到胶囊）
+        push_hit_body_from(hits, HitId::FileOpen(i), pad, y, iw - s(24.0), row_h, list_top);
+        let del_w = if armed { s(64.0) } else { s(24.0) };
+        let del_x0 = pad + iw - del_w;
+        push_hit_body_from(hits, HitId::FileDel(i), del_x0, y, del_w, row_h, list_top);
         y += row_h;
     }
+    cv.pop_clip();
 }
 
 // ---- 4 剪贴板 ----
@@ -1192,13 +1248,19 @@ struct DropTarget;
 impl IDropTarget_Impl for DropTarget_Impl {
     fn DragEnter(&self, _pdataobj: Ref<'_, windows::Win32::System::Com::IDataObject>, _grfkeystate: MODIFIERKEYS_FLAGS, _pt: &POINTL, pdweffect: *mut DROPEFFECT) -> windows::core::Result<()> {
         unsafe { *pdweffect = DROPEFFECT(1) }; // DROPEFFECT_COPY
+        // 文件拖到岛上：自动展开中转站页 + 高亮（幂等）
+        crate::app::set_drag_hover(true);
         Ok(())
     }
     fn DragOver(&self, _grfkeystate: MODIFIERKEYS_FLAGS, _pt: &POINTL, pdweffect: *mut DROPEFFECT) -> windows::core::Result<()> {
         unsafe { *pdweffect = DROPEFFECT(1) };
+        // 某些情况下 DragLeave 未触发但仍需维持高亮；幂等，无副作用
+        crate::app::set_drag_hover(true);
         Ok(())
     }
     fn DragLeave(&self) -> windows::core::Result<()> {
+        // 文件拖离岛屿：取消高亮
+        crate::app::set_drag_hover(false);
         Ok(())
     }
     fn Drop(&self, pdataobj: Ref<'_, windows::Win32::System::Com::IDataObject>, _grfkeystate: MODIFIERKEYS_FLAGS, _pt: &POINTL, pdweffect: *mut DROPEFFECT) -> windows::core::Result<()> {
@@ -1237,6 +1299,8 @@ impl IDropTarget_Impl for DropTarget_Impl {
             }
             ReleaseStgMedium(&mut medium);
         }
+        // 松手后取消拖入高亮
+        crate::app::set_drag_hover(false);
         Ok(())
     }
 }

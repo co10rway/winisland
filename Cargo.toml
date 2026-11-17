@@ -1,6 +1,6 @@
 [package]
 name = "winisland"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 description = "Windows 灵动岛 — 单一原生 exe、零运行时依赖的桌面灵动岛"
 license = "MIT"
