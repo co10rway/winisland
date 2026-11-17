@@ -297,6 +297,19 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
         }
     }
 
+    // 拖文件提示态（系统全局检测到文件拖动，尚未进入岛）：
+    // 像提醒一样占据整条胶囊，主题色高亮 + 文案，无需按钮（松手自动消失）
+    if app.file_drag_hint {
+        let msg = "拖到这里暂存文件";
+        let bx = x + 20.0;
+        cv.circle(bx, y + ph / 2.0, s(6.0), crate::theme::main(), alpha);
+        cv.text_ex(bx + 12.0, y, pw - 40.0, ph, msg, 13.0, W_SEMI, TXT, alpha, 0, 1);
+        // 右侧箭头图标暗示"往这里放"
+        let ax = x + pw - 28.0;
+        cv.text_c(ax, y, s(20.0), ph, "↙", 16.0, W_SEMI, crate::theme::main(), alpha);
+        return;
+    }
+
     // 默认态：从左到右三段 —— 动态图标 | 时间 + 上班状态 + 日期 | 打工人信息（上下轮播）
     let pad = s(18.0);
     let mut cx = x + pad;
@@ -494,7 +507,7 @@ fn Instant_now() -> Instant {
     Instant::now()
 }
 
-/// 胶囊当前内容模式（0 默认 / 1 喝水提醒 / 2 久坐提醒 / 3 邮箱验证码 / 4 日程提醒）
+/// 胶囊当前内容模式（0 默认 / 1 喝水提醒 / 2 久坐提醒 / 3 邮箱验证码 / 4 日程提醒 / 5 拖文件提示）
 /// 模式切换时触发淡入，避免文字硬替换
 pub fn pill_mode_key(app: &App) -> u32 {
     if let Some(t) = &app.reminder {
@@ -508,6 +521,10 @@ pub fn pill_mode_key(app: &App) -> u32 {
         if Instant_now() < until {
             return 3;
         }
+    }
+    // 全局检测到文件拖动且未进入岛：胶囊浮出"拖到此处暂存"提示
+    if app.file_drag_hint {
+        return 5;
     }
     0
 }
@@ -1253,6 +1270,10 @@ fn pager_btn(cv: &mut Canvas, x: f32, y: f32, sz: f32, left: bool, enabled: bool
 pub const WM_DRAG_ENTER: u32 = WM_APP + 2;
 pub const WM_DRAG_LEAVE: u32 = WM_APP + 3;
 pub const WM_DROP_FILES: u32 = WM_APP + 4;
+/// 全局鼠标钩子检测到"开始拖动文件"（系统任意位置）——主线程收到后查 CF_HDROP 确认
+pub const WM_FILE_DRAG_BEGIN: u32 = WM_APP + 5;
+/// 全局鼠标钩子检测到拖动结束（左键松开）
+pub const WM_FILE_DRAG_END: u32 = WM_APP + 6;
 
 thread_local! {
     /// 必须持有 IDropTarget 强引用直到 RevokeDragDrop ——
