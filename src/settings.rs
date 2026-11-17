@@ -384,10 +384,11 @@ fn pages() -> Vec<Page> {
         // 5 文件中转站
         Page {
             title: "文件中转站",
-            desc: "拖文件到岛上自动展开暂存，最多 5 个",
+            desc: "拖文件到岛上自动展开暂存，数量上限可自定义",
             rows: vec![
                 Row::toggle(0, "启用文件中转站", "拖入文件时自动展开并暂存"),
-                Row::note("只记录路径不复制内容，不占内存；满 5 个后拒绝新增，单击条目用默认程序直接打开文件，悬停可删除。"),
+                Row::field(1, "暂存数量上限", "最多暂存的文件数；满额后拒绝新增", 44.0).int().suffix("个").ph("20"),
+                Row::note("只记录路径不复制内容，不占内存；单击条目用默认程序直接打开文件，悬停可删除。上限调小后会自动移除超出的旧条目。"),
             ],
         },
         // 6 剪贴板中转
@@ -702,6 +703,12 @@ fn apply_page(page: usize) {
                 crate::app::with_cfg(|c| c.clipboard_history = v.clamp(1, 200));
             }
         }
+        5 => {
+            if let Some(v) = field_text(5, 1).trim().parse::<usize>().ok() {
+                // 立即截断超限的旧条目；save_now 在 apply_page 末尾统一落盘
+                let _ = crate::app::set_filehub_cap(v);
+            }
+        }
         3 => {
             let lead = field_text(3, 2).trim().parse::<u32>().ok();
             let refresh = field_text(3, 4).trim().parse::<u32>().ok();
@@ -792,6 +799,7 @@ fn sync_page(page: usize) {
             (2, 6) => c.salary.lunch_start.clone(),
             (2, 7) => c.salary.lunch_end.clone(),
             (6, 1) => c.clipboard_history.to_string(),
+            (5, 1) => c.filehub_cap.to_string(),
             (3, 2) => c.schedule_lead_minutes.to_string(),
             (3, 4) => c.schedule_sub.refresh_minutes.to_string(),
             (3, 12) => c.schedule_sub.feishu.dav_server.clone(),

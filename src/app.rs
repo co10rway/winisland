@@ -1038,6 +1038,26 @@ pub fn save_now() {
     });
 }
 
+/// 设置页调整中转站上限：写入配置，并立即裁掉超出的旧条目（保持最新在前）。
+/// 返回裁剪掉的条数，供界面提示。
+pub fn set_filehub_cap(cap: usize) -> usize {
+    let cap = cap.clamp(1, 200);
+    APP.with(|a| {
+        let mut b = a.borrow_mut();
+        let Some(app) = b.as_mut() else { return 0 };
+        app.cfg.filehub_cap = cap;
+        let before = app.store.files.len();
+        if app.store.files.len() > cap {
+            app.store.files.truncate(cap);
+        }
+        let removed = before.saturating_sub(app.store.files.len());
+        if removed > 0 {
+            app.dirty = true;
+        }
+        removed
+    })
+}
+
 /// 供设置窗口读写配置（同线程调用）
 pub fn with_cfg<R>(f: impl FnOnce(&mut Config) -> R) -> R {
     APP.with(|a| {
@@ -1341,7 +1361,7 @@ pub fn now_idle_secs() -> u32 {
 }
 
 /// 外部（OLE 拖放回调，运行在主线程消息循环）推入文件。
-/// 容量上限 5；满额时拒绝新文件并给出提示，不淘汰已有条目。
+/// 容量上限由设置里的 filehub_cap 决定；满额时拒绝新文件并提示，不淘汰已有条目。
 pub fn push_file_external(path: String) {
     APP.with(|a| {
         let mut b = a.borrow_mut();
@@ -1349,11 +1369,12 @@ pub fn push_file_external(path: String) {
         if !app.cfg.modules.filehub {
             return;
         }
-        let result = files::try_push_file(&mut app.store.files, &path, files::FILEHUB_CAP);
+        let cap = app.cfg.filehub_cap;
+        let result = files::try_push_file(&mut app.store.files, &path, cap);
         let msg = match result {
             files::PushResult::Added => Some("已暂存到中转站"),
             files::PushResult::Refreshed => Some("已更新（原已暂存）"),
-            files::PushResult::Full => Some("中转站已满（最多 5 个），请先移除"),
+            files::PushResult::Full => Some("中转站已满，请先移除或调大上限"),
         };
         if result != files::PushResult::Full {
             app.dirty = true;

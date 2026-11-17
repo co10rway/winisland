@@ -245,6 +245,8 @@ pub struct Config {
     pub deskarch_dir: String,
     /// 剪贴板历史条数
     pub clipboard_history: usize,
+    /// 文件中转站最多暂存的文件数（只存路径引用，此上限仅为列表管理，非内存约束）
+    pub filehub_cap: usize,
     /// 主题色 id（theme::THEMES 之一）；胶囊固定在屏幕顶部居中，货币符号固定为 ¥
     pub theme: String,
     /// 胶囊最左侧动态图标 id（icon::ICON_KINDS 之一）
@@ -343,6 +345,7 @@ impl Default for Config {
             autostart: false,
             deskarch_dir: String::new(),
             clipboard_history: 20,
+            filehub_cap: crate::modules::files::DEFAULT_FILEHUB_CAP,
             theme: "blue".into(),
             icon: "glow".into(),
             sound_react: true,

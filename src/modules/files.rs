@@ -12,9 +12,9 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// 文件中转站容量上限（只存路径引用，限制条目数避免列表过长）。
-/// 只存引用不占内存，所以这里限制的是"条目数"而非字节数。
-pub const FILEHUB_CAP: usize = 5;
+/// 文件中转站容量上限【默认值】（可在设置里调整）。
+/// 只存路径引用不占内存，此上限仅避免列表过长，非内存约束。
+pub const DEFAULT_FILEHUB_CAP: usize = 20;
 
 /// 加入中转站的结果。
 #[derive(PartialEq, Eq, Debug)]

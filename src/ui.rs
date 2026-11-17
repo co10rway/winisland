@@ -961,7 +961,8 @@ fn page_files(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit
     let pad = s(18.0);
     let iw = w - pad * 2.0;
     let dragging = app.drag_hover;
-    let cap = crate::modules::files::FILEHUB_CAP;
+    let cap = app.cfg.filehub_cap;
+    // 上限被调小后现有条目可能暂时超限，显示实际条数 / cap（如 12/5），不隐藏真实数量
     draw_label(
         app,
         cv,
