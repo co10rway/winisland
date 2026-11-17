@@ -194,9 +194,9 @@ unsafe fn build_edit_ui(parent: HWND) {
         WINDOW_EX_STYLE(0),
         w!("EDIT"),
         w!(""),
-        WINDOW_STYLE((ES_LEFT | ES_AUTOHSCROLL) as u32) | WS_CHILD | WS_TABSTOP,
+        WINDOW_STYLE((ES_LEFT | ES_AUTOHSCROLL) as u32) | WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         (ex + s(9.0)) as i32,
-        (ey + s(5.0)) as i32,
+        (ey + s(1.0)) as i32,
         (ew - s(18.0)) as i32,
         (s(INPUT_H) - s(10.0)) as i32,
         Some(parent),
@@ -206,7 +206,9 @@ unsafe fn build_edit_ui(parent: HWND) {
     )
     .expect("CreateWindowExW edit");
     let _ = SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
-    let _ = SetWindowTheme(h, w!(""), w!(""));
+    // 保留 Explorer 深色视觉样式，否则 EM_SETCUEBANNER 占位提示不会渲染；
+    // 同时用 EM_SETMARGINS 收紧左右内边距，让文字贴近自绘框。
+    let _ = SetWindowTheme(h, w!("Explorer"), w!(""));
     let _ = SendMessageW(h, EM_SETMARGINS, Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)), Some(LPARAM(0)));
     let wide = HSTRING::from("输入待办内容，回车添加");
     let _ = SendMessageW(h, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(wide.as_ptr() as isize)));

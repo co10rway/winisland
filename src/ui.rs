@@ -873,7 +873,9 @@ fn page_todo(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>
     push_hit(hits, HitId::TodoAdd, pad, ay, iw, ah);
 
     if total == 0 {
-        empty_hint(cv, w, "点击上方按钮即可添加", alpha);
+        // 空状态引导：放在「＋ 新增待办」按钮下方，避免盖住按钮本身
+        let hy = s(BODY_TOP) + s(TODO_ADD_H) + s(6.0);
+        cv.text_ex(pad, hy, iw, s(22.0), "暂无待办，点上方「＋ 新增待办」添加第一条", 10.0, W_NORMAL, TXT3, alpha, 1, 1);
         return;
     }
     let row_h = s(27.0);
