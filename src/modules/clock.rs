@@ -7,6 +7,7 @@ pub fn local_time() -> SYSTEMTIME {
     unsafe { GetLocalTime() }
 }
 
+#[allow(dead_code)]
 pub fn hhmm(st: &SYSTEMTIME) -> String {
     format!("{:02}:{:02}", st.wHour, st.wMinute)
 }
