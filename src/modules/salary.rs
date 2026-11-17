@@ -93,12 +93,12 @@ pub fn dur_segs(secs: f64) -> Vec<(String, String)> {
     let (h, m, s) = (t / 3600, (t % 3600) / 60, t % 60);
     let mut v = Vec::with_capacity(3);
     if h > 0 {
-        v.push((h.to_string(), "h".to_string()));
+        v.push((h.to_string(), "H".to_string()));
     }
     if h > 0 || m > 0 {
-        v.push((format!("{m:02}"), "m".to_string()));
+        v.push((format!("{m:02}"), "M".to_string()));
     }
-    v.push((format!("{s:02}"), "s".to_string()));
+    v.push((format!("{s:02}"), "S".to_string()));
     v
 }
 

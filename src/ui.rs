@@ -442,6 +442,18 @@ enum PillValue {
 fn pill_bar_w() -> f32 {
     s(54.0)
 }
+/// 时长分段里：数字与单位之间的间距
+fn pill_nu_gap() -> f32 {
+    s(2.0)
+}
+/// 时长分段之间（H / M / S）的间距
+fn pill_seg_gap() -> f32 {
+    s(3.0)
+}
+/// 中文标签与数值之间的间距
+fn pill_label_gap() -> f32 {
+    s(6.0)
+}
 
 impl PillValue {
     /// 值区估算宽度（与绘制保持一致，略偏保守）
@@ -449,8 +461,11 @@ impl PillValue {
         match self {
             PillValue::Plain(v, _) => text_w(v, 13.0) * 1.25 + s(8.0),
             PillValue::Segs(segs, _) => {
-                let w: f32 = segs.iter().map(|(n, u)| text_w(n, 13.0) + text_w(u, 9.5) + s(1.0)).sum();
-                w + s(4.0)
+                let mut w = 0.0f32;
+                for (num, unit) in segs {
+                    w += text_w(num, 13.0) + pill_nu_gap() + text_w(unit, 9.5);
+                }
+                w + pill_seg_gap() * segs.len().saturating_sub(1) as f32
             }
             PillValue::Progress(_) => pill_bar_w() + s(6.0) + text_w("100%", 9.5) + s(4.0),
         }
@@ -502,14 +517,15 @@ fn draw_pill_info(cv: &mut Canvas, app: &App, right: f32, y: f32, ph: f32, now_f
     // 各类值的宽度由 PillValue::width() 统一估算，右对齐绘制天然兼容偏差
     let mut block = s(74.0);
     for (label, val) in items.iter() {
-        block = block.max(text_w(label, 10.5) + s(6.0) + val.width() + s(10.0));
+        // 值区宽 + 标签间距 + 标签实宽 + 余量；不要高估，否则会挤掉左侧日期
+        block = block.max(val.width() + pill_label_gap() + text_w(label, 10.5) + s(6.0));
     }
     let block = block.min(s(178.0));
     let p = app.anims.rot.v.clamp(0.0, 1.0);
 
     // 裁剪区向右多留 10px：数值右对齐到 right+6（吃进胶囊内边距一部分），
     // 避免最后一个字符贴着裁剪边界被削掉半截
-    cv.push_clip(right - block - s(2.0), y, block + s(10.0), ph);
+    cv.push_clip(right - block - s(2.0), y, block + s(12.0), ph);
     let cur = &items[app.rot_i % items.len()];
     draw_info_line(cv, cur, right, y + ph - p * ph, ph, alpha);
     if p < 0.999 {
@@ -520,14 +536,15 @@ fn draw_pill_info(cv: &mut Canvas, app: &App, right: f32, y: f32, ph: f32, now_f
     right - block
 }
 
-/// 单条信息：右对齐绘制「标签(灰) + 值」。Plain 整段同色；
-/// Segs 数值大字彩色 + 单位小字灰；Progress 主题色进度条 + 小字百分比。
+/// 单条信息：先画值、得到其真实左缘，再把标签右对齐到「左缘 - 固定间距」，
+/// 确保中文标签与数值之间始终留白、绝不贴一起。
+/// Plain 整段同色；Segs 数值大字彩色 + 单位小字灰；Progress 主题色进度条 + 小字百分比。
 fn draw_info_line(cv: &mut Canvas, item: &(String, PillValue), right: f32, y0: f32, ph: f32, alpha: f32) {
     let (label, val) = item;
     let vr = right + s(6.0); // 值区右缘（略微伸进内边距，避开裁剪边界）
-    let vw = val.width();
 
-    match val {
+    // 画值区，返回它的真实左缘 x（标签据此定位，间距不依赖估算）
+    let value_left = match val {
         PillValue::Plain(value, col) => {
             let mut size = 13.0f32;
             while size > 9.0 && text_w(value, size) * 1.25 > s(126.0) {
@@ -535,20 +552,22 @@ fn draw_info_line(cv: &mut Canvas, item: &(String, PillValue), right: f32, y0: f
             }
             let w = text_w(value, size) * 1.25 + s(8.0);
             cv.text_ex(vr - w, y0, w + s(2.0), ph, value, size, W_SEMI, *col, alpha, 2, 1);
+            vr - w
         }
         PillValue::Segs(segs, col) => {
             // 从右往左依次画：单位(小字灰) → 数值(大字彩色)
             // 用 text1（不折行）：分段盒宽很窄，text_ex 会误把数字折成两行
-            let mut x = vr - s(2.0);
+            let mut x = vr;
             for (num, unit) in segs.iter().rev() {
                 let uw = text_w(unit, 9.5);
                 x -= uw;
                 cv.text1(x, y0, uw + s(2.0), ph, unit, 9.5, W_MED, UNIT, alpha);
                 let nw = text_w(num, 13.0);
-                x -= nw;
+                x -= pill_nu_gap() + nw;
                 cv.text1(x, y0, nw + s(2.0), ph, num, 13.0, W_SEMI, *col, alpha);
-                x -= s(1.0);
+                x -= pill_seg_gap();
             }
+            x + pill_seg_gap() // 撤销最后一段多减的段间距
         }
         PillValue::Progress(prog) => {
             let pct = format!("{}%", (prog.clamp(0.0, 1.0) * 100.0).round() as i32);
@@ -557,18 +576,20 @@ fn draw_info_line(cv: &mut Canvas, item: &(String, PillValue), right: f32, y0: f
             // 百分比（小字灰，右缘贴齐；text1 不折行）
             cv.text1(vr - pw - s(2.0), y0, pw + s(4.0), ph, &pct, 9.5, W_MED, TXT2, alpha);
             // 进度条：灰色底槽 + 主题色填充
-            let bx = vr - pw - s(6.0) - bw;
+            let bx = vr - pw - s(8.0) - bw;
             let by = y0 + ph / 2.0 - s(3.5);
             let bh = s(7.0);
             cv.rrect(bx, by, bw, bh, s(3.5), TXT3, alpha * 0.30);
             let fw = (bw * prog.clamp(0.0, 1.0)).max(bh).min(bw);
             cv.rrect(bx, by, fw, bh, s(3.5), crate::theme::main(), alpha);
+            bx
         }
-    }
+    };
 
+    // 标签右对齐到「值区真实左缘 - 固定间距」，保证留白、不重叠
     let lw = text_w(label, 10.5) * 1.15 + s(4.0);
-    let lx = vr - vw - s(6.0) - lw;
-    cv.text_ex(lx, y0, lw + s(4.0), ph, label, 10.5, W_NORMAL, TXT2, alpha, 2, 1);
+    let lx = value_left - pill_label_gap() - lw;
+    cv.text_ex(lx, y0, lw + s(2.0), ph, label, 10.5, W_NORMAL, TXT2, alpha, 2, 1);
 }
 
 use std::time::Instant;
