@@ -58,6 +58,8 @@ thread_local! {
     static EDIT_FONT: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
     static EDIT_BRUSH: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
     static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 确认时（销毁窗口前）读到的输入文本，供 prompt() 返回时使用
+    static RESULT: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 pub enum Result2 {
@@ -108,6 +110,7 @@ pub fn prompt() -> Result2 {
 
         WIN.with(|c| c.set(hwnd.0 as isize));
         DONE.with(|c| c.set(false));
+        RESULT.with(|c| c.borrow_mut().clear());
         build_edit_ui(hwnd);
         crate::app::set_island_topmost(false);
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -131,8 +134,7 @@ pub fn prompt() -> Result2 {
                 continue;
             }
             if is_edit_enter {
-                DONE.with(|c| c.set(true));
-                let _ = DestroyWindow(hwnd);
+                commit_and_destroy(hwnd);
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -142,7 +144,7 @@ pub fn prompt() -> Result2 {
             }
         }
 
-        let txt = input_text();
+        let txt = RESULT.with(|c| c.borrow().clone());
         WIN.with(|c| c.set(0));
         EDIT.with(|c| c.set(0));
         crate::app::set_island_topmost(true);
@@ -196,7 +198,7 @@ unsafe fn build_edit_ui(parent: HWND) {
         w!(""),
         WINDOW_STYLE((ES_LEFT | ES_AUTOHSCROLL) as u32) | WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         (ex + s(9.0)) as i32,
-        (ey + s(1.0)) as i32,
+        (ey + s(5.0)) as i32,
         (ew - s(18.0)) as i32,
         (s(INPUT_H) - s(10.0)) as i32,
         Some(parent),
@@ -206,13 +208,23 @@ unsafe fn build_edit_ui(parent: HWND) {
     )
     .expect("CreateWindowExW edit");
     let _ = SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
-    // 保留 Explorer 深色视觉样式，否则 EM_SETCUEBANNER 占位提示不会渲染；
-    // 同时用 EM_SETMARGINS 收紧左右内边距，让文字贴近自绘框。
-    let _ = SetWindowTheme(h, w!("Explorer"), w!(""));
+    // 用经典渲染（与自绘框 + ey+5 的位置参数配套，文字垂直位置才对得上）。
+    // 设成 "Explorer" 主题会给 EDIT 加内部 padding，导致文字在框里偏上。
+    let _ = SetWindowTheme(h, w!(""), w!(""));
     let _ = SendMessageW(h, EM_SETMARGINS, Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)), Some(LPARAM(0)));
     let wide = HSTRING::from("输入待办内容，回车添加");
     let _ = SendMessageW(h, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(wide.as_ptr() as isize)));
     EDIT.with(|c| c.set(h.0 as isize));
+}
+
+/// 确认操作：必须在销毁窗口【之前】读取 EDIT 文本。
+/// 否则控件随窗口一起销毁，GetWindowTextW 只能拿到空串——这正是
+/// 「点了添加，面板里却不显示」的根因。
+unsafe fn commit_and_destroy(hwnd: HWND) {
+    let txt = input_text();
+    RESULT.with(|c| *c.borrow_mut() = txt);
+    DONE.with(|c| c.set(true));
+    let _ = DestroyWindow(hwnd);
 }
 
 unsafe fn input_text() -> String {
@@ -302,8 +314,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 添加（右）
             let apex = s(W) - s(24.0) - s(BTN_W);
             if in_r(x, y, apex, cyy, s(BTN_W), s(BTN_H)) {
-                DONE.with(|c| c.set(true));
-                let _ = DestroyWindow(hwnd);
+                commit_and_destroy(hwnd);
                 return LRESULT(0);
             }
             LRESULT(0)
