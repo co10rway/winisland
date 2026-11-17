@@ -164,6 +164,8 @@ CI 在 `windows-latest` 上执行 `cargo check / clippy / build --release`，并
 - 邮箱验证码需在设置里填入 IMAP 账号（默认关闭）
 - 日历解析暂不支持：全天事件、`MONTHLY` / `YEARLY` 重复事件
 
+已记录的待办问题见 [BUGS.md](docs/BUGS.md)。
+
 ---
 
 ## Roadmap
