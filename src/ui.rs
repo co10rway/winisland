@@ -38,6 +38,8 @@ const BORDER: u32 = 0x2B2B33;
 const TXT: u32 = 0xF2F2F6;
 const TXT2: u32 = 0x9A9AA4;
 const TXT3: u32 = 0x66666F;
+/// 数值旁的单位：比普通次级文字亮，但仍明显区别于大号数值
+const UNIT: u32 = 0xC2C2CC;
 
 
 const GREEN: u32 = 0x4ADE80;
@@ -426,32 +428,60 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
     cv.text_ex(time_x, y, time_w, ph, &time_str, 21.0, W_BOLD, TXT, alpha, 0, 1);
 }
 
-/// 胶囊右侧「打工人信息」轮播条目：(标签, 值, 颜色)
-/// 标签写全（今日已赚 / 今日已工作 / 今日工作进度 / 距下班还有 / 今日已经打字），
-/// 时长的值精确到秒，每秒都在变。
-fn pill_items(app: &App, now_f: f64, now_min: f64) -> Vec<(String, String, u32)> {
+/// 胶囊右侧信息的值：
+/// - Plain：整段同色（金额）
+/// - Segs：每段「数值大字彩色 + 单位小字灰」（时长、字数），让数值与单位一眼可分
+/// - Progress：主题色进度条 + 百分比（今日工作进度）
+enum PillValue {
+    Plain(String, u32),
+    Segs(Vec<(String, String)>, u32),
+    Progress(f32),
+}
+
+/// 进度条宽度（运行时缩放，不能用 const）
+fn pill_bar_w() -> f32 {
+    s(54.0)
+}
+
+impl PillValue {
+    /// 值区估算宽度（与绘制保持一致，略偏保守）
+    fn width(&self) -> f32 {
+        match self {
+            PillValue::Plain(v, _) => text_w(v, 13.0) * 1.25 + s(8.0),
+            PillValue::Segs(segs, _) => {
+                let w: f32 = segs.iter().map(|(n, u)| text_w(n, 13.0) + text_w(u, 9.5) + s(1.0)).sum();
+                w + s(4.0)
+            }
+            PillValue::Progress(_) => pill_bar_w() + s(6.0) + text_w("100%", 9.5) + s(4.0),
+        }
+    }
+}
+
+/// 胶囊右侧「打工人信息」轮播条目：(标签, 值)
+/// 时长精确到秒、每秒都在变；数值与单位分色分字号，进度用条展示。
+fn pill_items(app: &App, now_f: f64, now_min: f64) -> Vec<(String, PillValue)> {
     let light = crate::theme::light();
     vec![
         (
-            "今日已赚".to_string(),
-            format!("¥{}", salary::fmt_money(app.sal.earned_today_f(now_f))),
-            GREEN,
+            "今天已经赚了".to_string(),
+            PillValue::Plain(format!("¥{}", salary::fmt_money(app.sal.earned_today_f(now_f))), GREEN),
         ),
         (
-            "今日已工作".to_string(),
-            salary::fmt_dur_secs(app.sal.worked_secs_excl_lunch(now_f)),
-            light,
+            "今天已经工作了".to_string(),
+            PillValue::Segs(salary::dur_segs(app.sal.worked_secs_excl_lunch(now_f)), light),
         ),
         (
             "今日工作进度".to_string(),
-            format!("{:.1}%", app.sal.progress(now_min) * 100.0),
-            light,
+            PillValue::Progress(app.sal.progress(now_min)),
         ),
         {
             let (lbl, secs) = app.sal.next_break_secs(now_f);
-            (lbl.to_string(), salary::fmt_dur_secs(secs), light)
+            (lbl.to_string(), PillValue::Segs(salary::dur_segs(secs), light))
         },
-        ("今日已经打字".to_string(), fmt_count(app.store.typing_keys), light),
+        (
+            "今天已经输入了".to_string(),
+            PillValue::Segs(vec![(fmt_count(app.store.typing_keys), "字".to_string())], light),
+        ),
     ]
 }
 
@@ -469,10 +499,10 @@ fn fmt_count(n: u64) -> String {
 fn draw_pill_info(cv: &mut Canvas, app: &App, right: f32, y: f32, ph: f32, now_f: f64, now_min: f64, alpha: f32) -> f32 {
     let items = pill_items(app, now_f, now_min);
     // 固定块宽 = 最长条目宽度：轮播时左边界不动，日期宽度才不会忽宽忽窄。
-    // 数值宽度按 1.25 倍估（text_w 对 ASCII 偏保守），右对齐绘制天然兼容偏差
+    // 各类值的宽度由 PillValue::width() 统一估算，右对齐绘制天然兼容偏差
     let mut block = s(74.0);
-    for (label, value, _) in items.iter() {
-        block = block.max(text_w(label, 10.5) + s(6.0) + text_w(value, 13.0) * 1.25 + s(10.0));
+    for (label, val) in items.iter() {
+        block = block.max(text_w(label, 10.5) + s(6.0) + val.width() + s(10.0));
     }
     let block = block.min(s(178.0));
     let p = app.anims.rot.v.clamp(0.0, 1.0);
@@ -490,17 +520,52 @@ fn draw_pill_info(cv: &mut Canvas, app: &App, right: f32, y: f32, ph: f32, now_f
     right - block
 }
 
-/// 单条信息：右对齐绘制「标签(灰) + 值(粗)」；值过长时先降字号，保证完整显示。
-/// 盒宽给足余量 + 尾对齐，宽度估算误差不会引起折行或裁切。
-fn draw_info_line(cv: &mut Canvas, item: &(String, String, u32), right: f32, y0: f32, ph: f32, alpha: f32) {
-    let (label, value, col) = item;
-    let mut size = 13.0f32;
-    while size > 9.0 && text_w(value, size) * 1.25 > s(126.0) {
-        size -= 0.5;
+/// 单条信息：右对齐绘制「标签(灰) + 值」。Plain 整段同色；
+/// Segs 数值大字彩色 + 单位小字灰；Progress 主题色进度条 + 小字百分比。
+fn draw_info_line(cv: &mut Canvas, item: &(String, PillValue), right: f32, y0: f32, ph: f32, alpha: f32) {
+    let (label, val) = item;
+    let vr = right + s(6.0); // 值区右缘（略微伸进内边距，避开裁剪边界）
+    let vw = val.width();
+
+    match val {
+        PillValue::Plain(value, col) => {
+            let mut size = 13.0f32;
+            while size > 9.0 && text_w(value, size) * 1.25 > s(126.0) {
+                size -= 0.5;
+            }
+            let w = text_w(value, size) * 1.25 + s(8.0);
+            cv.text_ex(vr - w, y0, w + s(2.0), ph, value, size, W_SEMI, *col, alpha, 2, 1);
+        }
+        PillValue::Segs(segs, col) => {
+            // 从右往左依次画：单位(小字灰) → 数值(大字彩色)
+            // 用 text1（不折行）：分段盒宽很窄，text_ex 会误把数字折成两行
+            let mut x = vr - s(2.0);
+            for (num, unit) in segs.iter().rev() {
+                let uw = text_w(unit, 9.5);
+                x -= uw;
+                cv.text1(x, y0, uw + s(2.0), ph, unit, 9.5, W_MED, UNIT, alpha);
+                let nw = text_w(num, 13.0);
+                x -= nw;
+                cv.text1(x, y0, nw + s(2.0), ph, num, 13.0, W_SEMI, *col, alpha);
+                x -= s(1.0);
+            }
+        }
+        PillValue::Progress(prog) => {
+            let pct = format!("{}%", (prog.clamp(0.0, 1.0) * 100.0).round() as i32);
+            let pw = text_w(&pct, 9.5);
+            let bw = pill_bar_w();
+            // 百分比（小字灰，右缘贴齐；text1 不折行）
+            cv.text1(vr - pw - s(2.0), y0, pw + s(4.0), ph, &pct, 9.5, W_MED, TXT2, alpha);
+            // 进度条：灰色底槽 + 主题色填充
+            let bx = vr - pw - s(6.0) - bw;
+            let by = y0 + ph / 2.0 - s(3.5);
+            let bh = s(7.0);
+            cv.rrect(bx, by, bw, bh, s(3.5), TXT3, alpha * 0.30);
+            let fw = (bw * prog.clamp(0.0, 1.0)).max(bh).min(bw);
+            cv.rrect(bx, by, fw, bh, s(3.5), crate::theme::main(), alpha);
+        }
     }
-    let vw = text_w(value, size) * 1.25 + s(8.0);
-    let vr = right + s(6.0); // 数值右缘（略微伸进内边距，避开裁剪边界）
-    cv.text_ex(vr - vw, y0, vw + s(2.0), ph, value, size, W_SEMI, *col, alpha, 2, 1);
+
     let lw = text_w(label, 10.5) * 1.15 + s(4.0);
     let lx = vr - vw - s(6.0) - lw;
     cv.text_ex(lx, y0, lw + s(4.0), ph, label, 10.5, W_NORMAL, TXT2, alpha, 2, 1);

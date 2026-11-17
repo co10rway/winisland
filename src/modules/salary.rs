@@ -73,6 +73,7 @@ impl SalaryCalc {
 }
 
 /// "3h04m12s" / "4m12s" / "12s" —— 秒级时长
+#[allow(dead_code)]
 pub fn fmt_dur_secs(secs: f64) -> String {
     let t = secs.max(0.0).floor() as i64;
     let (h, m, s) = (t / 3600, (t % 3600) / 60, t % 60);
@@ -83,6 +84,22 @@ pub fn fmt_dur_secs(secs: f64) -> String {
     } else {
         format!("{s}s")
     }
+}
+
+/// "3h04m12s" 的分段表示：[("3","h"),("04","m"),("12","s")]
+/// 供胶囊「数值大字 + 单位小字」分色展示；省略高位为 0 的段。
+pub fn dur_segs(secs: f64) -> Vec<(String, String)> {
+    let t = secs.max(0.0).floor() as i64;
+    let (h, m, s) = (t / 3600, (t % 3600) / 60, t % 60);
+    let mut v = Vec::with_capacity(3);
+    if h > 0 {
+        v.push((h.to_string(), "h".to_string()));
+    }
+    if h > 0 || m > 0 {
+        v.push((format!("{m:02}"), "m".to_string()));
+    }
+    v.push((format!("{s:02}"), "s".to_string()));
+    v
 }
 
 /// 金额小数位：标准两位小数（用户要求，变化慢或静止均可接受）。
