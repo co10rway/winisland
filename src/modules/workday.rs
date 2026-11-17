@@ -283,12 +283,11 @@ fn parse_date(s: &str) -> Option<(i32, u32, u32)> {
 
 // ───────────────────────── 联网同步 ─────────────────────────
 
-/// 启动时调用：读缓存 + （可选）后台同步当年与明年
-pub fn init(cfg: &Salary) {
+/// 启动时调用：读缓存 + 后台同步当年与明年。
+/// 节假日信息默认联网同步（设置里已无开关）；失败时静默，不向上报错。
+pub fn init(_cfg: &Salary) {
     load_cache();
-    if cfg.online_calendar {
-        sync_async();
-    }
+    sync_async();
 }
 
 /// 后台拉取官方日历。多次调用会被合并（同一时刻只跑一个）。
@@ -318,8 +317,8 @@ pub fn sync_async() {
             set_note(&format!("已同步 {} 条官方安排", all.len()));
             // 岛上的状态徽标由每秒 tick 重绘，无需在此跨线程强制刷新
         } else {
+            // 联网同步失败：静默处理，仅保留内置/缓存日历，不展示任何报错信息
             SYNC_STATE.store(SYNC_FAIL, Ordering::Relaxed);
-            set_note("同步失败（已使用内置/缓存日历）");
         }
         SYNC_RUNNING.store(false, Ordering::SeqCst);
     });
@@ -433,6 +432,36 @@ pub fn holiday_name(st: &SYSTEMTIME) -> Option<String> {
     cal().read().ok()?.rest.get(&key).cloned()
 }
 
+// ───────────────────────── 胶囊节日展示 ─────────────────────────
+
+/// 离屏预览测试用：覆盖节日名（如「圣诞节」），None = 恢复正常判定。
+/// 仅用于 --preview-pill --festival=XXX，正式运行恒为 None。
+static PREVIEW_FESTIVAL: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+pub fn set_preview_festival(name: Option<String>) {
+    let slot = PREVIEW_FESTIVAL.get_or_init(|| RwLock::new(None));
+    if let Ok(mut n) = slot.write() {
+        *n = name;
+    }
+}
+
+/// 胶囊日期下方展示的节日名：测试覆盖优先，其次内置节日表，再查放假日名。
+/// 节假日信息默认联网同步；同步失败时静默回退，不返回任何报错。
+pub fn display_festival(st: &SYSTEMTIME) -> Option<String> {
+    if let Some(slot) = PREVIEW_FESTIVAL.get() {
+        if let Ok(n) = slot.read() {
+            if let Some(name) = n.as_ref() {
+                if !name.is_empty() {
+                    return Some(name.clone());
+                }
+            }
+        }
+    }
+    festival(st)
+        .map(|s| s.to_string())
+        .or_else(|| holiday_name(st))
+}
+
 /// 上班状态
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -493,7 +522,8 @@ pub fn phase_now(st: &SYSTEMTIME, sal: &Salary) -> Phase {
     }
 }
 
-/// 设置页展示用的一句话状态
+/// 设置页展示用的一句话状态（保留供排查用；同步失败时不返回报错信息）
+#[allow(dead_code)]
 pub fn status_line(sal: &Salary) -> String {
     let st = clock::local_time();
     let phs = phase_now(&st, sal);

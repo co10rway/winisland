@@ -940,6 +940,11 @@ fn preview_reminder() {
 fn preview_pill() {
     let mut app = preview_app(false);
     let out_dir = std::env::args().nth(2).unwrap_or_else(|| "preview-pill".to_string());
+    // --festival=圣诞节：离屏预览时注入测试节日名，验证日期下方小字展示（正式运行无此参数）
+    if let Some(arg) = std::env::args().find(|a| a.starts_with("--festival=")) {
+        let name = arg["--festival=".len()..].to_string();
+        crate::modules::workday::set_preview_festival(if name.is_empty() { None } else { Some(name) });
+    }
     let _ = std::fs::create_dir_all(&out_dir);
     let mut canvas = match Canvas::new() {
         Ok(c) => c,
@@ -1044,6 +1049,20 @@ pub fn save_now() {
             app.dirty = false;
         }
     });
+}
+
+/// 设置窗口点「同步」后调用：用最新配置重建运行时数据并刷新面板。
+/// - SalaryCalc 是配置快照，月薪 / 作息改动必须重建才生效
+/// - 工作日判定与节假日缓存按最新配置重新加载，并后台拉取一次官方数据
+pub fn reload_runtime() {
+    workday::init(&with_cfg(|c| c.salary.clone()));
+    APP.with(|a| {
+        if let Some(app) = a.borrow_mut().as_mut() {
+            app.sal = salary::SalaryCalc::new(&app.cfg.salary);
+            app.dirty = false;
+        }
+    });
+    redraw();
 }
 
 /// 设置页调整中转站上限：写入配置，并立即裁掉超出的旧条目（保持最新在前）。

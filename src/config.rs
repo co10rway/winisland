@@ -171,7 +171,7 @@ pub const PANEL_KINDS: [(&str, &str); 7] = [
     ("files", "文件中转站"),
     ("clips", "剪贴板中转"),
     ("health", "健康提醒"),
-    ("salary", "薪资模拟器"),
+    ("salary", "打工鼓励器"),
 ];
 
 /// id -> 展示名（未知 id 返回 "其他"）

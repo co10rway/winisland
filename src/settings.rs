@@ -81,7 +81,7 @@ const GROUPS: [&str; 4] = ["外观", "效率", "关怀", "其他"];
 const NAV: [(usize, usize, &str); 12] = [
     (0, 0, "通用"),
     (11, 0, "面板页面"),
-    (2, 1, "薪资模拟器"),
+    (2, 1, "打工鼓励器"),
     (3, 1, "日程安排"),
     (4, 1, "待办清单"),
     (5, 1, "文件中转站"),
@@ -94,7 +94,6 @@ const NAV: [(usize, usize, &str); 12] = [
 ];
 
 const ID_TIMER_STATUS: usize = 1;
-const ID_TIMER_SYNC: usize = 2;
 const ID_TIMER_ICS: usize = 3;
 const EM_SETMARGINS: u32 = 0x00D3;
 const EC_LEFTMARGIN: usize = 1;
@@ -123,8 +122,6 @@ enum RowKind {
     Sound,
     /// 工作日：一排「一二三四五六日」可点方块
     Weekday,
-    /// 动态说明文字（内容随时计算，如节假日同步状态）
-    Info,
 }
 
 struct Row {
@@ -196,10 +193,6 @@ impl Row {
     fn weekday() -> Row {
         Row { kind: RowKind::Weekday, slot: 0, label: "工作日", desc: "点选需要上班的星期；未自定义时按法定日历判定", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
     }
-    /// 动态说明行
-    fn info() -> Row {
-        Row { kind: RowKind::Info, slot: 0, label: "", desc: "", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
-    }
     /// 面板轮播页行：slot = 在 panel.pages 中的下标；btns = [↑, ↓]
     fn page_row(idx: usize, label: &'static str) -> Row {
         let slot = idx as i32;
@@ -249,11 +242,6 @@ fn layout(page: &Page) -> Layout {
                 i += 1;
             }
             RowKind::Note => {
-                placed.push(Placed { row: i, y, h: NOTE_H });
-                y += NOTE_H;
-                i += 1;
-            }
-            RowKind::Info => {
                 placed.push(Placed { row: i, y, h: NOTE_H });
                 y += NOTE_H;
                 i += 1;
@@ -321,24 +309,20 @@ fn pages() -> Vec<Page> {
                 Row::note("久坐时长取自系统真实输入空闲时间，不记录任何操作内容。"),
             ],
         },
-        // 2 薪资模拟器
+        // 2 打工鼓励器
         Page {
-            title: "薪资模拟器",
-            desc: "按月薪折算到每秒，胶囊轮播今日已赚 / 工作进度 / 距下班",
+            title: "打工鼓励器",
+            desc: "按月薪折算到每秒，胶囊轮播今天已赚 / 工作进度 / 距下班",
             rows: vec![
-                Row::toggle(0, "启用薪资模拟器", "关闭后胶囊右侧改为显示打字速度"),
+                Row::toggle(0, "启用打工鼓励器", "关闭后胶囊右侧改为显示打字速度"),
                 Row::field(1, "月薪", "用于折算每秒收入", 128.0).suffix("元"),
                 Row::field(2, "每日工时", "", 100.0).suffix("小时"),
-                Row::field(3, "每月工作日", "", 100.0).suffix("天"),
                 Row::field(4, "上午上班", "留空用默认 09:00", 100.0).ph("09:00"),
                 Row::field(6, "午休开始", "去吃饭的时间", 100.0).ph("12:00"),
                 Row::field(7, "下午上班", "午休结束时间", 100.0).ph("13:00"),
                 Row::field(5, "下班时间", "留空用默认 18:00", 100.0).ph("18:00"),
                 Row::weekday(),
-                Row::toggle(10, "联网同步节假日", "启动时拉取官方放假 / 调休，用来判定上班状态"),
-                Row::action(8, "节假日数据", "内置 2025–2026 官方安排，联网可补齐调休与节日", vec![("立即同步", 8, true, 112.0)]),
-                Row::info(),
-                Row::note("上班状态 = 勾选的星期 + 官方节假日 / 调休；金额只在上下班区间内增长，午休不计。"),
+                Row::note("上班状态 = 勾选的星期 + 官方节假日 / 调休；金额只在上下班区间内增长，午休不计。节假日联网自动同步，同步失败时不展示。"),
             ],
         },
         // 3 日程安排
@@ -481,6 +465,8 @@ enum HitId {
     /// 工作日（0=周一 … 6=周日）
     Weekday(usize),
     Sound,
+    /// 底部「同步」按钮：保存所有页配置 + 刷新面板数据
+    Sync,
     Min,
     Close,
 }
@@ -661,7 +647,6 @@ fn apply_page(page: usize) {
         2 => {
             let m = field_text(2, 1).trim().parse::<f64>().ok();
             let hd = field_text(2, 2).trim().parse::<f64>().ok();
-            let wd = field_text(2, 3).trim().parse::<f64>().ok();
             let st = field_text(2, 4).trim().to_string();
             let ls = field_text(2, 6).trim().to_string();
             let le = field_text(2, 7).trim().to_string();
@@ -672,9 +657,6 @@ fn apply_page(page: usize) {
                 }
                 if let Some(v) = hd {
                     c.salary.hours_per_day = v.clamp(0.5, 24.0);
-                }
-                if let Some(v) = wd {
-                    c.salary.workdays_per_month = v.clamp(1.0, 31.0);
                 }
                 if st.len() >= 4 {
                     c.salary.work_start = st;
@@ -793,7 +775,6 @@ fn sync_page(page: usize) {
             (1, 3) => c.health.water_goal_cups.to_string(),
             (2, 1) => fmt_num(c.salary.monthly),
             (2, 2) => fmt_num(c.salary.hours_per_day),
-            (2, 3) => fmt_num(c.salary.workdays_per_month),
             (2, 4) => c.salary.work_start.clone(),
             (2, 5) => c.salary.work_end.clone(),
             (2, 6) => c.salary.lunch_start.clone(),
@@ -838,6 +819,15 @@ fn sync_all() {
     }
 }
 
+/// 提交所有页的输入框到配置（关闭窗口 / 点同步时用）。
+/// 输入框失焦与切换页面不再自动提交——所有改动统一走这里。
+fn apply_all() {
+    let n = pages().len();
+    for p in 0..n {
+        apply_page(p);
+    }
+}
+
 // ───────────────────────── 绘制 ─────────────────────────
 
 fn draw_all(cv: &mut Canvas, w: f32, h: f32, page: usize, hover: HitId, hits: &mut Vec<Hit>) {
@@ -847,7 +837,7 @@ fn draw_all(cv: &mut Canvas, w: f32, h: f32, page: usize, hover: HitId, hits: &m
     if let Some(p) = list.get(page) {
         draw_page(cv, p, page, hover, hits);
     }
-    draw_footer(cv, w, h);
+    draw_footer(cv, w, h, hover, hits);
 }
 
 /// --preview-settings [输出目录] [--scroll=N]：把每一页离屏渲染成 BMP（仅调试用）。
@@ -1076,8 +1066,6 @@ fn draw_row(cv: &mut Canvas, row: &Row, page: usize, pl: &Placed, cx: f32, cw: f
                 crate::app::with_cfg(|c| c.auto_collapse)
             } else if page == 0 {
                 crate::app::with_cfg(|c| c.autostart)
-            } else if page == 2 && row.slot == 10 {
-                crate::app::with_cfg(|c| c.salary.online_calendar)
             } else if page == 3 && matches!(row.slot, 10 | 20 | 30) {
                 // 日程三个来源各自的开关，不能落到 module_enabled（那是模块总开关）
                 crate::app::with_cfg(|c| match row.slot {
@@ -1252,10 +1240,6 @@ fn draw_row(cv: &mut Canvas, row: &Row, page: usize, pl: &Placed, cx: f32, cw: f
                 bx += d + gap;
             }
         }
-        RowKind::Info => {
-            let msg = crate::modules::workday::status_line(&crate::app::with_cfg(|c| c.salary.clone()));
-            cv.text1(cx + s(2.0), ry, cw, rh, &msg, 10.5, W_NORMAL, TXT2, 0.88);
-        }
         RowKind::Field => {
             let bw = s(row.fw);
             let bx = cx + cw - s(18.0) - bw;
@@ -1364,7 +1348,7 @@ fn draw_hero(cv: &mut Canvas, x: f32, y: f32, w: f32, h: f32) {
     cv.text1(tx + vw + s(10.0), y + s(52.0), w - (tx - x) - vw - s(30.0), s(20.0), "Rust 原生 · 单一 exe · 零运行时依赖", 10.5, W_NORMAL, TXT2, 0.95);
 }
 
-fn draw_footer(cv: &mut Canvas, w: f32, h: f32) {
+fn draw_footer(cv: &mut Canvas, w: f32, h: f32, hover: HitId, hits: &mut Vec<Hit>) {
     let fy = h - s(FOOT_H);
     cv.rect(s(SIDE_W), fy, w - s(SIDE_W), s(FOOT_H), FOOT_BG, 1.0);
     cv.line(s(SIDE_W), fy + 0.5, w, fy + 0.5, HAIR, 1.0, s(1.0));
@@ -1372,13 +1356,19 @@ fn draw_footer(cv: &mut Canvas, w: f32, h: f32) {
     let bh = s(34.0);
     let by = fy + (s(FOOT_H) - bh) / 2.0;
 
+    // 右侧「同步」按钮
+    let sw = s(96.0);
+    let sx = w - s(PAD) - sw;
+    draw_button(cv, sx, by, sw, bh, "同步", true, hover == HitId::Sync, 1.0);
+    push_hit(hits, HitId::Sync, sx, by, sw, bh);
+
     let st = STATUS.with(|c| c.borrow().clone());
     let (msg, c, saved) = match st {
         Some((m, until)) if Instant::now() < until => (m, GREEN, true),
-        _ => ("改动即时生效，并写入本机配置".to_string(), TXT3, false),
+        _ => ("修改后点击「同步」保存到本机并刷新面板".to_string(), TXT3, false),
     };
     let tx = s(SIDE_W + PAD);
-    let maxw = w - s(SIDE_W) - s(PAD) * 2.0;
+    let maxw = (sx - s(12.0) - tx).max(s(40.0));
     if saved {
         cv.circle(tx + s(3.0), fy + s(FOOT_H) / 2.0, s(3.0), GREEN, 0.95);
         cv.text1(tx + s(14.0), by, maxw - s(14.0), bh, &msg, 11.0, W_MED, c, 1.0);
@@ -1634,7 +1624,7 @@ fn on_click(hwnd: HWND, id: HitId) {
         HitId::Nav(p) => {
             let cur = PAGE.with(|c| c.get());
             if cur != p {
-                apply_page(cur);
+                // 切页不自动提交输入：所有改动统一由底部「同步」按钮保存并生效
                 unsafe { show_page(hwnd, p) };
             }
         }
@@ -1672,16 +1662,6 @@ fn on_click(hwnd: HWND, id: HitId) {
                 let name = match slot { 10 => "飞书日历", 20 => "钉钉日历", _ => "企业微信日历" };
                 let msg = if on { format!("{name}已启用") } else { format!("{name}已停用") };
                 flash(&msg);
-            } else if page == 2 && slot == 10 {
-                let on = crate::app::with_cfg(|c| {
-                    c.salary.online_calendar = !c.salary.online_calendar;
-                    c.salary.online_calendar
-                });
-                crate::app::save_now();
-                if on {
-                    crate::modules::workday::sync_async();
-                }
-                flash(if on { "已开启联网同步" } else { "已关闭联网同步（用内置日历）" });
             } else if page == 11 {
                 crate::app::with_cfg(|c| {
                     if let Some(p) = c.panel.pages.get_mut(slot as usize) {
@@ -1712,15 +1692,6 @@ fn on_click(hwnd: HWND, id: HitId) {
                 (8, 7) => {
                     apply_page(8);
                     flash("已保存 · 重启后生效");
-                }
-                (2, 8) => {
-                    apply_page(2);
-                    crate::modules::workday::sync_async();
-                    // 同步在后台跑，定时刷新状态行直到结束
-                    unsafe {
-                        SetTimer(Some(hwnd), ID_TIMER_SYNC, 600, None);
-                    }
-                    flash("正在同步官方节假日…");
                 }
                 (3, 5) => {
                     apply_page(3);
@@ -1790,6 +1761,14 @@ fn on_click(hwnd: HWND, id: HitId) {
             flash(if on { "已开启声音响应" } else { "已关闭声音响应" });
             invalidate(hwnd);
         }
+        HitId::Sync => {
+            // 统一提交所有页的输入框，保存并让面板立即用上新配置
+            apply_all();
+            crate::app::save_now();
+            crate::app::reload_runtime();
+            flash("已保存并同步到面板");
+            invalidate(hwnd);
+        }
         HitId::Weekday(i) => {
             crate::app::with_cfg(|c| {
                 let mut w = c.salary.weekdays_view();
@@ -1818,8 +1797,7 @@ fn on_click(hwnd: HWND, id: HitId) {
 }
 
 fn hide_and_restore(hwnd: HWND) {
-    let cur = PAGE.with(|c| c.get());
-    apply_page(cur);
+    apply_all(); // 关闭窗口时兜底提交所有页输入，避免用户改了没点同步就丢失
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
@@ -1895,14 +1873,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             STATUS.with(|c| *c.borrow_mut() = None);
             let _ = KillTimer(Some(hwnd), ID_TIMER_STATUS);
             invalidate(hwnd);
-            LRESULT(0)
-        }
-        WM_TIMER if wparam.0 == ID_TIMER_SYNC => {
-            // 后台同步期间刷新状态行；结束后停表
-            invalidate(hwnd);
-            if crate::modules::workday::sync_state() != crate::modules::workday::SYNC_RUN {
-                let _ = KillTimer(Some(hwnd), ID_TIMER_SYNC);
-            }
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == ID_TIMER_ICS => {
@@ -1987,8 +1957,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if code == EN_SETFOCUS_CODE {
                 invalidate(hwnd);
             } else if code == EN_KILLFOCUS_CODE {
-                let cur = PAGE.with(|c| c.get());
-                apply_page(cur);
+                // 失焦不再自动保存/生效：所有修改统一由底部「同步」按钮提交
                 invalidate(hwnd);
             }
             LRESULT(0)

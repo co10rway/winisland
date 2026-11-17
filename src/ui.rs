@@ -343,7 +343,7 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
         }
     }
 
-    // 中间段：日期（+节日徽标）| 上班状态徽标 | 时间
+    // 中间段：日期（下方小字节日）| 上班状态徽标 | 时间
     // 日期在左、时间在右；放不下时逐级退化（整日期 → 11/15 → 省略号）
     // 时间显示到秒：时分秒统一大字同色，读作完整的 HH:MM:SS
     let time_str = clock::hhmmss(&st);
@@ -360,45 +360,36 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
     let tail = gap + if phs.is_some() { chip_w + gap } else { 0.0 } + time_w;
 
     if app.cfg.modules.clock {
-        let fes = workday::festival(&st);
-        let fes_w = fes.map(|f| text_w(f, 10.5) + s(17.0)).unwrap_or(0.0);
+        // 节日名放在日期下方（小字），与日期共用左边界、不再额外占水平空间
+        let fes = workday::display_festival(&st);
         let date_end = money_left - gap - tail; // 日期段最多画到这里
-        let avail = (date_end - cx - fes_w).max(0.0);
+        let avail = (date_end - cx).max(0.0);
+        let fes_tw = fes.as_ref().map(|f| text_w(f, 9.5)).unwrap_or(0.0);
         let mut used = 0.0f32;
         if avail > s(26.0) {
             let date_full = clock::date_short(&st);
             let date_min = format!("{}/{}", st.wMonth, st.wDay);
-            let shown = if avail >= text_w(&date_full, 12.5) {
+            // 块宽同时容纳日期与更长的节日名，避免下方小字被挤掉
+            let need_full = text_w(&date_full, 12.5).max(fes_tw);
+            let need_min = text_w(&date_min, 12.5).max(fes_tw);
+            let shown = if avail >= need_full {
                 date_full
-            } else if avail >= text_w(&date_min, 12.5) {
+            } else if avail >= need_min {
                 date_min
             } else {
                 ellipsize(&date_full, 12.5, avail)
             };
-            used = text_w(&shown, 12.5).min(avail);
-            cv.text_ex(cx, y, avail, ph, &shown, 12.5, W_MED, TXT2, alpha * 0.95, 0, 1);
-        }
-        if let Some(f) = fes {
-            let chip_w2 = text_w(f, 10.5) + s(14.0);
-            let chip_h = s(17.0);
-            let bx = cx + used + s(5.0);
-            if bx + chip_w2 <= date_end {
-                cv.rrect(bx, cy - chip_h / 2.0, chip_w2, chip_h, chip_h / 2.0, crate::theme::main(), alpha * 0.16);
-                cv.text_ex(
-                    bx + s(7.0),
-                    cy - chip_h / 2.0,
-                    chip_w2 - s(10.0),
-                    chip_h,
-                    f,
-                    10.5,
-                    W_MED,
-                    crate::theme::light(),
-                    alpha,
-                    0,
-                    1,
-                );
-                used += s(5.0) + chip_w2;
+            used = text_w(&shown, 12.5).max(fes_tw).min(avail);
+            if fes.is_some() {
+                // 有节日：日期上移，节日小字在下方，两行整体垂直居中
+                cv.text_ex(cx, cy - s(18.0), used, s(18.0), &shown, 12.5, W_MED, TXT2, alpha * 0.95, 0, 1);
+            } else {
+                cv.text_ex(cx, y, used, ph, &shown, 12.5, W_MED, TXT2, alpha * 0.95, 0, 1);
             }
+        }
+        if let Some(f) = fes.as_ref() {
+            // 节日小字：主题弱化色，紧贴日期正下方
+            cv.text_ex(cx, cy + s(1.0), avail, s(14.0), f, 9.5, W_MED, crate::theme::light(), alpha * 0.92, 0, 1);
         }
         if used > 0.0 {
             cx += used + gap;
