@@ -47,7 +47,12 @@ pub enum HitId {
     PagePrev,
     PageNext,
     Collapse,
+    /// 待办页「＋ 新增待办」按钮
+    TodoAdd,
+    /// 待办行「完成/未完成」切换（点击整行）
     TodoToggle(usize),
+    /// 待办行尾「×」删除按钮（悬停显示）
+    TodoDel(usize),
     FileOpen(usize),
     ClipCopy(usize),
     WaterOk,
@@ -103,7 +108,9 @@ pub fn panel_scroll_max(app: &App, kind: &str) -> f32 {
     if n == 0 {
         return 0.0;
     }
-    let content_end = s(BODY_TOP) + n as f32 * row + s(4.0);
+    // 待办页顶部多一块「+ 新增待办」固定按钮区，列表从其下开始
+    let top_offset = if kind == "todo" { s(TODO_ADD_H) + s(6.0) } else { 0.0 };
+    let content_end = s(BODY_TOP) + top_offset + n as f32 * row + s(4.0);
     (content_end - body_clip_bottom()).max(0.0)
 }
 
@@ -498,6 +505,8 @@ pub fn pill_mode_key(app: &App) -> u32 {
 
 const HEADER_H: f32 = 48.0;
 const BODY_TOP: f32 = 76.0;
+/// 待办页「＋ 新增待办」按钮区高度（固定在标题下，列表从其下方滚动）
+const TODO_ADD_H: f32 = 32.0;
 
 /// 依据配置推导实际参与轮播的页面（顺序即展示顺序；模块关闭时自动跳过）
 pub fn effective_pages(cfg: &crate::config::Config) -> Vec<&'static str> {
@@ -854,16 +863,25 @@ fn page_todo(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>
     let done = app.store.todos.iter().filter(|t| t.done).count();
     draw_label(app, cv, w, crate::config::panel_name("todo"), Some(format!("{}/{} 完成", done, total)), alpha);
 
+    // ── 「＋ 新增待办」固定按钮（置于标题下，始终可见）──
+    let ay = s(BODY_TOP);
+    let ah = s(TODO_ADD_H);
+    let ahp = app.anims.hover_p(&HitId::TodoAdd);
+    cv.rrect(pad, ay, iw, ah, s(9.0), mix(0x1E1E25, crate::theme::main(), ahp * 0.5), alpha * (0.85 + 0.15 * ahp));
+    cv.rrect_stroke(pad, ay, iw, ah, s(9.0), crate::theme::main(), alpha * (0.5 + 0.5 * ahp), s(1.0));
+    cv.text1(pad, ay, iw, ah, "＋ 新增待办", 12.0, W_SEMI, mix(TXT2, crate::theme::tint(), ahp), alpha);
+    push_hit(hits, HitId::TodoAdd, pad, ay, iw, ah);
+
     if total == 0 {
-        empty_hint(cv, w, "还没有待办 · 在 data.json 里每行加一条", alpha);
+        empty_hint(cv, w, "点击上方按钮即可添加", alpha);
         return;
     }
     let row_h = s(27.0);
     let sc = app.panel_scroll.min(panel_scroll_max(app, "todo"));
-    let mut y = s(BODY_TOP) - sc;
+    let mut y = s(BODY_TOP) + s(TODO_ADD_H) + s(6.0) - sc;
     let r = s(6.5);
 
-    // 未完成优先
+    // 完成/未完成
     for want_done in [false, true] {
         for (idx, it) in app.store.todos.iter().enumerate() {
             if it.done != want_done {
@@ -881,8 +899,23 @@ fn page_todo(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>
                 cv.circle(cxx, cyy, rr, ROW2, alpha);
                 cv.circle_stroke(cxx, cyy, rr, mix(TXT3, crate::theme::light(), hp), alpha * 0.85, s(1.0));
             }
-            cv.text1(pad + s(20.0), y, iw - s(20.0), row_h, &it.title, 11.5, W_NORMAL, if it.done { TXT3 } else { TXT }, alpha);
+            // 标题（右侧预留删除按钮空间）
+            cv.text1(pad + s(20.0), y, iw - s(34.0), row_h, &it.title, 11.5, W_NORMAL, if it.done { TXT3 } else { TXT }, alpha);
+            // 行尾「×」删除：只在悬停该行时显示（柔和高亮随悬停淡入淡出）
+            let del_x = pad + iw - s(24.0);
+            let dhp = app.anims.hover_p(&HitId::TodoDel(idx));
+            let dvisible = dhp.max(hp);
+            if dvisible > 0.004 {
+                let dcx = del_x + s(8.0);
+                let dcy = y + row_h / 2.0;
+                cv.circle(dcx, dcy, s(8.5), mix(0x2C2C36, 0xFF5A5A, dhp), alpha * 0.95 * dvisible);
+                cv.line(dcx - s(3.2), dcy, dcx + s(3.2), dcy, 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+                cv.line(dcx - s(3.2), dcy - s(3.2), dcx + s(3.2), dcy + s(3.2), 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+                cv.line(dcx - s(3.2), dcy + s(3.2), dcx + s(3.2), dcy - s(3.2), 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+            }
+            // 命中区：整行切换完成；行尾小方块删除
             push_hit_body(hits, HitId::TodoToggle(idx), pad, y, iw, row_h);
+            push_hit_body(hits, HitId::TodoDel(idx), del_x, y, s(24.0), row_h);
             y += row_h;
         }
     }

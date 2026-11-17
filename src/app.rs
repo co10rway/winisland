@@ -1022,6 +1022,43 @@ pub fn with_cfg<R>(f: impl FnOnce(&mut Config) -> R) -> R {
     })
 }
 
+/// 面板新增待办（由待办输入对话框回调）：写入 store 并保存、重绘。
+/// 新待办追加到末尾，未完成优先排序由渲染端处理。
+pub fn push_todo(title: &str) {
+    APP.with(|a| {
+        let mut b = a.borrow_mut();
+        let Some(app) = b.as_mut() else { return };
+        app.store.todos.push(crate::store::TodoItem {
+            title: title.to_string(),
+            done: false,
+        });
+        app.dirty = true;
+        app.save_now_quiet();
+    });
+}
+
+/// 面板删除待办（行尾 ×）在 click 中直接处理，这里保留为对外 API。
+#[allow(dead_code)]
+pub fn remove_todo(index: usize) {
+    APP.with(|a| {
+        let mut b = a.borrow_mut();
+        let Some(app) = b.as_mut() else { return };
+        if index < app.store.todos.len() {
+            app.store.todos.remove(index);
+            app.dirty = true;
+            app.save_now_quiet();
+        }
+    });
+}
+
+impl App {
+    /// 待办数据有变：立即落盘（不必等 2s 节流）+ 触痛重绘
+    fn save_now_quiet(&mut self) {
+        self.store.save();
+        self.last_save = Instant::now();
+    }
+}
+
 /// 调试用：把离屏预览的 App 装进 APP（--preview-settings 需要读配置）
 pub(crate) fn install_preview_app(demo: bool) {
     let app = preview_app(demo);
@@ -1471,6 +1508,16 @@ fn on_clipboard_update() {
 }
 
 fn click(h: &HitId) {
+    // 「新增待办」在 APP 借用之外处理：模态对话框的消息循环会再次触达主窗口
+    // 事件，若此时还持有 APP 借用会重入冲突。
+    if let HitId::TodoAdd = h {
+        let res = crate::modules::todo_add::prompt();
+        if let crate::modules::todo_add::Result2::Confirm(txt) = &res {
+            push_todo(txt);
+            crate::app::redraw();
+        }
+        return;
+    }
     let mut open_file: Option<String> = None;
     APP.with(|a| {
         let mut b = a.borrow_mut();
@@ -1522,6 +1569,15 @@ fn click(h: &HitId) {
                 if let Some(t) = app.store.todos.get_mut(*i) {
                     t.done = !t.done;
                     app.dirty = true;
+                }
+            }
+            // 已在 click 开头单独处理（模态对话框需在 APP 借用之外运行）
+            HitId::TodoAdd => {} 
+            HitId::TodoDel(i) => {
+                // 悬停行尾 × 删除：只删、不误触完成切换
+                if *i < app.store.todos.len() {
+                    app.store.todos.remove(*i);
+                    app.save_now_quiet();
                 }
             }
             HitId::FileOpen(i) => {

@@ -11,4 +11,5 @@ pub mod salary;
 pub mod sched_ics;
 pub mod tray;
 pub mod typing;
+pub mod todo_add;
 pub mod workday;
