@@ -11,7 +11,6 @@ pub fn hhmm(st: &SYSTEMTIME) -> String {
     format!("{:02}:{:02}", st.wHour, st.wMinute)
 }
 
-#[allow(dead_code)]
 pub fn hhmmss(st: &SYSTEMTIME) -> String {
     format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
 }

@@ -343,8 +343,12 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
 
     // 中间段：日期（+节日徽标）| 上班状态徽标 | 时间
     // 日期在左、时间在右；放不下时逐级退化（整日期 → 11/15 → 省略号）
-    let time_str = clock::hhmm(&st);
-    let time_w = text_w(&time_str, 21.0) + s(3.0);
+    // 时间显示到秒：时分用大字，秒用小字跟在后面，尽量少占胶囊宽度
+    let time_hm = clock::hhmm(&st);
+    let time_sec = format!(":{:02}", st.wSecond);
+    let time_hm_w = text_w(&time_hm, 21.0);
+    let time_sec_w = text_w(&time_sec, 14.0);
+    let time_w = time_hm_w + time_sec_w + s(2.0);
 
     // 上班状态：按法定工作日 + 上午/午休/下午/下班时间判定
     let phs = if app.cfg.modules.salary { Some(workday::phase_now(&st, &app.cfg.salary)) } else { None };
@@ -413,13 +417,10 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
         }
     }
 
-    // 时间（最右，紧跟状态徽标）
-    if cx + time_w <= money_left {
-        cv.text_ex(cx, y, time_w, ph, &time_str, 21.0, W_BOLD, TXT, alpha, 0, 1);
-    } else {
-        // 实在放不下就贴右边界，宁可压住间隔也不截断数字
-        cv.text_ex(money_left - time_w, y, time_w, ph, &time_str, 21.0, W_BOLD, TXT, alpha, 0, 1);
-    }
+    // 时间（最右，紧跟状态徽标）：时分大字 + 秒小字
+    let tx = if cx + time_w <= money_left { cx } else { money_left - time_w };
+    cv.text_ex(tx, y, time_hm_w, ph, &time_hm, 21.0, W_BOLD, TXT, alpha, 0, 1);
+    cv.text_ex(tx + time_hm_w, y, time_sec_w, ph, &time_sec, 14.0, W_MED, TXT2, alpha, 0, 1);
 }
 
 /// 胶囊右侧「打工人信息」轮播条目：(标签, 值, 颜色)
@@ -584,7 +585,7 @@ fn draw_panel(app: &App, cv: &mut Canvas, w: f32, h: f32, o: f32, bg_a: f32, ct:
         let date_s = clock::date_cn(&st);
         cv.text_ex(pad, 0.0, s(190.0), header_h, &date_s, 13.0, W_MED, TXT2, ct, 0, 1);
         let dw = text_w(&date_s, 13.0);
-        cv.text_ex(pad + dw + s(10.0), 0.0, s(96.0), header_h, &clock::hhmm(&st), 18.0, W_BOLD, TXT, ct, 0, 1);
+        cv.text_ex(pad + dw + s(10.0), 0.0, s(96.0), header_h, &clock::hhmmss(&st), 18.0, W_BOLD, TXT, ct, 0, 1);
 
         let bw = s(28.0);
         let bx = w - bw - pad;
