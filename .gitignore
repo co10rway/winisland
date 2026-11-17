@@ -4,6 +4,8 @@ Cargo.lock.orig
 *.pdb
 /preview
 /preview_set
+/preview_*
+/.workbuddy
 
 # 编译产物与历史归档（不进版本库）
 /winisland.exe
