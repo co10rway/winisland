@@ -22,10 +22,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 分区窗口类名（顶层子窗，随主窗线程的消息循环一起分发）
 const CLASS: PCWSTR = w!("WinIslandZone");
-/// 标题条高度（像素）
-const TITLE_H: i32 = 26;
 /// 圆角半径
-const RADIUS: i32 = 14;
+const RADIUS: i32 = 12;
 
 thread_local! {
     /// 与 config.zones 对齐的活窗口：None = 该分区当前无窗口（隐藏 / 未启用）
@@ -106,7 +104,7 @@ struct AccentPolicy {
 struct WcaData {
     attrib: i32,
     data: *mut c_void,
-    size: u32,
+    size: usize, // SIZE_T：x64 下必须 8 字节，r32 会错位导致 SetWindowCompositionAttribute 失败
 }
 
 const ACCENT_ENABLE_ACRYLICBLURBEHIND: i32 = 4;
@@ -130,7 +128,7 @@ fn set_acrylic(hwnd: HWND, tint_argb: u32) {
                 let mut d = WcaData {
                     attrib: WCA_ACCENT_POLICY,
                     data: &mut ap as *mut _ as *mut c_void,
-                    size: std::mem::size_of::<AccentPolicy>() as u32,
+                    size: std::mem::size_of::<AccentPolicy>(),
                 };
                 let _ = f(hwnd, &mut d as *mut _ as *mut c_void);
             }
@@ -184,7 +182,7 @@ fn create_zone(layer: HWND, z: &crate::config::ZoneConf, idx: usize) -> HWND {
             return hw;
         }
         SetWindowLongPtrW(hw, GWLP_USERDATA, idx as isize);
-        set_acrylic(hw, 0x3A1C2438); // 深色丙烯酸打底：AARRGGBB
+        set_acrylic(hw, 0x241B2336); // 丙烯酸打底：AARRGGBB，A≈14%（高透，壁纸清晰可见）
         let _ = SetWindowPos(hw, None, z.x, z.y, z.w.max(96), z.h.max(64), SWP_NOACTIVATE | SWP_SHOWWINDOW);
         let _ = ShowWindow(hw, SW_SHOWNOACTIVATE);
         hw
@@ -369,7 +367,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, _wparam: WPARAM, _lparam
     }
 }
 
-/// 用 GDI 画分区外观：顶部主题色标题条 + 圆角边框 + 左上角名称。
+/// 用 GDI 画分区外观（其余区域留给丙烯酸毛玻璃透出壁纸）：
+/// 顶部 2px 主题色横线 + 左上角名称小字 + 1px 柔和细圆角边框。
 fn paint_zone(hwnd: HWND) {
     let idx = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
     let (name, color) = if idx >= 0 {
@@ -395,15 +394,8 @@ fn paint_zone(hwnd: HWND) {
             return;
         }
 
-        // 顶部标题条：主题色填充
-        let bar = CreateSolidBrush(COLORREF(color));
-        let rgn = CreateRectRgn(1, 1, w, TITLE_H);
-        let _ = FillRgn(hdc, rgn, bar);
-        let _ = DeleteObject(rgn.into());
-        let _ = DeleteObject(bar.into());
-
-        // 圆角边框
-        let pen = CreatePen(PS_SOLID, 2, COLORREF(color));
+        // 1px 柔和细边框（贴合毛玻璃的浅灰蓝）
+        let pen = CreatePen(PS_SOLID, 1, COLORREF(0x7E8898));
         let old_pen = SelectObject(hdc, pen.into());
         let old_br = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         let _ = RoundRect(hdc, 1, 1, w - 1, h - 1, RADIUS * 2, RADIUS * 2);
@@ -411,9 +403,17 @@ fn paint_zone(hwnd: HWND) {
         let _ = SelectObject(hdc, old_br);
         let _ = DeleteObject(pen.into());
 
-        // 名称文字（主题色）
+        // 顶部 2px 主题色横线（分区强调色，代替旧的大标题条）
+        let line_pen = CreatePen(PS_SOLID, 2, COLORREF(color));
+        let old2 = SelectObject(hdc, line_pen.into());
+        let _ = MoveToEx(hdc, 14, 9, None);
+        let _ = LineTo(hdc, w - 14, 9);
+        let _ = SelectObject(hdc, old2);
+        let _ = DeleteObject(line_pen.into());
+
+        // 左上角名称（主题色小字，透明背景叠在毛玻璃上）
         let font = CreateFontW(
-            -14,
+            -15,
             0,
             0,
             0,
@@ -431,7 +431,7 @@ fn paint_zone(hwnd: HWND) {
         let old_font = SelectObject(hdc, font.into());
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(color));
-        let mut tr = RECT { left: 16, top: 5, right: w - 16, bottom: TITLE_H };
+        let mut tr = RECT { left: 18, top: 16, right: w - 18, bottom: 42 };
         let mut wide: Vec<u16> = name.encode_utf16().collect();
         let _ = DrawTextW(hdc, &mut wide, &mut tr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
         let _ = SelectObject(hdc, old_font);
