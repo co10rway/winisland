@@ -1,12 +1,20 @@
 //! 桌面分区（围栏）：仿 Fences 的桌面图标收纳面板。
 //!
 //! 架构（v0.12 重写为「图标托管」）：
-//! - 每个分区是一块**顶层毛玻璃窗口**。`SetWindowCompositionAttribute` 的 acrylic
-//!   只对**顶层窗口**生效——这是之前反复「纯黑 / 完全不透」的总根因（分区曾是
-//!   Progman 的子窗口，acrylic 永远不生效，露出类背景刷的不透明深色）。
-//!   现在浮在壁纸之上、普通应用窗口之下（HWND_BOTTOM + WS_EX_NOACTIVATE）。
+//! - 每个分区是一块**顶层分层窗口（WS_EX_LAYERED）**，内容由
+//!   `UpdateLayeredWindow` 提交一张逐像素预乘的 ARGB 位图。
+//!
+//!   **为什么不用 acrylic**：`SetWindowCompositionAttribute` 在 acrylic 窗口上
+//!   画过的 GDI 像素**无法擦除**——GDI 写不了 alpha=0，旧像素永久留在窗口表面。
+//!   表现就是改名字旧字叠新字、拖动/缩放时系统位图搬运遗留成阶梯状重影。
+//!   改成「每次内容变化都整张重建位图再提交」后，位图里只可能有本次绘制的内容，
+//!   物理上不可能残留；窗口移动时 DWM 搬运的是完整图层而非屏幕像素，拖动也无重影。
+//!
+//!   半透明由像素 alpha 直接给出（面板底 A=210），所以壁纸能透出来、图标依然清晰：
+//!   GDI 画上去的像素在提交前会被提升到 alpha=255（见 `render` 第 ④ 步），
+//!   避免与预乘值二次相乘而发灰。
 //! - 桌面图标由本模块接管：隐藏 Explorer 的图标层（SHELLDLL_DefView），按分区配置
-//!   枚举桌面项、**自绘图标 + 名称**，网格排列在面板内（3 列）。这样图标才真正
+//!   枚举桌面项、**自绘图标 + 名称**，网格排列在面板内。这样图标才真正
 //!   「在分区里」，而不是被一个空框罩住。
 //! - 双击图标用 ShellExecute 打开；把文件拖到面板上即归入该分区
 //!   （DragAcceptFiles + WM_DROPFILES）。
@@ -19,11 +27,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use windows::core::{w, PCSTR, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, SHGetFileInfoW, ShellExecuteW, HDROP, SHFILEINFOW,
@@ -52,8 +60,12 @@ const EDGE: i32 = 8;
 /// 最小宽 / 高
 const MIN_W: i32 = 160;
 const MIN_H: i32 = TITLE_H + 18;
-/// 毛玻璃打底色（AABBGGRR）：A≈70%，深灰绿
-const TINT: u32 = 0xB4_24_26_1E;
+/// 面板底色（RGB）：深灰绿，与参考图一致
+const PANEL_RGB: (u32, u32, u32) = (30, 38, 36);
+/// 面板底色不透明度（0-255）：210 ≈ 82%，壁纸能透出来但不糊
+const PANEL_A: u32 = 210;
+/// 标题栏底色（RGB）：比面板更沉，接近参考图
+const TITLE_RGB: (u32, u32, u32) = (20, 28, 26);
 /// 分区主题色 ID 列表（右键菜单换色用）
 const COLOR_IDS: [&str; 7] = ["blue", "teal", "green", "purple", "pink", "orange", "red"];
 
@@ -178,52 +190,108 @@ fn set_shell_icons_visible(show: bool) {
     }
 }
 
-// ── 毛玻璃 ──
+// ── 分层窗口渲染（ARGB 逐像素） ──
+//
+// 为什么必须这样：acrylic 窗口上 GDI 画过的像素**无法擦除**——GDI 写不了
+// alpha=0，所以旧像素永远留在窗口表面。这就是「改名字旧字叠新字」、
+// 「拖动 / 缩放时靠系统位图搬运遗留成阶梯状残影」的物理原因。
+//
+// 改为 layered 窗口 + UpdateLayeredWindow：每次内容变化都**整张重建**一张
+// 32bpp 预乘 ARGB 位图再提交，物理上不可能有残留；窗口移动时 DWM 搬运的是
+// 完整图层而不是屏幕像素，所以拖动同样不会重影。
 
-#[repr(C)]
-struct AccentPolicy {
-    state: i32,
-    flags: i32,
-    gradient_color: u32,
-    animation_id: i32,
+/// 一张离屏 32bpp（预乘 BGRA、top-down）位图及其 DC
+struct Surf {
+    dib: HBITMAP,
+    mdc: HDC,
+    old: HGDIOBJ,
+    buf: *mut u32,
+    w: i32,
+    h: i32,
 }
 
-#[repr(C)]
-struct WcaData {
-    attrib: i32,
-    data: *mut c_void,
-    /// WINDOWCOMPOSITIONATTRIBDATA.cbData 在 x64 下是 SIZE_T（8 字节），
-    /// 曾经写成 u32 导致结构错位 → 调用永远失败 → 毛玻璃不生效。
-    size: usize,
-}
-
-/// 给**顶层窗口**设置丙烯酸毛玻璃。argb 为 AABBGGRR。
-fn set_acrylic(hw: HWND, argb: u32) {
-    const WCA_ACCENT_POLICY: i32 = 19;
-    const ACCENT_ENABLE_ACRYLICBLURBEHIND: i32 = 4;
-    unsafe {
-        let lib = match LoadLibraryW(w!("user32.dll")) {
-            Ok(h) => h,
-            Err(_) => return,
-        };
-        let proc = GetProcAddress(lib, PCSTR(b"SetWindowCompositionAttribute\0".as_ptr()));
-        let f: Option<unsafe extern "system" fn(HWND, *mut WcaData) -> i32> =
-            std::mem::transmute(proc);
-        if let Some(f) = f {
-            let mut ap = AccentPolicy {
-                state: ACCENT_ENABLE_ACRYLICBLURBEHIND,
-                flags: 0x20 | 0x40 | 0x80,
-                gradient_color: argb,
-                animation_id: 0,
-            };
-            let mut d = WcaData {
-                attrib: WCA_ACCENT_POLICY,
-                data: &mut ap as *mut _ as *mut c_void,
-                size: std::mem::size_of::<AccentPolicy>(),
-            };
-            f(hw, &mut d);
+impl Surf {
+    fn new(w: i32, h: i32) -> Option<Surf> {
+        unsafe {
+            let mut bmi = BITMAPINFO::default();
+            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h; // 负高 = top-down，与 GDI 坐标一致
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB.0;
+            let mut bits: *mut c_void = std::ptr::null_mut();
+            let dib = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+            if dib.0.is_null() || bits.is_null() {
+                return None;
+            }
+            let mdc = CreateCompatibleDC(None);
+            if mdc.0.is_null() {
+                let _ = DeleteObject(dib.into());
+                return None;
+            }
+            let old = SelectObject(mdc, dib.into());
+            Some(Surf {
+                dib,
+                mdc,
+                old,
+                buf: bits as *mut u32,
+                w,
+                h,
+            })
         }
     }
+
+    fn pixels(&mut self) -> &mut [u32] {
+        unsafe { std::slice::from_raw_parts_mut(self.buf, (self.w * self.h) as usize) }
+    }
+}
+
+impl Drop for Surf {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.mdc, self.old);
+            let _ = DeleteDC(self.mdc);
+            let _ = DeleteObject(self.dib.into());
+        }
+    }
+}
+
+/// 写一个预乘 ARGB 像素（r,g,b 未预乘）
+#[inline]
+fn put_px(buf: &mut [u32], i: usize, c: (u32, u32, u32), a: u32) {
+    buf[i] = (a << 24)
+        | ((c.0 * a / 255) << 16)
+        | ((c.1 * a / 255) << 8)
+        | (c.2 * a / 255);
+}
+
+/// 圆角覆盖率（0-4）。返回 4 表示完全在圆角内。只对四角像素调用。
+fn corner_cover(x: i32, y: i32, w: i32, h: i32, r: i32) -> u32 {
+    let (cx, cy) = if x < r && y < r {
+        (r as f32, r as f32)
+    } else if x >= w - r && y < r {
+        ((w - r) as f32, r as f32)
+    } else if x < r && y >= h - r {
+        (r as f32, (h - r) as f32)
+    } else if x >= w - r && y >= h - r {
+        ((w - r) as f32, (h - r) as f32)
+    } else {
+        return 4;
+    };
+    let rf = r as f32;
+    let mut hit = 0u32;
+    for sy in 0..2 {
+        for sx in 0..2 {
+            let px = x as f32 + 0.25 + sx as f32 * 0.5;
+            let py = y as f32 + 0.25 + sy as f32 * 0.5;
+            let (dx, dy) = (px - cx, py - cy);
+            if dx * dx + dy * dy <= rf * rf {
+                hit += 1;
+            }
+        }
+    }
+    hit
 }
 
 // ── 类注册 ──
@@ -264,16 +332,6 @@ fn register_rename_class() {
         RegisterClassW(&wc);
     }
     REN_CLASSED.with(|c| c.set(true));
-}
-
-/// 圆角窗口区域
-fn round_region(hwnd: HWND, w: i32, h: i32) {
-    unsafe {
-        let r = CreateRoundRectRgn(0, 0, w + 1, h + 1, RADIUS * 2, RADIUS * 2);
-        if !r.0.is_null() {
-            SetWindowRgn(hwnd, Some(r), true);
-        }
-    }
 }
 
 // ── 桌面项枚举与图标 ──
@@ -369,7 +427,7 @@ fn create_zone(z: &crate::config::ZoneConf, idx: usize) -> Option<HWND> {
         let hinst = GetModuleHandleW(None).unwrap();
         let h = if z.collapsed { TITLE_H } else { z.h.max(MIN_H) };
         let hw = match CreateWindowExW(
-            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
             CLASS,
             w!(""),
             WS_POPUP,
@@ -389,9 +447,9 @@ fn create_zone(z: &crate::config::ZoneConf, idx: usize) -> Option<HWND> {
             return None;
         }
         SetWindowLongPtrW(hw, GWLP_USERDATA, idx as isize);
-        set_acrylic(hw, TINT);
-        round_region(hw, z.w.max(MIN_W), h);
         DragAcceptFiles(hw, true);
+        // layered 窗口必须提交过位图才可见，先渲染一次
+        render(hw, idx);
         let _ = SetWindowPos(
             hw,
             Some(HWND_BOTTOM),
@@ -472,8 +530,7 @@ pub fn sync() {
                             want_h,
                             SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
                         );
-                        round_region(hw, z.w.max(MIN_W), want_h);
-                        let _ = InvalidateRect(Some(hw), None, true);
+                        render(hw, i);
                     } else {
                         let _ = ShowWindow(hw, SW_HIDE);
                     }
@@ -511,9 +568,9 @@ pub fn toggle_edit() -> bool {
     });
     WIN.with(|ws| {
         if let Ok(v) = ws.try_borrow() {
-            for hw in v.iter().flatten() {
-                unsafe {
-                    let _ = InvalidateRect(Some(*hw), None, true);
+            for (i, hw) in v.iter().enumerate() {
+                if let Some(h) = hw {
+                    render(*h, i);
                 }
             }
         }
@@ -842,8 +899,7 @@ fn toggle_collapse(idx: usize) {
                 nh,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            round_region(hw, w, nh);
-            let _ = InvalidateRect(Some(hw), None, true);
+            render(hw, idx);
         }
     }
 }
@@ -1031,9 +1087,7 @@ unsafe extern "system" fn rename_wndproc(
                             WIN.with(|ws| {
                                 if let Ok(v) = ws.try_borrow() {
                                     if let Some(Some(hw)) = v.get(idx) {
-                                        unsafe {
-                                            let _ = InvalidateRect(Some(*hw), None, true);
-                                        }
+                                        render(*hw, idx);
                                     }
                                 }
                             });
@@ -1108,16 +1162,20 @@ fn open_rename(idx: usize) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
-            let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-            if idx >= 0 {
-                paint_zone(hwnd, idx as usize);
-            }
+            // layered 窗口的内容全部由 UpdateLayeredWindow 提供，
+            // 这里只需要把 dirty 标记清掉，避免 WM_PAINT 反复触发。
+            let mut ps = PAINTSTRUCT::default();
+            let _ = BeginPaint(hwnd, &mut ps);
+            let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_SIZE => {
-            let (w, h) = client_size(hwnd);
-            round_region(hwnd, w, h);
+            // 尺寸变化 → 整张位图重建（缩放时每帧走这里，保证边框始终贴合）
+            let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if idx >= 0 {
+                render(hwnd, idx as usize);
+            }
             LRESULT(0)
         }
         WM_SETCURSOR => {
@@ -1334,7 +1392,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     });
                     crate::app::save_now();
-                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    render(hwnd, idx);
                 }
             }
             LRESULT(0)
@@ -1418,9 +1476,52 @@ fn draw_chevron(hdc: HDC, cx: i32, cy: i32, up: bool, col: COLORREF) {
     }
 }
 
-/// 画一块分区：深色标题栏 + 名称 + 折叠箭头 + 图标网格。
-/// 背景不上色，露出 acrylic 毛玻璃。
-fn paint_zone(hwnd: HWND, idx: usize) {
+/// 提交一整张 ARGB 位图到 layered 窗口（位置由 SetWindowPos 负责，这里只换内容）
+fn commit_layered(hwnd: HWND, surf: &Surf, w: i32, h: i32) {
+    unsafe {
+        let screen = GetDC(None);
+        if screen.0.is_null() {
+            return;
+        }
+        let size = SIZE { cx: w, cy: h };
+        let src = POINT { x: 0, y: 0 };
+        let bf = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        // pptDst 传 None → 不改变窗口位置，避免和拖动逻辑抢位置
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            Some(screen),
+            None,
+            Some(&size),
+            Some(surf.mdc),
+            Some(&src),
+            COLORREF(0),
+            Some(&bf),
+            ULW_ALPHA,
+        );
+        let _ = ReleaseDC(None, screen);
+    }
+}
+
+/// 渲染一个分区：每次都**从空白画布整张重建**预乘 ARGB 位图再提交。
+///
+/// 这是消除「显示 / 拖动重影」的关键：旧实现直接往窗口 DC 上画，
+/// 而 GDI 无法把像素写回 alpha=0，旧内容永远擦不掉（改名字叠字、
+/// 拖动缩放靠系统位图搬运 → 阶梯状残影）。整张重建后，位图里只可能
+/// 有本次绘制的内容。
+fn render(hwnd: HWND, idx: usize) {
+    let (w, h) = client_size(hwnd);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let mut surf = match Surf::new(w, h) {
+        Some(s) => s,
+        None => return,
+    };
     let (name, color, collapsed, items) = crate::app::with_cfg(|c| {
         c.zones
             .get(idx)
@@ -1435,26 +1536,38 @@ fn paint_zone(hwnd: HWND, idx: usize) {
             .unwrap_or_else(|| ("围栏".to_string(), 0x4E8FFF, false, Vec::new()))
     });
 
-    unsafe {
-        let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        let (w, h) = client_size(hwnd);
-        if w <= 0 || h <= 0 {
-            let _ = EndPaint(hwnd, &ps);
-            return;
+    // ① 面板底色（四角 2x2 超采样，边缘不发锯齿）
+    {
+        let buf = surf.pixels();
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) as usize;
+                let cv = corner_cover(x, y, w, h, RADIUS);
+                if cv == 0 {
+                    buf[i] = 0;
+                } else {
+                    put_px(buf, i, PANEL_RGB, PANEL_A * cv / 4);
+                }
+            }
         }
+        // ② 标题栏：不透明深色
+        for y in 0..TITLE_H.min(h) {
+            for x in 0..w {
+                let cv = corner_cover(x, y, w, h, RADIUS);
+                if cv == 0 {
+                    continue;
+                }
+                let i = (y * w + x) as usize;
+                put_px(buf, i, TITLE_RGB, 255 * cv / 4);
+            }
+        }
+    }
 
-        // 标题栏：深色实心（比毛玻璃面板更沉，接近参考图）
-        let bar = CreateSolidBrush(COLORREF(rgb(20, 28, 26)));
-        let bar_rect = RECT {
-            left: 0,
-            top: 0,
-            right: w,
-            bottom: TITLE_H,
-        };
-        let _ = FillRect(hdc, &bar_rect, bar);
-        let _ = DeleteObject(bar.into());
+    // ③ 记下底色快照：稍后据此判断哪些像素是 GDI 画上去的
+    let base: Vec<u32> = surf.pixels().to_vec();
+    let hdc = surf.mdc;
 
+    unsafe {
         // 标题栏底部 1px 主题色描边
         let line_pen = CreatePen(PS_SOLID, 1, COLORREF(color));
         let old_pen = SelectObject(hdc, line_pen.into());
@@ -1463,7 +1576,7 @@ fn paint_zone(hwnd: HWND, idx: usize) {
         let _ = SelectObject(hdc, old_pen);
         let _ = DeleteObject(line_pen.into());
 
-        // 名称
+        // 标题文字
         let font_bold = CreateFontW(
             -14,
             0,
@@ -1476,7 +1589,7 @@ fn paint_zone(hwnd: HWND, idx: usize) {
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
+            ANTIALIASED_QUALITY,
             (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
             w!("Microsoft YaHei UI"),
         );
@@ -1489,7 +1602,7 @@ fn paint_zone(hwnd: HWND, idx: usize) {
             right: w - 38,
             bottom: TITLE_H,
         };
-        let mut title_w: Vec<u16> = name.encode_utf16().collect();
+        let mut title_w = wide_nul(&name);
         let _ = DrawTextW(
             hdc,
             &mut title_w,
@@ -1513,7 +1626,7 @@ fn paint_zone(hwnd: HWND, idx: usize) {
                 DEFAULT_CHARSET,
                 OUT_DEFAULT_PRECIS,
                 CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
+                ANTIALIASED_QUALITY,
                 (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
                 w!("Microsoft YaHei UI"),
             );
@@ -1548,7 +1661,7 @@ fn paint_zone(hwnd: HWND, idx: usize) {
                     right: cx + CELL_W - 3,
                     bottom: cy + CELL_H,
                 };
-                let mut nw: Vec<u16> = it.encode_utf16().collect();
+                let mut nw = wide_nul(it);
                 let _ = DrawTextW(
                     hdc,
                     &mut nw,
@@ -1567,7 +1680,7 @@ fn paint_zone(hwnd: HWND, idx: usize) {
                     right: w - PAD,
                     bottom: h - PAD,
                 };
-                let mut ew: Vec<u16> = "把图标拖到这里".encode_utf16().collect();
+                let mut ew = wide_nul("把图标拖到这里");
                 let _ = DrawTextW(
                     hdc,
                     &mut ew,
@@ -1579,23 +1692,19 @@ fn paint_zone(hwnd: HWND, idx: usize) {
 
         let _ = SelectObject(hdc, old_font);
         let _ = DeleteObject(font_bold.into());
-
-        // 编辑态（兼容旧开关）：四角手柄
-        if EDITING.with(|c| c.get()) {
-            let hb = CreateSolidBrush(COLORREF(color));
-            let s = 8;
-            for (hx, hy) in [(0, 0), (w - s, 0), (0, h - s), (w - s, h - s)] {
-                let hr = RECT {
-                    left: hx,
-                    top: hy,
-                    right: hx + s,
-                    bottom: hy + s,
-                };
-                let _ = FillRect(hdc, &hr, hb);
-            }
-            let _ = DeleteObject(hb.into());
-        }
-
-        let _ = EndPaint(hwnd, &ps);
     }
+
+    // ④ GDI 画上去的像素 alpha 提到 255。
+    //    面板底色是半透明且已预乘，而 GDI 写入的是未预乘实色 ——
+    //    若不提 alpha，图标和文字会被再乘一次 PANEL_A 而发灰。
+    {
+        let buf = surf.pixels();
+        for i in 0..(w * h) as usize {
+            if buf[i] != base[i] {
+                buf[i] = 0xFF00_0000 | (buf[i] & 0x00FF_FFFF);
+            }
+        }
+    }
+
+    commit_layered(hwnd, &surf, w, h);
 }
