@@ -1793,20 +1793,6 @@ pub fn open_data_file() {
     });
 }
 
-/// 供设置窗口调用：立即执行桌面类型归档
-pub fn run_deskarch() {
-    APP.with(|a| {
-        if let Some(app) = a.borrow_mut().as_mut() {
-            let dir = if app.cfg.deskarch_dir.is_empty() {
-                files::desktop_dir().join("归档")
-            } else {
-                std::path::PathBuf::from(&app.cfg.deskarch_dir)
-            };
-            let n = files::run_archive(&dir);
-            app.last_arch = Some(n);
-        }
-    });
-}
 
 pub fn open_config_file() {
     APP.with(|a| {

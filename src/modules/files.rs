@@ -168,54 +168,248 @@ pub fn scan_desktop() -> Vec<ArchiveGroup> {
     groups
 }
 
-/// 执行归档：把桌面文件按类型移动到 target 目录下的分类子目录。
-/// 返回成功移动的数量。
-pub fn run_archive(target_root: &Path) -> usize {
+/// 时间粒度：把 unix 秒格式化为时间目录名。
+/// gran="month" → "2026-11"，否则 "→ 2026"。
+#[allow(dead_code)]
+pub fn time_folder(ts_secs: i64, gran: &str) -> String {
+    let (y, m) = local_ym(ts_secs);
+    if gran == "month" {
+        format!("{y:04}-{m:02}")
+    } else {
+        format!("{y}")
+    }
+}
+
+/// 本机 UTC 时区偏移（秒）。桌面文件修改时间多为近期，用当前偏移近似即可。
+fn local_offset_secs() -> i64 {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    use windows::Win32::System::Time::SystemTimeToFileTime;
+    let now = now_unix();
+    unsafe {
+        let st = GetLocalTime();
+        let mut ft = FILETIME::default();
+        if SystemTimeToFileTime(&st, &mut ft).is_ok() {
+            let h = ft.dwHighDateTime as i64;
+            let l = ft.dwLowDateTime as i64;
+            let secs = ((h << 32) | l) / 10_000_000 - 11644473600;
+            return secs - now;
+        }
+    }
+    0
+}
+
+/// unix 秒 → 本地(年, 月)。
+fn local_ym(ts_secs: i64) -> (u16, u16) {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::FileTimeToSystemTime;
+    let local = ts_secs + local_offset_secs();
+    let ft100 = local * 10_000_000 + 116444736000000000;
+    let ft = FILETIME {
+        dwLowDateTime: (ft100 & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: ((ft100 >> 32) & 0xFFFF_FFFF) as u32,
+    };
+    unsafe {
+        let mut st = SYSTEMTIME::default();
+        if FileTimeToSystemTime(&ft, &mut st).is_ok() {
+            return (st.wYear, st.wMonth);
+        }
+    }
+    (0, 0)
+}
+
+/// 归档计划中的单个文件：源、目标（时间/类型 下的最终路径）、统计字段。
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct ArchItem {
+    pub src: PathBuf,
+    pub dest: PathBuf,
+    pub time: String,
+    pub ty: String,
+    pub size: u64,
+}
+
+/// 预览用的分组统计行：某个「时间 / 类型」组合下有多少文件、多大。
+#[derive(Clone, Debug, Default)]
+pub struct ArchTypeRow {
+    pub time: String,
+    pub ty: String,
+    pub count: usize,
+    pub bytes: u64,
+}
+
+/// 一次扫描的归档计划（只描述，不执行）。
+#[derive(Clone)]
+pub struct ArchivePlan {
+    pub items: Vec<ArchItem>,
+    pub rows: Vec<ArchTypeRow>,
+    pub total: usize,
+    pub total_bytes: u64,
+}
+
+/// 扫描桌面，生成归档计划（不移动任何文件）。
+/// 只处理桌面根层级的文件（文件夹跳过）；排除 .lnk / desktop.ini / 位于归档目录内的文件。
+/// 目标路径 = target_root / 时间 / 类型 / 文件名（时间→类型 结构）。
+#[allow(dead_code)]
+pub fn scan_arch_plan(target_root: &Path, gran: &str) -> ArchivePlan {
+    let mut plan = ArchivePlan { items: vec![], rows: vec![], total: 0, total_bytes: 0 };
     let desktop = desktop_dir();
-    let mut moved = 0usize;
     let entries = match std::fs::read_dir(&desktop) {
         Ok(rd) => rd,
-        Err(_) => return 0,
+        Err(_) => return plan,
     };
     for e in entries.flatten() {
         let p = e.path();
+        // 本次不处理文件夹：只归档桌面根层级的文件
         if !p.is_file() {
             continue;
         }
-        let ext = p
-            .extension()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let name = match p.file_name().map(|s| s.to_string_lossy().to_string()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if name.eq_ignore_ascii_case("desktop.ini") {
+            continue;
+        }
+        let ext = p.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         if ext.eq_ignore_ascii_case("lnk") {
             continue;
         }
-        let cat = category_of(&ext).unwrap_or("其他");
-        let dir = target_root.join(cat);
-        if std::fs::create_dir_all(&dir).is_err() {
+        // 归档目录若恰好设在桌面内，跳过它内部的文件，避免归档自身
+        if p.starts_with(target_root) {
             continue;
         }
-        let name = match p.file_name() {
-            Some(n) => n.to_owned(),
-            None => continue,
-        };
-        let mut dest = dir.join(&name);
-        // 同名冲突：追加序号
-        let mut i = 1;
+        let ty = category_of(&ext).unwrap_or("其他").to_string();
+        let mtime = std::fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_else(now_unix);
+        let time = time_folder(mtime, gran);
+        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        let dest = target_root.join(&time).join(&ty).join(&name);
+
+        match plan.rows.iter_mut().find(|r| r.time == time && r.ty == ty) {
+            Some(r) => {
+                r.count += 1;
+                r.bytes += size;
+            }
+            None => plan.rows.push(ArchTypeRow { time: time.clone(), ty: ty.clone(), count: 1, bytes: size }),
+        }
+        plan.items.push(ArchItem { src: p, dest, time, ty, size });
+        plan.total += 1;
+        plan.total_bytes += size;
+    }
+    plan
+}
+
+fn split_name(name: &str) -> (String, String) {
+    let p = Path::new(name);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = p.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    (stem, ext)
+}
+
+fn rollback_path(root: &Path, ts: i64) -> PathBuf {
+    root.join(format!("归档记录-{}.txt", ts))
+}
+
+/// 把 原→新 路径映射写进撤销记录（根目录下 归档记录-<时间戳>.txt）。
+fn write_rollback(root: &Path, moves: &[(String, String)]) -> std::io::Result<()> {
+    let path = rollback_path(root, now_unix());
+    let mut s = String::new();
+    for (f, t) in moves {
+        s.push_str(&format!("{f}\t{t}\n"));
+    }
+    std::fs::write(path, s)
+}
+
+/// 执行归档计划：逐项移动（只移动、永不删除、同名加序号），把 原→新 写入可撤销记录。
+/// 返回成功移动的数量。被占用/目标创建失败的文件跳过，不影响其它项。
+#[allow(dead_code)]
+pub fn execute_arch_plan(target_root: &Path, plan: &ArchivePlan) -> usize {
+    let mut moved = 0usize;
+    let mut moves: Vec<(String, String)> = Vec::new();
+    for it in &plan.items {
+        if !it.src.exists() {
+            continue;
+        }
+        let dir = it.dest.parent().unwrap_or(target_root);
+        if std::fs::create_dir_all(dir).is_err() {
+            continue;
+        }
+        let mut dest = it.dest.clone();
+        // 同名冲突：追加 (序号)
+        let name = it.dest.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let (stem, ext) = split_name(&name);
+        let mut i = 1u32;
         while dest.exists() {
-            let stem = Path::new(&name)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "file".into());
-            let ext2 = if ext.is_empty() { String::new() } else { format!(".{}", ext) };
-            dest = dir.join(format!("{} ({}).{}", stem, i, ext2.trim_start_matches('.')));
+            let suffix = if ext.is_empty() {
+                format!("({i})")
+            } else {
+                format!("({i}).{ext}")
+            };
+            dest = dir.join(format!("{stem} {suffix}"));
             i += 1;
             if i > 999 {
                 break;
             }
         }
-        if std::fs::rename(&p, &dest).is_ok() {
-            moved += 1;
+        if i > 999 {
+            continue;
         }
+        if std::fs::rename(&it.src, &dest).is_ok() {
+            moved += 1;
+            moves.push((it.src.to_string_lossy().to_string(), dest.to_string_lossy().to_string()));
+        }
+    }
+    if !moves.is_empty() {
+        let _ = write_rollback(target_root, &moves);
     }
     moved
 }
+
+/// 撤销最近一次归档：读最新的 归档记录-*.txt，把 dest → src 反向移回。
+/// 返回移回数量；处理成功后删除该记录文件，避免重复撤销。
+#[allow(dead_code)]
+pub fn undo_last_archive(target_root: &Path) -> usize {
+    let mut recs: Vec<(i64, PathBuf)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(target_root) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if let Some(rest) = n.strip_prefix("归档记录-").and_then(|s| s.strip_suffix(".txt")) {
+                if let Ok(ts) = rest.parse::<i64>() {
+                    recs.push((ts, e.path()));
+                }
+            }
+        }
+    }
+    recs.sort_by(|a, b| b.0.cmp(&a.0));
+    let (_, rec) = match recs.into_iter().next() {
+        Some(x) => x,
+        None => return 0,
+    };
+    let body = match std::fs::read_to_string(&rec) {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+    let mut restored = 0usize;
+    for line in body.lines() {
+        let mut it = line.split('\t');
+        let (Some(from), Some(to)) = (it.next(), it.next()) else { continue };
+        let fp = PathBuf::from(from.trim());
+        let tp = PathBuf::from(to.trim());
+        if tp.exists() && !fp.exists() {
+            if let Some(d) = fp.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            if std::fs::rename(&tp, &fp).is_ok() {
+                restored += 1;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&rec);
+    restored
+}
+

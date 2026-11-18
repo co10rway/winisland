@@ -243,6 +243,8 @@ pub struct Config {
     pub autostart: bool,
     /// 桌面归档目标目录（默认为 桌面\归档）
     pub deskarch_dir: String,
+    /// 桌面归档的时间粒度："year"（按年，默认）/"month"（按年-月）
+    pub deskarch_time: String,
     /// 剪贴板历史条数
     pub clipboard_history: usize,
     /// 文件中转站最多暂存的文件数（只存路径引用，此上限仅为列表管理，非内存约束）
@@ -344,6 +346,7 @@ impl Default for Config {
             mail: Mail::default(),
             autostart: false,
             deskarch_dir: String::new(),
+            deskarch_time: String::from("year"),
             clipboard_history: 20,
             filehub_cap: crate::modules::files::DEFAULT_FILEHUB_CAP,
             theme: "blue".into(),
