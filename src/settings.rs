@@ -86,7 +86,7 @@ const NAV: [(usize, usize, &str); 12] = [
     (4, 1, "待办清单"),
     (5, 1, "文件中转站"),
     (6, 1, "剪贴板中转"),
-    (7, 1, "桌面归档"),
+    (7, 1, "桌面分区"),
     (9, 1, "灵动图标"),
     (1, 2, "健康提醒"),
     (8, 2, "邮箱验证码"),
@@ -391,19 +391,16 @@ fn pages() -> Vec<Page> {
                 Row::note("仅在本地记录，不上传任何内容。"),
             ],
         },
-        // 7 桌面归档
+        // 7 桌面分区
         Page {
-            title: "桌面归档",
-            desc: "把桌面文件按「时间 → 类型」整理进子文件夹",
+            title: "桌面分区",
+            desc: "在桌面上划出半透明毛玻璃分组框，图标拖进框内即归为一组（纯视觉，不搬文件）",
             rows: vec![
-                Row::toggle(0, "启用桌面归档", "开启后才能从设置里执行归档"),
-                Row::field(1, "归档目录", "留空 = 桌面\\归档", 300.0),
-                Row::caption("时间粒度"),
-                Row::toggle(5, "按年归档", "每个文件归到 归档\\年份\\类型 下"),
-                Row::toggle(6, "按年-月归档", "每个文件归到 归档\\年份-月\\类型 下"),
-                Row::action(7, "执行归档", "扫描桌面，预览后按「时间 → 类型」移动文件（只移动、不删除）", vec![("保存目录", 3, false, 104.0), ("预览归档", 7, true, 112.0)]),
-                Row::action(8, "撤销", "把最近一次归档的文件原样移回桌面", vec![("撤销最近一次", 8, true, 128.0)]),
-                Row::note("归档 = 移动，永不删除文件、永不覆盖（同名自动加序号）。时间粒度二选一，默认按年；执行前会先预览。"),
+                Row::toggle(0, "启用桌面分区", "开启后在桌面绘制分区（壁纸之上、图标之下）"),
+                Row::toggle(1, "开机自启分区", "随系统启动自动显示分区"),
+                Row::action(2, "新建分区", "在桌面中央新增一个可直接拖动 / 缩放的分区", vec![("＋ 新建分区", 2, true, 128.0)]),
+                Row::action(3, "显示 / 隐藏全部", "一键隐藏所有分区看干净桌面，再点一次恢复", vec![("隐藏全部", 3, true, 116.0)]),
+                Row::note("分区是纯视觉分组：图标始终在原地，毛玻璃框只是把它们罩住。桌面上拖动分区标题可移动、拖角落可缩放、右键可改名 / 删除 / 换色。"),
             ],
         },
         // 8 邮箱验证码
@@ -484,9 +481,6 @@ enum HitId {
     /// 时间选择面板确定 / 取消
     TimeOk,
     TimeCancel,
-    /// 归档预览浮层：开始归档 / 取消
-    ArchOk,
-    ArchCancel,
     Min,
     Close,
 }
@@ -524,10 +518,6 @@ thread_local! {
     /// 选择器里正在调整的时 / 分
     static TIME_H: Cell<u32> = const { Cell::new(9) };
     static TIME_M: Cell<u32> = const { Cell::new(0) };
-    /// 归档预览浮层是否打开
-    static ARCH_OPEN: Cell<bool> = const { Cell::new(false) };
-    /// 归档预览浮层里缓存的扫描计划
-    static ARCH_PLAN: RefCell<Option<crate::modules::files::ArchivePlan>> = const { RefCell::new(None) };
 }
 
 fn tw(txt: &str, size: f32) -> f32 {
@@ -579,7 +569,7 @@ fn module_enabled(page: usize) -> bool {
         4 => cfg.modules.todo,
         5 => cfg.modules.filehub,
         6 => cfg.modules.clipboard,
-        7 => cfg.modules.deskarch,
+        7 => cfg.modules.zones,
         8 => cfg.modules.mailcode,
         9 => cfg.modules.typing,
         _ => true,
@@ -602,13 +592,16 @@ fn set_module_enabled(page: usize, on: bool) {
         4 => cfg.modules.todo = on,
         5 => cfg.modules.filehub = on,
         6 => cfg.modules.clipboard = on,
-        7 => cfg.modules.deskarch = on,
+        7 => cfg.modules.zones = on,
         8 => cfg.modules.mailcode = on,
         9 => cfg.modules.typing = on,
         _ => {}
     });
     crate::app::save_now();
     crate::app::redraw();
+    if page == 7 {
+        crate::modules::zones::sync();
+    }
 }
 
 fn edit_hwnd(page: usize, slot: i32) -> Option<HWND> {
@@ -795,10 +788,6 @@ fn apply_page(page: usize) {
                 sub.wecom.dav_pass = wecom.2.clone();
             });
         }
-        7 => {
-            let d = field_text(7, 1).trim().to_string();
-            crate::app::with_cfg(|c| c.deskarch_dir = d);
-        }
         8 => {
             let host = field_text(8, 1).trim().to_string();
             let port = field_text(8, 2).trim().parse::<u16>().ok();
@@ -856,7 +845,6 @@ fn sync_page(page: usize) {
             (3, 31) => c.schedule_sub.wecom.dav_server.clone(),
             (3, 32) => c.schedule_sub.wecom.dav_user.clone(),
             (3, 33) => c.schedule_sub.wecom.dav_pass.clone(),
-            (7, 1) => c.deskarch_dir.clone(),
             (8, 1) => c.mail.imap_host.clone(),
             (8, 2) => c.mail.imap_port.to_string(),
             (8, 3) => c.mail.user.clone(),
@@ -916,7 +904,6 @@ fn draw_all(cv: &mut Canvas, w: f32, h: f32, page: usize, hover: HitId, hits: &m
     }
     draw_footer(cv, w, h, hover, hits);
     draw_time_picker(cv, w, h, hover, hits);
-    draw_arch_preview(cv, w, h, hover, hits);
 }
 
 /// 自绘时间选择浮层：半透明遮罩 + 居中卡片 + 时/分步进 + 确定/取消
@@ -961,61 +948,6 @@ fn draw_time_picker(cv: &mut Canvas, w: f32, h: f32, hover: HitId, hits: &mut Ve
     push_hit(hits, HitId::TimeOk, ok_x, by, bw, s(38.0));
     // 防止 page / slot 未使用警告（title 已用 slot）
     let _ = page;
-}
-
-/// 归档预览浮层：半透明遮罩 + 居中卡片，展示扫描统计，确认后才执行移动（只移动不删除）。
-fn draw_arch_preview(cv: &mut Canvas, w: f32, h: f32, hover: HitId, hits: &mut Vec<Hit>) {
-    if !ARCH_OPEN.with(|c| c.get()) {
-        return;
-    }
-    // 遮罩：点击空白处等价于取消
-    cv.rrect(0.0, 0.0, w, h, 0.0, 0x000000, 0.55);
-    push_hit(hits, HitId::ArchCancel, 0.0, 0.0, w, h);
-
-    let pw = s(430.0);
-    let ph = s(360.0);
-    let px = (w - pw) / 2.0;
-    let py = (h - ph) / 2.0;
-    cv.rrect(px, py, pw, ph, s(16.0), 0x1C1C23, 1.0);
-    cv.rrect_stroke(px + 0.5, py + 0.5, pw - 1.0, ph - 1.0, s(16.0), 0x3A3A48, 1.0, s(1.0));
-
-    let Some(plan) = ARCH_PLAN.with(|c| c.borrow().clone()) else { return };
-    cv.text_c(px, py + s(16.0), pw, s(28.0), "桌面归档 · 预览", 15.0, W_SEMI, TXT, 1.0);
-    let sub = format!("将移动 {} 个文件 · {}", plan.total, crate::modules::files::fmt_size(plan.total_bytes));
-    cv.text_c(px, py + s(46.0), pw, s(18.0), &sub, 10.5, W_NORMAL, TXT3, 0.9);
-
-    // 分组统计列表：时间 → 类型，最多显示 10 组
-    let rows = &plan.rows;
-    let shown = rows.len().min(10);
-    let mut ly = py + s(72.0);
-    for r in rows.iter().take(shown) {
-        let line = format!(
-            "{} · {}    {} 个 · {}",
-            r.time,
-            r.ty,
-            r.count,
-            crate::modules::files::fmt_size(r.bytes)
-        );
-        cv.text_ex(px + s(20.0), ly, pw - s(40.0), s(22.0), &line, 12.0, W_NORMAL, TXT2, 1.0, 0, 1);
-        ly += s(24.0);
-    }
-    if rows.len() > shown {
-        cv.text_ex(
-            px + s(20.0), ly, pw - s(40.0), s(20.0),
-            &format!("… 共 {} 组", rows.len()), 11.0, W_NORMAL, TXT3, 1.0, 0, 1,
-        );
-    }
-
-    // 底部按钮：取消 / 开始归档
-    let bw = s(118.0);
-    let by = py + ph - s(58.0);
-    let cancel_x = px + (pw - bw * 2.0 - s(16.0)) / 2.0;
-    let ok_x = cancel_x + bw + s(16.0);
-    draw_button(cv, cancel_x, by, bw, s(38.0), "取消", false, hover == HitId::ArchCancel, 1.0);
-    draw_button(cv, ok_x, by, bw, s(38.0), "开始归档", true, hover == HitId::ArchOk, 1.0);
-    // 遮罩已覆盖全屏，需把按钮 hit 重新覆盖在上面
-    push_hit(hits, HitId::ArchCancel, cancel_x, by, bw, s(38.0));
-    push_hit(hits, HitId::ArchOk, ok_x, by, bw, s(38.0));
 }
 
 /// 时间选择器的一列：上箭头 + 大数字 + 下箭头 + 单位标签
@@ -1275,13 +1207,9 @@ fn draw_row(cv: &mut Canvas, row: &Row, page: usize, pl: &Placed, cx: f32, cw: f
                 crate::app::with_cfg(|c| c.auto_collapse)
             } else if page == 0 {
                 crate::app::with_cfg(|c| c.autostart)
-            } else if page == 7 && (row.slot == 5 || row.slot == 6) {
-                // 桌面归档的时间粒度二选一：5=按年，6=按年-月
-                crate::app::with_cfg(|c| if row.slot == 5 {
-                    c.deskarch_time != "month"
-                } else {
-                    c.deskarch_time == "month"
-                })
+            } else if page == 7 && row.slot == 1 {
+                // 桌面分区：开机自启（slot 0 的启用开关走通用 module_enabled）
+                crate::app::with_cfg(|c| c.zones_autostart)
             } else if page == 3 && matches!(row.slot, 10 | 20 | 30) {
                 // 日程三个来源各自的开关，不能落到 module_enabled（那是模块总开关）
                 crate::app::with_cfg(|c| match row.slot {
@@ -1869,40 +1797,6 @@ fn hit_at(x: i32, y: i32) -> HitId {
     })
 }
 
-fn arch_target() -> std::path::PathBuf {
-    crate::app::with_cfg(|c| {
-        if c.deskarch_dir.is_empty() {
-            crate::modules::files::desktop_dir().join("归档")
-        } else {
-            std::path::PathBuf::from(&c.deskarch_dir)
-        }
-    })
-}
-
-/// 「预览归档」：扫描桌面生成计划（不移动任何文件），打开浮层展示统计。
-fn open_arch_preview() {
-    let dir = arch_target();
-    let gran = crate::app::with_cfg(|c| c.deskarch_time.clone());
-    let plan = crate::modules::files::scan_arch_plan(&dir, &gran);
-    if plan.items.is_empty() {
-        flash("桌面没有可归档的文件");
-        return;
-    }
-    ARCH_PLAN.with(|c| *c.borrow_mut() = Some(plan));
-    ARCH_OPEN.with(|c| c.set(true));
-}
-
-/// 「撤销最近一次」：把最新一条归档记录的 dest 移回 src。
-fn undo_arch() {
-    let dir = arch_target();
-    let n = crate::modules::files::undo_last_archive(&dir);
-    flash(&if n > 0 {
-        format!("已撤销，移回 {n} 个文件")
-    } else {
-        "没有可撤销的归档记录".to_string()
-    });
-}
-
 fn on_click(hwnd: HWND, id: HitId) {
     match id {
         HitId::Nav(p) => {
@@ -1913,17 +1807,15 @@ fn on_click(hwnd: HWND, id: HitId) {
             }
         }
         HitId::Toggle(page, slot) => {
-            if page == 7 && (slot == 5 || slot == 6) {
-                // 桌面归档时间粒度：5=按年 / 6=按年-月，互斥
-                let v = if slot == 5 {
-                    "year"
-                } else {
-                    "month"
-                };
-                crate::app::with_cfg(|c| c.deskarch_time = v.to_string());
+            if page == 7 && slot == 1 {
+                // 桌面分区：开机自启（slot 0 的启用开关走 set_module_enabled 同步分区）
+                let on = crate::app::with_cfg(|c| {
+                    c.zones_autostart = !c.zones_autostart;
+                    c.zones_autostart
+                });
                 crate::app::save_now();
                 crate::app::redraw();
-                flash(if slot == 5 { "已切换为按年归档" } else { "已切换为按年-月归档" });
+                flash(if on { "分区已开机自启" } else { "已关闭分区自启" });
             } else if page == 0 && slot == 0 {
                 let want = !crate::app::with_cfg(|c| c.autostart);
                 if crate::modules::autostart::set_enabled(want) {
@@ -1976,16 +1868,13 @@ fn on_click(hwnd: HWND, id: HitId) {
         HitId::Btn(page, slot) => {
             match (page, slot) {
                 (4, 1) => crate::app::open_data_file(),
-                (7, 7) => {
-                    open_arch_preview();
+                (7, 2) => {
+                    crate::modules::zones::add_zone();
                     invalidate(hwnd);
                 }
                 (7, 3) => {
-                    apply_page(7);
-                    flash("目录已保存");
-                }
-                (7, 8) => {
-                    undo_arch();
+                    let on = crate::modules::zones::toggle_all();
+                    flash(if on { "已隐藏全部分区" } else { "已显示全部分区" });
                     invalidate(hwnd);
                 }
                 (8, 7) => {
@@ -2111,25 +2000,6 @@ fn on_click(hwnd: HWND, id: HitId) {
         }
         HitId::TimeCancel => {
             TIME_PICK.with(|c| c.set(None));
-            invalidate(hwnd);
-        }
-        HitId::ArchCancel => {
-            ARCH_OPEN.with(|c| c.set(false));
-            ARCH_PLAN.with(|c| *c.borrow_mut() = None);
-            invalidate(hwnd);
-        }
-        HitId::ArchOk => {
-            if ARCH_OPEN.with(|c| c.get()) {
-                let dir = arch_target();
-                let plan = ARCH_PLAN.with(|c| c.borrow().clone());
-                let n = match &plan {
-                    Some(p) => crate::modules::files::execute_arch_plan(&dir, p),
-                    None => 0,
-                };
-                flash(&format!("已归档 {n} 个文件"));
-            }
-            ARCH_OPEN.with(|c| c.set(false));
-            ARCH_PLAN.with(|c| *c.borrow_mut() = None);
             invalidate(hwnd);
         }
         HitId::Weekday(i) => {

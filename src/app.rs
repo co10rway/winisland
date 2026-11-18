@@ -155,8 +155,6 @@ pub struct App {
     pub sed_ack_idle: u32, // 上次"起来走走"确认时的空闲秒数
     pub code_until: Option<Instant>,
     pub last_mail_ts: i64,
-    #[allow(dead_code)]
-    pub last_arch: Option<usize>,
     pub peak_wpm: u64,
     /// 胶囊右侧信息轮播：当前条目、上一条目（滑动中的旧内容）、下一次切换时间
     pub rot_i: usize,
@@ -467,7 +465,6 @@ pub fn run() {
                 sed_ack_idle: 0,
                 code_until: None,
                 last_mail_ts: 0,
-                last_arch: None,
                 peak_wpm: 0,
                 rot_i: 0,
                 rot_prev: 0,
@@ -532,6 +529,9 @@ pub fn run() {
         if std::env::args().any(|a| a == "--settings") {
             crate::settings::open();
         }
+
+        // 桌面分区：按配置创建毛玻璃分区窗口（壁纸之上、图标之下）
+        crate::modules::zones::sync();
 
         let mut msg = MSG::default();
         // --probe：自动点开一次面板并采样真实帧间隔（性能诊断用）
@@ -701,7 +701,6 @@ fn preview_app(demo: bool) -> App {
         sed_ack_idle: 0,
         code_until: None,
         last_mail_ts: 0,
-        last_arch: None,
         peak_wpm: 0,
         rot_i: 0,
         rot_prev: 0,
@@ -1183,6 +1182,8 @@ pub fn toggle_hidden() {
 
 pub fn quit() {
     save_now();
+    // 桌面分区窗口随主线程消息循环一起销毁
+    crate::modules::zones::shutdown();
     // 设置窗口可能开着：先同步藏掉（顺带保存当前页输入），退出后不残留窗口
     crate::settings::close_for_quit();
     // 看门狗兜底：正常收尾（销毁窗口 → 存盘 → 退出消息循环）应在 1-2 秒内结束。

@@ -14,7 +14,7 @@ pub struct Modules {
     pub todo: bool,
     pub clipboard: bool,
     pub filehub: bool,
-    pub deskarch: bool,
+    pub zones: bool,
     pub mailcode: bool,
 }
 
@@ -29,7 +29,7 @@ impl Default for Modules {
             todo: true,
             clipboard: true,
             filehub: true,
-            deskarch: true,
+            zones: true,
             mailcode: false, // 需要用户自行配置 IMAP 后开启
         }
     }
@@ -241,10 +241,10 @@ pub struct Config {
     pub health: Health,
     pub mail: Mail,
     pub autostart: bool,
-    /// 桌面归档目标目录（默认为 桌面\归档）
-    pub deskarch_dir: String,
-    /// 桌面归档的时间粒度："year"（按年，默认）/"month"（按年-月）
-    pub deskarch_time: String,
+    /// 桌面分区：是否随系统启动自动显示
+    pub zones_autostart: bool,
+    /// 桌面分区列表（纯视觉分组，不移动/不删除任何文件）
+    pub zones: Vec<ZoneConf>,
     /// 剪贴板历史条数
     pub clipboard_history: usize,
     /// 文件中转站最多暂存的文件数（只存路径引用，此上限仅为列表管理，非内存约束）
@@ -336,6 +336,36 @@ impl Default for ScheduleSub {
     }
 }
 
+/// 单个桌面分区：纯视觉的毛玻璃分组框，图标留在原位不动。
+/// 坐标基于桌面工作区的物理像素。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct ZoneConf {
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    /// 主题色 id（theme::THEMES 之一），决定边框与标题颜色
+    pub color: String,
+    /// 当前是否显示
+    pub visible: bool,
+}
+
+impl Default for ZoneConf {
+    fn default() -> Self {
+        ZoneConf {
+            name: "新分区".into(),
+            x: 120,
+            y: 120,
+            w: 300,
+            h: 200,
+            color: "blue".into(),
+            visible: true,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -345,8 +375,8 @@ impl Default for Config {
             health: Health::default(),
             mail: Mail::default(),
             autostart: false,
-            deskarch_dir: String::new(),
-            deskarch_time: String::from("year"),
+            zones_autostart: true,
+            zones: Vec::new(),
             clipboard_history: 20,
             filehub_cap: crate::modules::files::DEFAULT_FILEHUB_CAP,
             theme: "blue".into(),
