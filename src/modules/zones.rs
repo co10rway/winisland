@@ -1,35 +1,35 @@
-//! 桌面分区：在桌面上绘制毛玻璃分组框（仿 Fences），分区可完全自定义。
+//! 桌面分区：在桌面上绘制「镂空描边框」分组框（仿 Fences），分区可完全自定义。
 //!
-//! 纯视觉分组——不移动、不删除任何文件，桌面图标留在原位，仅被分区的毛玻璃框
-//! 象征性地「收纳」为一组。
-//!
-//! 交互采用「编辑模式」（兼顾视觉与自定义）：
-//! - **平时（非编辑）**：分区挂在桌面图标宿主（SHELLDLL_DefView）的父层下、位于
-//!   图标**之下**，套丙烯酸毛玻璃（Acrylic）→ 壁纸透亮可见、图标清晰可点、
-//!   文件可正常拖到桌面，分区完全不干扰日常操作。
-//! - **编辑模式**（设置页「编辑分区」触发）：分区临时上浮到图标**之上**并显示
-//!   手柄——顶部拖动整块移动、四边四角缩放、右键重命名/换色/隐藏；退出即恢复。
-//! - 位置、大小、配色改动持久化到 config.json。
+//! 核心架构（v0.11 重写，彻底放弃 acrylic / layered / z 序控制）：
+//! - 分区窗口用 `SetWindowRgn` 裁成「边框环 + 顶部标题条」——**窗口中间根本不属于
+//!   窗口区域**（镂空）。因此：壁纸与桌面图标天然透出（不再有黑色遮挡）、鼠标事件
+//!   自然穿透到桌面（文件可正常拖放、图标可点，不再出现 🚫 禁止光标）。
+//! - 交互常驻（无需编辑模式上浮下沉）：标题条拖动整块、四边四角缩放、右键改名换色隐藏。
+//!   因为只有边框/标题条是窗口，中间镂空区域永远不拦截桌面。
+//! - 自绘拖动/缩放（不依赖系统位图拉伸，边框不会错乱）。
+//! - 位置、大小、配色持久化到 config.json。
 //!
 //! 全部数据仅存本机 config.json，不联网。
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use windows::core::{s, w, PCWSTR};
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-/// 分区窗口类名（顶层子窗，随主窗线程的消息循环一起分发）
+/// 分区窗口类名
 const CLASS: PCWSTR = w!("WinIslandZone");
 /// 重命名弹窗类名
 const RENAME_CLASS: PCWSTR = w!("WinIslandRename");
-/// 圆角半径
-const RADIUS: i32 = 12;
+/// 边框厚度（窗口区域 = 边框环 + 标题条）
+const BORDER: i32 = 3;
+/// 顶部标题条高度（拖动区 + 显示名称）
+const TITLE_H: i32 = 30;
 /// 命中边界厚度（四边/四角的缩放手柄宽度）
-const EDGE: i32 = 6;
+const EDGE: i32 = 8;
 
 thread_local! {
     /// 与 config.zones 对齐的活窗口：None = 该分区当前无窗口（隐藏 / 未启用）
@@ -40,10 +40,10 @@ thread_local! {
     static REN_CLASSED: Cell<bool> = const { Cell::new(false) };
     /// 当前正在重命名的分区索引（无则 None）
     static RENAME_IDX: Cell<Option<usize>> = const { Cell::new(None) };
-    /// 是否处于「编辑分区」模式（分区上浮到图标之上、可拖动/缩放/右键）
-    static EDITING: Cell<bool> = const { Cell::new(false) };
     /// 自绘拖动/缩放状态
     static DRAG: RefCell<Option<DragState>> = const { RefCell::new(None) };
+    /// 是否处于「编辑分区」模式（仅作设置页按钮兼容；交互已常驻，仅控制手柄高亮显示）
+    static EDITING: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -65,52 +65,6 @@ struct DragState {
     start_rect: RECT, // 屏幕坐标
 }
 
-// ── 丙烯酸毛玻璃：动态调用 user32!SetWindowCompositionAttribute（Win10 1803+ 可用） ──
-
-#[repr(C)]
-struct AccentPolicy {
-    state: i32,
-    flags: u32,
-    gradient: u32,
-    anim: u32,
-}
-
-#[repr(C)]
-struct WcaData {
-    attrib: i32,
-    data: *mut c_void,
-    size: usize, // SIZE_T：x64 下必须 8 字节，用 u32 会错位导致调用失败
-}
-
-const ACCENT_ENABLE_ACRYLICBLURBEHIND: i32 = 4;
-const WCA_ACCENT_POLICY: i32 = 19;
-
-type Swca = unsafe extern "system" fn(HWND, *mut c_void) -> i32;
-
-/// 给窗口套上丙烯酸毛玻璃背景；不支持时静默退化为类背景色。
-fn set_acrylic(hwnd: HWND, tint_argb: u32) {
-    unsafe {
-        if let Ok(m) = LoadLibraryW(w!("user32.dll")) {
-            let farproc = GetProcAddress(m, s!("SetWindowCompositionAttribute"));
-            if let Some(p) = farproc {
-                let f: Swca = std::mem::transmute(p);
-                let mut ap = AccentPolicy {
-                    state: ACCENT_ENABLE_ACRYLICBLURBEHIND,
-                    flags: 2,
-                    gradient: tint_argb,
-                    anim: 0,
-                };
-                let mut d = WcaData {
-                    attrib: WCA_ACCENT_POLICY,
-                    data: &mut ap as *mut _ as *mut c_void,
-                    size: std::mem::size_of::<AccentPolicy>(),
-                };
-                let _ = f(hwnd, &mut d as *mut _ as *mut c_void);
-            }
-        }
-    }
-}
-
 /// 取某个分区在 config 中的主题色（0xRRGGBB）
 fn zone_rgb(id: &str) -> u32 {
     crate::theme::THEMES
@@ -124,7 +78,6 @@ fn zone_rgb(id: &str) -> u32 {
 const COLOR_IDS: [&str; 7] = ["blue", "teal", "green", "purple", "pink", "orange", "red"];
 
 /// 找桌面图标宿主的父层（layer = 壁纸之上的那一层，是分区窗口要挂的父）与图标宿主（def）。
-/// 返回 (layer, def)，找不到时均为 HWND::default()。
 fn shell() -> (HWND, HWND) {
     unsafe {
         let prog = match FindWindowW(w!("Progman"), None) {
@@ -139,7 +92,6 @@ fn shell() -> (HWND, HWND) {
             Err(_) => HWND::default(),
         };
         if def.0.is_null() {
-            // 遍历顶层 WorkerW，找装有 SHELLDLL_DefView 的那一个
             let mut ww = match FindWindowExW(None, None, w!("WorkerW"), None) {
                 Ok(h) => h,
                 Err(_) => HWND::default(),
@@ -172,19 +124,25 @@ fn shell() -> (HWND, HWND) {
     }
 }
 
+/// 把一段 Rust 字符串转成 Win32 需要的、以 NUL 结尾的 UTF-16 缓冲。
+/// 关键：SetWindowTextW / CreateWindowExW 等 LPCWSTR 参数必须 NUL 结尾，
+/// 直接用 encode_utf16().collect() 不带结尾 0 会导致读越界 → 中文乱码。
+fn wide_nul(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 fn register_class() {
     if CLASSED.with(|c| c.get()) {
         return;
     }
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap();
-        // 背景刷：丙烯酸不支持时的兜底深色（正常情况下被毛玻璃覆盖）
-        let bg = CreateSolidBrush(COLORREF(0x1B2030));
+        // 用 NULL_BRUSH：窗口区域（边框+标题条）由 WM_PAINT 自绘，不需要默认填充
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst.into(),
             lpszClassName: CLASS,
-            hbrBackground: bg,
+            hbrBackground: std::mem::transmute(GetStockObject(NULL_BRUSH)),
             style: CS_HREDRAW | CS_VREDRAW,
             ..Default::default()
         };
@@ -212,23 +170,43 @@ fn register_rename_class() {
     REN_CLASSED.with(|c| c.set(true));
 }
 
-/// 创建/摆放一个分区窗口。作为桌面层的**真子窗口**（WS_CHILD），
-/// 这样它和图标宿主 def 是兄弟，z 序可被精确比较——平时沉到 def 之下，编辑时浮到其上。
-/// 若用 WS_POPUP，parent 参数只是 owner，owned popup 永远在 owner 的子窗口之上，
-/// 无法沉到图标之下（这正是「拖入显示禁止 / 拦截桌面拖放」的根因）。
+/// 给分区窗口设置镂空区域：只保留「边框环 + 顶部标题条」。
+/// 中间区域不属于窗口 → 壁纸/图标透出、鼠标穿透桌面（拖放不再 🚫）。
+fn apply_zone_region(hwnd: HWND, w: i32, h: i32) {
+    if w <= BORDER * 2 || h <= TITLE_H + BORDER {
+        return;
+    }
+    unsafe {
+        // 外框（整块）
+        let outer = CreateRectRgn(0, 0, w, h);
+        // 内框（要挖空的部分）：跳过标题条与四周边框
+        let inner = CreateRectRgn(BORDER, TITLE_H, w - BORDER, h - BORDER);
+        // 边框环 = 外框 - 内框
+        let frame = CreateRectRgn(0, 0, 0, 0);
+        CombineRgn(Some(frame), Some(outer), Some(inner), RGN_DIFF);
+        // 并把顶部标题条并回来（标题条是拖动区 + 名称显示区，需要可交互）
+        let title = CreateRectRgn(0, 0, w, TITLE_H);
+        CombineRgn(Some(frame), Some(frame), Some(title), RGN_OR);
+        // SetWindowRgn 接管 frame 的所有权，不要 DeleteObject(frame)
+        SetWindowRgn(hwnd, Some(frame), true);
+        let _ = DeleteObject(outer.into());
+        let _ = DeleteObject(inner.into());
+        let _ = DeleteObject(title.into());
+    }
+}
+
+/// 创建/摆放一个分区窗口。用 WS_POPUP 挂在桌面层（owner），配合镂空 region：
+/// 边框与标题条浮在图标之上可见可交互，中间镂空不遮挡、不拦截桌面。
 fn create_zone(layer: HWND, z: &crate::config::ZoneConf, idx: usize, parent_visible: bool) -> Option<HWND> {
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap();
-        // config 存屏幕坐标；WS_CHILD 坐标相对父窗口客户区，需转换
-        let mut pos = POINT { x: z.x, y: z.y };
-        let _ = ScreenToClient(layer, &mut pos);
         let hw = match CreateWindowExW(
-            WS_EX_NOACTIVATE,
+            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
             CLASS,
             w!(""),
-            WS_CHILD | WS_VISIBLE,
-            pos.x,
-            pos.y,
+            WS_POPUP,
+            z.x,
+            z.y,
             z.w.max(96),
             z.h.max(64),
             Some(layer),
@@ -243,8 +221,7 @@ fn create_zone(layer: HWND, z: &crate::config::ZoneConf, idx: usize, parent_visi
             return None;
         }
         SetWindowLongPtrW(hw, GWLP_USERDATA, idx as isize);
-        // 丙烯酸毛玻璃打底：AARRGGBB，A≈12%（高透，壁纸清晰可见）
-        set_acrylic(hw, 0x1F1B2336);
+        apply_zone_region(hw, z.w.max(96), z.h.max(64));
         if parent_visible {
             let _ = ShowWindow(hw, SW_SHOWNOACTIVATE);
         } else {
@@ -269,11 +246,10 @@ pub fn sync() {
     }
     let cfg2 = crate::app::with_cfg(|c| c.zones.clone());
 
-    let (layer, def) = shell();
+    let (layer, _def) = shell();
     if layer.0.is_null() {
         return;
     }
-    let editing = EDITING.with(|c| c.get());
 
     WIN.with(|ws| {
         let mut v = ws.borrow_mut();
@@ -290,18 +266,17 @@ pub fn sync() {
             match v[i] {
                 Some(hw) if z.visible => {
                     unsafe {
-                        let mut pos = POINT { x: z.x, y: z.y };
-                        let _ = ScreenToClient(layer, &mut pos);
                         let _ = SetWindowPos(
                             hw,
                             None,
-                            pos.x,
-                            pos.y,
+                            z.x,
+                            z.y,
                             z.w.max(96),
                             z.h.max(64),
                             SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
                         );
                     }
+                    apply_zone_region(hw, z.w.max(96), z.h.max(64));
                 }
                 Some(hw) => {
                     unsafe { let _ = ShowWindow(hw, SW_HIDE); }
@@ -315,22 +290,22 @@ pub fn sync() {
             }
         }
     });
+}
 
-    // 层序：zone 与 def 同为 layer 的子窗口（兄弟），z 序可精确比较。
-    // 编辑模式把每个分区顶到最上（浮到图标之上、可交互）；
-    // 平时把每个分区沉到最底（在图标宿主之下：壁纸透出、图标清晰可点、拖放不干扰）。
-    let _ = def;
-    unsafe {
-        WIN.with(|ws| {
-            if let Ok(v) = ws.try_borrow() {
-                let anchor = if editing { HWND_TOP } else { HWND_BOTTOM };
-                for hw in v.iter().flatten() {
-                    let _ = SetWindowPos(*hw, Some(anchor), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                }
-            }
-        });
-    }
-    // 层序变化后重绘
+/// 是否处于编辑模式（兼容设置页接口；交互已常驻，仅控制手柄高亮）
+#[allow(dead_code)]
+pub fn is_editing() -> bool {
+    EDITING.with(|c| c.get())
+}
+
+/// 进入 / 退出「编辑分区」模式（仅切换四角手柄高亮，交互本身常驻可用）
+pub fn toggle_edit() -> bool {
+    let now = EDITING.with(|c| {
+        let n = !c.get();
+        c.set(n);
+        n
+    });
+    // 重绘所有分区以反映手柄高亮
     WIN.with(|ws| {
         if let Ok(v) = ws.try_borrow() {
             for hw in v.iter().flatten() {
@@ -338,22 +313,6 @@ pub fn sync() {
             }
         }
     });
-}
-
-/// 是否处于编辑模式
-#[allow(dead_code)]
-pub fn is_editing() -> bool {
-    EDITING.with(|c| c.get())
-}
-
-/// 进入 / 退出「编辑分区」模式。返回进入后是否处于编辑态。
-pub fn toggle_edit() -> bool {
-    let now = EDITING.with(|c| {
-        let n = !c.get();
-        c.set(n);
-        n
-    });
-    sync();
     now
 }
 
@@ -424,7 +383,7 @@ pub fn add_zone() {
     sync();
 }
 
-/// 设置页「隐藏 / 显示全部」：翻转所有分区显隐。返回当前是否处于隐藏态。
+/// 设置页「隐藏 / 显示全部」：翻转所有分区显隐。
 pub fn toggle_all() -> bool {
     crate::app::with_cfg(|c| {
         for z in c.zones.iter_mut() {
@@ -437,14 +396,14 @@ pub fn toggle_all() -> bool {
     hidden
 }
 
-/// 程序退出干净清理（托盘退出时调用，可选）。
+/// 程序退出干净清理。
 pub fn shutdown() {
     teardown();
 }
 
-// ── 命中测试：决定分区上每个点的角色（拖动 / 缩放 / 穿透） ──
+// ── 命中测试：判断鼠标落在分区的哪个部位 ──
 
-/// 判断鼠标落在分区的哪个部位：四角/四边缩放，其余整块移动（自绘，不依赖系统 hit）。
+/// 屏幕坐标 → 命中部位。中间镂空区域收不到消息，这里只处理边框与标题条。
 fn hit_mode(hwnd: HWND, screen_pt: POINT, w: i32, h: i32) -> DragMode {
     let mut pt = screen_pt;
     unsafe { let _ = ScreenToClient(hwnd, &mut pt); }
@@ -463,17 +422,16 @@ fn hit_mode(hwnd: HWND, screen_pt: POINT, w: i32, h: i32) -> DragMode {
     else if right { DragMode::Right }
     else if top { DragMode::Top }
     else if bottom { DragMode::Bottom }
-    else { DragMode::Move }
+    else { DragMode::Move } // 标题条内部：整块移动
 }
 
-/// 客户区尺寸
 fn client_size(hwnd: HWND) -> (i32, i32) {
     let mut rc = RECT::default();
     unsafe { let _ = GetClientRect(hwnd, &mut rc); }
     (rc.right - rc.left, rc.bottom - rc.top)
 }
 
-/// 交接 WM_MOVING / WM_SIZING 结束（拖动或缩放完成）后，把窗口几何写回 config 并落盘。
+/// 拖动 / 缩放结束后，把窗口几何写回 config 并落盘。
 fn commit_rect(hwnd: HWND) {
     let idx = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
     if idx < 0 {
@@ -514,7 +472,6 @@ fn popup_menu(hwnd: HWND, idx: usize) {
     unsafe {
         let menu = CreatePopupMenu().unwrap();
         let _ = AppendMenuW(menu, MF_STRING, MENU_RENAME as usize, w!("重命名…"));
-        // 配色子菜单
         let cm = CreatePopupMenu().unwrap();
         for (i, cid) in COLOR_IDS.iter().enumerate() {
             let label: Vec<u16> = match *cid {
@@ -533,12 +490,10 @@ fn popup_menu(hwnd: HWND, idx: usize) {
         let _ = AppendMenuW(menu, MF_POPUP, cm.0 as usize, w!("配色"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, MENU_HIDE as usize, w!("隐藏"));
-        let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT_EDIT as usize, w!("退出编辑模式"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT_EDIT as usize, w!("退出编辑"));
 
         let mut pos = POINT::default();
         let _ = GetCursorPos(&mut pos);
-        // 关键：TrackPopupMenu 要求调用线程的前台窗口属于本线程。
-        // 分区是 WS_CHILD，不能设为前台，改设其根祖先（桌面层所在的顶层窗）。
         let root = GetAncestor(hwnd, GA_ROOT);
         if !root.0.is_null() {
             let _ = SetForegroundWindow(root);
@@ -550,7 +505,7 @@ fn popup_menu(hwnd: HWND, idx: usize) {
     }
 }
 
-// ── 重命名弹窗（简易模态） ──
+// ── 重命名弹窗 ──
 
 const RENAME_EDIT: i32 = 3001;
 const RENAME_OK: i32 = 3002;
@@ -605,10 +560,10 @@ unsafe extern "system" fn rename_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 Some(hinst.into()),
                 None,
             );
-            // 预填当前名字
+            // 预填当前名字（wide_nul 保证 NUL 结尾，修复中文乱码）
             if let Some(idx) = RENAME_IDX.with(|c| c.get()) {
                 if let Some(cur) = crate::app::with_cfg(|c| c.zones.get(idx).map(|z| z.name.clone())) {
-                    let cur_w: Vec<u16> = cur.encode_utf16().collect();
+                    let cur_w = wide_nul(&cur);
                     if let Ok(edit) = GetDlgItem(Some(hwnd), RENAME_EDIT) {
                         let _ = SetWindowTextW(edit, PCWSTR(cur_w.as_ptr()));
                         let _ = SetFocus(Some(edit));
@@ -620,7 +575,6 @@ unsafe extern "system" fn rename_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
         WM_COMMAND => {
             let id = (wparam.0 as u32) & 0xffff;
             if id as i32 == RENAME_OK {
-                // 读取输入 → 写回 config → 结束
                 if let Some(idx) = RENAME_IDX.with(|c| c.get()) {
                     if let Ok(edit) = GetDlgItem(Some(hwnd), RENAME_EDIT) {
                         let len = GetWindowTextLengthW(edit) as usize;
@@ -630,10 +584,18 @@ unsafe extern "system" fn rename_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                         if !s.is_empty() {
                             crate::app::with_cfg(|c| {
                                 if let Some(z) = c.zones.get_mut(idx) {
-                                    z.name = s;
+                                    z.name = s.clone();
                                 }
                             });
                             crate::app::save_now();
+                            // 立即重绘对应分区名称
+                            WIN.with(|ws| {
+                                if let Ok(v) = ws.try_borrow() {
+                                    if let Some(Some(hw)) = v.get(idx) {
+                                        unsafe { let _ = InvalidateRect(Some(*hw), None, true); }
+                                    }
+                                }
+                            });
                         }
                     }
                 }
@@ -686,7 +648,6 @@ fn open_rename(idx: usize) {
                 return;
             }
         };
-        // 居中
         let sw = GetSystemMetrics(SM_CXSCREEN);
         let sh = GetSystemMetrics(SM_CYSCREEN);
         let mut rc = RECT::default();
@@ -709,56 +670,47 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
-        WM_ERASEBKGND => LRESULT(1), // 由 WM_PAINT 全量重绘，避免闪烁
+        WM_ERASEBKGND => LRESULT(1), // 由 WM_PAINT 全量自绘
         WM_NCHITTEST => {
-            // 编辑模式：整块作为客户区接收鼠标（自绘拖动/缩放/右键）；
-            // 平时：分区沉在图标之下返回穿透，进一步确保不拦截任何桌面交互。
-            if EDITING.with(|c| c.get()) {
-                LRESULT(HTCLIENT as isize)
-            } else {
-                LRESULT(HTTRANSPARENT as isize)
-            }
+            // 中间镂空区域不属于窗口，收不到此消息；这里只对边框/标题条返回客户区，
+            // 交给自绘拖动/缩放。返回 HTCLIENT 让鼠标消息进入。
+            LRESULT(HTCLIENT as isize)
         }
         WM_SETCURSOR => {
-            if EDITING.with(|c| c.get()) {
-                let (w, h) = client_size(hwnd);
-                let mut sp = POINT::default();
-                let _ = GetCursorPos(&mut sp);
-                let mode = hit_mode(hwnd, sp, w, h);
-                let idc = match mode {
-                    DragMode::Left | DragMode::Right => IDC_SIZEWE,
-                    DragMode::Top | DragMode::Bottom => IDC_SIZENS,
-                    DragMode::TopLeft | DragMode::BottomRight => IDC_SIZENWSE,
-                    DragMode::TopRight | DragMode::BottomLeft => IDC_SIZENESW,
-                    _ => IDC_SIZEALL,
-                };
-                if let Ok(cur) = LoadCursorW(None, idc) {
-                    let _ = SetCursor(Some(cur));
-                    return LRESULT(1);
-                }
+            let (w, h) = client_size(hwnd);
+            let mut sp = POINT::default();
+            let _ = GetCursorPos(&mut sp);
+            let mode = hit_mode(hwnd, sp, w, h);
+            let idc = match mode {
+                DragMode::Left | DragMode::Right => IDC_SIZEWE,
+                DragMode::Top | DragMode::Bottom => IDC_SIZENS,
+                DragMode::TopLeft | DragMode::BottomRight => IDC_SIZENWSE,
+                DragMode::TopRight | DragMode::BottomLeft => IDC_SIZENESW,
+                _ => IDC_SIZEALL,
+            };
+            if let Ok(cur) = LoadCursorW(None, idc) {
+                let _ = SetCursor(Some(cur));
+                return LRESULT(1);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONDOWN => {
-            if EDITING.with(|c| c.get()) {
-                let (w, h) = client_size(hwnd);
-                let cx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
-                let cy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
-                let mut sp = POINT { x: cx, y: cy };
-                let _ = ClientToScreen(hwnd, &mut sp);
-                let mode = hit_mode(hwnd, sp, w, h);
-                let mut rc = RECT::default();
-                let _ = GetWindowRect(hwnd, &mut rc);
-                DRAG.with(|d| {
-                    *d.borrow_mut() = Some(DragState { mode, start_screen: sp, start_rect: rc });
-                });
-                let _ = SetCapture(hwnd);
-                return LRESULT(0);
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            let (w, h) = client_size(hwnd);
+            let cx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
+            let cy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
+            let mut sp = POINT { x: cx, y: cy };
+            let _ = ClientToScreen(hwnd, &mut sp);
+            let mode = hit_mode(hwnd, sp, w, h);
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rc);
+            DRAG.with(|d| {
+                *d.borrow_mut() = Some(DragState { mode, start_screen: sp, start_rect: rc });
+            });
+            let _ = SetCapture(hwnd);
+            LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            if EDITING.with(|c| c.get()) && DRAG.with(|d| d.borrow().is_some()) {
+            if DRAG.with(|d| d.borrow().is_some()) {
                 let cx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
                 let cy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
                 let mut sp = POINT { x: cx, y: cy };
@@ -783,18 +735,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     DragMode::BottomLeft => { l += dx; b += dy; if l > r - minw { l = r - minw; } if b < t + minh { b = t + minh; } }
                     DragMode::BottomRight => { r += dx; b += dy; if r < l + minw { r = l + minw; } if b < t + minh { b = t + minh; } }
                 }
-                // 新矩形是屏幕坐标，转换为父窗口（layer）客户区坐标后 MoveWindow
-                let parent = unsafe { GetParent(hwnd).unwrap_or_default() };
-                let mut pt = POINT { x: l, y: t };
-                if !parent.0.is_null() {
-                    unsafe { let _ = ScreenToClient(parent, &mut pt); }
-                }
                 unsafe {
-                    let _ = MoveWindow(hwnd, pt.x, pt.y, r - l, b - t, false);
-                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    let _ = MoveWindow(hwnd, l, t, r - l, b - t, false);
                 }
                 return LRESULT(0);
             }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_SIZE => {
+            // 尺寸变化后重建镂空区域，边框始终跟随窗口
+            let (w, h) = client_size(hwnd);
+            apply_zone_region(hwnd, w, h);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONUP => {
@@ -805,9 +756,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
-        WM_CONTEXTMENU => {
+        WM_RBUTTONUP => {
             let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-            if idx >= 0 && EDITING.with(|c| c.get()) {
+            if idx >= 0 {
                 popup_menu(hwnd, idx as usize);
             }
             LRESULT(0)
@@ -828,7 +779,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     sync();
                 } else if id == MENU_EXIT_EDIT {
                     EDITING.with(|c| c.set(false));
-                    sync();
+                    let _ = InvalidateRect(Some(hwnd), None, true);
                 } else if id >= MENU_COLOR_BASE && id < MENU_COLOR_BASE + COLOR_IDS.len() as u32 {
                     let cid = COLOR_IDS[(id - MENU_COLOR_BASE) as usize];
                     crate::app::with_cfg(|c| {
@@ -837,7 +788,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     });
                     crate::app::save_now();
-                    // 立即重绘新配色
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
@@ -847,9 +797,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
-/// 用 GDI 画分区外观：1px 柔和细圆角边框 + 顶部 2px 主题色横线 + 左上角名称小字。
-/// 编辑模式下额外画主题色强调边框 + 四角手柄，提示可拖动 / 缩放。
-/// 其余区域留空，让丙烯酸毛玻璃透出壁纸与图标。
+/// 用 GDI 画分区外观：**只画边框环 + 顶部标题条**（中间镂空，由 region 保证透明）。
+/// 标题条：主题色打底 + 白色名称；边框：主题色细线；编辑模式额外画四角手柄。
 fn paint_zone(hwnd: HWND, idx: usize) {
     let (name, color) = crate::app::with_cfg(|c| {
         c.zones
@@ -871,38 +820,24 @@ fn paint_zone(hwnd: HWND, idx: usize) {
             return;
         }
 
-        // 边框：编辑模式用主题色 2px 强调框；平时 1px 柔和浅灰蓝
-        let (bw, bcolor) = if editing { (2, color) } else { (1, 0x7E8898) };
-        let pen = CreatePen(PS_SOLID, bw, COLORREF(bcolor));
+        // 顶部标题条：主题色填充（这是唯一不透明的实心区，也是拖动区）
+        let bar_brush = CreateSolidBrush(COLORREF(color));
+        let bar_rect = RECT { left: 0, top: 0, right: w, bottom: TITLE_H };
+        let _ = FillRect(hdc, &bar_rect, bar_brush);
+        let _ = DeleteObject(bar_brush.into());
+
+        // 边框：主题色细线（region 已裁成环，这里描边即只显示边框）
+        let pen = CreatePen(PS_SOLID, 2, COLORREF(color));
         let old_pen = SelectObject(hdc, pen.into());
         let old_br = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        let _ = RoundRect(hdc, 1, 1, w - 1, h - 1, RADIUS * 2, RADIUS * 2);
+        let _ = Rectangle(hdc, 0, 0, w, h);
         let _ = SelectObject(hdc, old_pen);
         let _ = SelectObject(hdc, old_br);
         let _ = DeleteObject(pen.into());
 
-        // 编辑模式：四角画实心小方块手柄
-        if editing {
-            let hb = CreateSolidBrush(COLORREF(color));
-            let s = 8;
-            for (hx, hy) in [(1, 1), (w - 1 - s, 1), (1, h - 1 - s), (w - 1 - s, h - 1 - s)] {
-                let hr = RECT { left: hx, top: hy, right: hx + s, bottom: hy + s };
-                let _ = FillRect(hdc, &hr, hb);
-            }
-            let _ = DeleteObject(hb.into());
-        }
-
-        // 顶部 2px 主题色横线（分区强调色）
-        let line_pen = CreatePen(PS_SOLID, 2, COLORREF(color));
-        let old2 = SelectObject(hdc, line_pen.into());
-        let _ = MoveToEx(hdc, 14, 9, None);
-        let _ = LineTo(hdc, w - 14, 9);
-        let _ = SelectObject(hdc, old2);
-        let _ = DeleteObject(line_pen.into());
-
-        // 左上角名称（主题色小字，透明背景）
+        // 标题条上的名称（白色小字，透明背景）
         let font = CreateFontW(
-            -15,
+            -14,
             0,
             0,
             0,
@@ -919,12 +854,23 @@ fn paint_zone(hwnd: HWND, idx: usize) {
         );
         let old_font = SelectObject(hdc, font.into());
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(hdc, COLORREF(color));
-        let mut tr = RECT { left: 18, top: 16, right: w - 18, bottom: 42 };
+        let _ = SetTextColor(hdc, COLORREF(0xFFFFFF));
+        let mut tr = RECT { left: 12, top: 4, right: w - 12, bottom: TITLE_H - 2 };
         let mut wide: Vec<u16> = name.encode_utf16().collect();
-        let _ = DrawTextW(hdc, &mut wide, &mut tr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+        let _ = DrawTextW(hdc, &mut wide, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
         let _ = SelectObject(hdc, old_font);
         let _ = DeleteObject(font.into());
+
+        // 编辑模式：四角画实心小方块手柄（提示可缩放）
+        if editing {
+            let hb = CreateSolidBrush(COLORREF(0xFFFFFF));
+            let s = 8;
+            for (hx, hy) in [(0, 0), (w - s, 0), (0, h - s), (w - s, h - s)] {
+                let hr = RECT { left: hx, top: hy, right: hx + s, bottom: hy + s };
+                let _ = FillRect(hdc, &hr, hb);
+            }
+            let _ = DeleteObject(hb.into());
+        }
 
         let _ = EndPaint(hwnd, &ps);
     }

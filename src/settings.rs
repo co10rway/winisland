@@ -394,14 +394,14 @@ fn pages() -> Vec<Page> {
         // 7 桌面分区
         Page {
             title: "桌面分区",
-            desc: "在桌面上划出毛玻璃分组框，把图标按分组罩成一块块可视区域（纯视觉，不搬文件）",
+            desc: "在桌面上划出镂空描边框（仿 Fences），把图标框成一块块可视区域；框内完全透明，不搬文件",
             rows: vec![
-                Row::toggle(0, "启用桌面分区", "开启后在桌面绘制分区（壁纸之上、图标之下，不遮挡壁纸）"),
+                Row::toggle(0, "启用桌面分区", "开启后在桌面绘制镂空分区框，中间透明不遮挡壁纸和图标"),
                 Row::toggle(1, "开机自启分区", "随系统启动自动显示分区"),
-                Row::action(4, "编辑分区", "进入编辑模式：分区浮到图标之上，可拖动位置、四角缩放、右键改名 / 换色 / 隐藏。调整完再点一次退出", vec![("进入编辑模式", 4, true, 132.0)]),
+                Row::action(4, "编辑分区", "切换四角手柄高亮；拖动标题栏移动、拖四边四角缩放、右键改名 / 换色 / 隐藏随时可用", vec![("切换手柄", 4, true, 112.0)]),
                 Row::action(2, "新建分区", "在桌面中央新增一个默认分区", vec![("＋ 新建分区", 2, true, 128.0)]),
                 Row::action(3, "显示 / 隐藏全部", "一键隐藏所有分区看干净桌面，再点一次恢复", vec![("隐藏全部", 3, true, 116.0)]),
-                Row::note("平时分区在图标下方，壁纸和图标都清晰、桌面操作不受影响；要调整位置和大小就点「编辑分区」，进入后直接拖动 / 缩放 / 右键，调完点「退出编辑」。"),
+                Row::note("分区是镂空描边框：只有边框和标题栏可见，中间完全透明——壁纸、图标清晰可见，文件可正常拖到桌面。直接拖标题栏可移动、拖四边四角可缩放、右键可改名 / 换色 / 隐藏，全部自动保存。"),
             ],
         },
         // 8 邮箱验证码
@@ -1875,13 +1875,8 @@ fn on_click(hwnd: HWND, id: HitId) {
                 }
                 (7, 4) => {
                     let editing = crate::modules::zones::toggle_edit();
-                    if editing {
-                        // 藏掉设置窗口，让用户直接在桌面拖动 / 缩放分区
-                        hide_for_edit();
-                    } else {
-                        flash("已退出编辑模式");
-                        invalidate(hwnd);
-                    }
+                    flash(if editing { "已显示缩放手柄（拖标题栏移动 / 四角缩放）" } else { "已隐藏缩放手柄" });
+                    invalidate(hwnd);
                 }
                 (7, 3) => {
                     let on = crate::modules::zones::toggle_all();
@@ -2054,18 +2049,6 @@ pub fn close_for_quit() {
     let hwnd = WIN.with(|c| c.get());
     if hwnd != 0 {
         hide_and_restore(HWND(hwnd as *mut core::ffi::c_void));
-    }
-}
-
-/// 进入「编辑分区」模式时调用：把设置窗口藏起来，让用户能直接在桌面上
-/// 拖动 / 缩放分区；退出编辑可在分区右键菜单里点「退出编辑模式」。
-pub fn hide_for_edit() {
-    let hwnd = WIN.with(|c| c.get());
-    if hwnd != 0 {
-        unsafe {
-            let _ = ShowWindow(HWND(hwnd as *mut core::ffi::c_void), SW_HIDE);
-        }
-        crate::app::set_island_topmost(true);
     }
 }
 
