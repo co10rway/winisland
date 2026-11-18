@@ -146,9 +146,6 @@ pub struct App {
     pub hover: Option<ui::HitId>,
     /// 文件正拖到岛上（OLE DragEnter→DragLeave/Drop 之间），用于面板高亮
     pub drag_hover: bool,
-    /// 全局检测到用户正在拖动文件（系统任意位置），但尚未进入灵动岛。
-    /// 收起态胶囊显示一条"拖到此处暂存"提示；不展开面板。
-    pub file_drag_hint: bool,
 
     /// 待用户确认的提醒（久坐 / 喝水 / 日程）。存在期间胶囊常亮显示提醒内容：
     /// 不自动过期、不被遮挡收成小黑条、不被悬停/轮播顶掉，
@@ -465,7 +462,6 @@ pub fn run() {
                 mouse: POINT { x: 0, y: 0 },
                 hover: None,
                 drag_hover: false,
-                file_drag_hint: false,
                 reminder: None,
                 last_water_unix: now_unix,
                 sed_ack_idle: 0,
@@ -516,8 +512,6 @@ pub fn run() {
 
         // 键盘钩子
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0).expect("SetWindowsHookExW");
-        // 全局鼠标钩子：检测系统任意位置的文件拖动（用于收起态胶囊提示）
-        let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0).expect("SetWindowsHookExW(mouse)");
         HOOK_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
 
         AddClipboardFormatListener(hwnd).ok();
@@ -614,7 +608,6 @@ pub fn run() {
 
         let _ = timeEndPeriod(1);
         UnhookWindowsHookEx(hook).ok();
-        UnhookWindowsHookEx(mouse_hook).ok();
         save_now();
         let _ = crate::ui::revoke_ole_drop(hwnd);
     }
@@ -703,7 +696,6 @@ fn preview_app(demo: bool) -> App {
         mouse: POINT::default(),
         hover: None,
         drag_hover: false,
-        file_drag_hint: false,
         reminder: None,
         last_water_unix: 0,
         sed_ack_idle: 0,
@@ -1377,60 +1369,6 @@ unsafe extern "system" fn hook_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) 
 
 // ───────── 全局鼠标钩子：检测"用户正在拖动文件" ─────────
 // 只做轻量手势判定，绝不在此调用 OleGetClipboard / 访问 APP：
-// 低级鼠标钩子有系统超时（LowLevelHooksTimeout），做重活会被静默卸载。
-// 越过阈值后只 PostMessage 一次给主线程，由 wndproc 里查 CF_HDROP 确认。
-static MOUSE_DOWN_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-static MOUSE_DOWN_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-static MOUSE_LDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static DRAG_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-unsafe extern "system" fn mouse_hook_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    use std::sync::atomic::Ordering;
-    if ncode >= 0 {
-        let msg = wparam.0 as u32;
-        const WM_MOUSEMOVE_U: u32 = 0x0200;
-        const WM_LBUTTONDOWN_U: u32 = 0x0201;
-        const WM_LBUTTONUP_U: u32 = 0x0202;
-        let h = HOOK_HWND.load(Ordering::Relaxed);
-        match msg {
-            WM_LBUTTONDOWN_U => {
-                let m = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-                MOUSE_DOWN_X.store(m.pt.x, Ordering::Relaxed);
-                MOUSE_DOWN_Y.store(m.pt.y, Ordering::Relaxed);
-                MOUSE_LDOWN.store(true, Ordering::Relaxed);
-                DRAG_ARMED.store(false, Ordering::Relaxed);
-            }
-            WM_MOUSEMOVE_U => {
-                // 左键按住且已越过阈值后，每次移动都发一次 BEGIN（幂等）。
-                // 原因：OLE 把 CF_HDROP 放进剪贴板相对"拖动开始"有几十毫秒延迟，
-                // 首次查询可能太早；持续重查直到确认为文件（已显示则主线程直接忽略）。
-                if MOUSE_LDOWN.load(Ordering::Relaxed) {
-                    let m = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-                    let dx = m.pt.x - MOUSE_DOWN_X.load(Ordering::Relaxed);
-                    let dy = m.pt.y - MOUSE_DOWN_Y.load(Ordering::Relaxed);
-                    if !DRAG_ARMED.load(Ordering::Relaxed) {
-                        // 超过阈值视为拖动开始（区分点击与拖拽）
-                        if dx * dx + dy * dy > 100 {
-                            DRAG_ARMED.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    if DRAG_ARMED.load(Ordering::Relaxed) && h != 0 {
-                        let _ = PostMessageW(Some(HWND(h as *mut _)), ui::WM_FILE_DRAG_BEGIN, WPARAM(0), LPARAM(0));
-                    }
-                }
-            }
-            WM_LBUTTONUP_U => {
-                if DRAG_ARMED.swap(false, Ordering::Relaxed) && h != 0 {
-                    let _ = PostMessageW(Some(HWND(h as *mut _)), ui::WM_FILE_DRAG_END, WPARAM(0), LPARAM(0));
-                }
-                MOUSE_LDOWN.store(false, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-    }
-    CallNextHookEx(None, ncode, wparam, lparam)
-}
-
 pub fn now_idle_secs() -> u32 {
     unsafe {
         let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
@@ -1463,48 +1401,6 @@ pub fn push_file_external(path: String) {
             app.dirty = true;
         }
         app.flash = Some(Flash::new(msg.unwrap_or(""), 1600));
-        drop(b);
-        redraw();
-    });
-}
-
-/// 判断当前系统剪贴板数据对象是否包含 CF_HDROP（文件拖动）。
-/// OLE 拖放在 DoDragDrop 期间会把拖动的数据放进 OLE 剪贴板，
-/// 因此这能可靠区分"拖文件"与"拖窗口/拖文字/选文本"。
-/// 必须在主线程 STA（已 OleInitialize）里调用。
-fn is_file_drag_active() -> bool {
-    use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
-    use windows::Win32::System::Ole::{OleGetClipboard, CF_HDROP};
-    unsafe {
-        let Ok(obj) = OleGetClipboard() else { return false };
-        let fmt = FORMATETC {
-            cfFormat: CF_HDROP.0,
-            dwAspect: DVASPECT_CONTENT.0 as u32,
-            lindex: -1,
-            ptd: std::ptr::null_mut(),
-            tymed: TYMED_HGLOBAL.0 as u32,
-        };
-        obj.QueryGetData(&fmt).is_ok()
-    }
-}
-
-/// 全局检测到文件拖动（尚未进入岛）：控制收起态胶囊的提示条。
-/// 只改状态 + 重绘，不展开面板。
-pub fn set_file_drag_hint(on: bool) {
-    APP.with(|a| {
-        let mut b = a.borrow_mut();
-        let Some(app) = b.as_mut() else { return };
-        if !app.cfg.modules.filehub {
-            return;
-        }
-        // 已进入岛（drag_hover=true）时不再点亮胶囊提示，避免两者打架
-        if on && app.drag_hover {
-            return;
-        }
-        if app.file_drag_hint == on {
-            return;
-        }
-        app.file_drag_hint = on;
         drop(b);
         redraw();
     });
@@ -2349,24 +2245,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             on_clipboard_update();
             LRESULT(0)
         }
-        // 全局鼠标钩子：检测到拖动开始 → 查剪贴板是否为文件拖动（CF_HDROP）
-        ui::WM_FILE_DRAG_BEGIN => {
-            // 幂等：提示已显示就不再重复查剪贴板（钩子在拖动期间会持续发）
-            let already = APP.with(|a| a.borrow().as_ref().map(|x| x.file_drag_hint).unwrap_or(false));
-            if !already && is_file_drag_active() {
-                diag_log("全局检测到文件拖动 → 胶囊提示");
-                set_file_drag_hint(true);
-            }
-            LRESULT(0)
-        }
-        ui::WM_FILE_DRAG_END => {
-            set_file_drag_hint(false);
-            LRESULT(0)
-        }
         // OLE 拖放回调通过消息把 UI 操作切回主线程（回调里严禁同步重绘）
         ui::WM_DRAG_ENTER => {
-            // 文件已进入灵动岛 → 收起态提示可以撤掉，改由面板高亮接管
-            set_file_drag_hint(false);
             set_drag_hover(true);
             LRESULT(0)
         }
