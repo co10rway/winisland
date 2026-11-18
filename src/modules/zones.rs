@@ -1,49 +1,82 @@
-//! 桌面分区：在桌面上绘制「镂空描边框」分组框（仿 Fences），分区可完全自定义。
+//! 桌面分区（围栏）：仿 Fences 的桌面图标收纳面板。
 //!
-//! 核心架构（v0.11 重写，彻底放弃 acrylic / layered / z 序控制）：
-//! - 分区窗口用 `SetWindowRgn` 裁成「边框环 + 顶部标题条」——**窗口中间根本不属于
-//!   窗口区域**（镂空）。因此：壁纸与桌面图标天然透出（不再有黑色遮挡）、鼠标事件
-//!   自然穿透到桌面（文件可正常拖放、图标可点，不再出现 🚫 禁止光标）。
-//! - 交互常驻（无需编辑模式上浮下沉）：标题条拖动整块、四边四角缩放、右键改名换色隐藏。
-//!   因为只有边框/标题条是窗口，中间镂空区域永远不拦截桌面。
-//! - 自绘拖动/缩放（不依赖系统位图拉伸，边框不会错乱）。
-//! - 位置、大小、配色持久化到 config.json。
+//! 架构（v0.12 重写为「图标托管」）：
+//! - 每个分区是一块**顶层毛玻璃窗口**。`SetWindowCompositionAttribute` 的 acrylic
+//!   只对**顶层窗口**生效——这是之前反复「纯黑 / 完全不透」的总根因（分区曾是
+//!   Progman 的子窗口，acrylic 永远不生效，露出类背景刷的不透明深色）。
+//!   现在浮在壁纸之上、普通应用窗口之下（HWND_BOTTOM + WS_EX_NOACTIVATE）。
+//! - 桌面图标由本模块接管：隐藏 Explorer 的图标层（SHELLDLL_DefView），按分区配置
+//!   枚举桌面项、**自绘图标 + 名称**，网格排列在面板内（3 列）。这样图标才真正
+//!   「在分区里」，而不是被一个空框罩住。
+//! - 双击图标用 ShellExecute 打开；把文件拖到面板上即归入该分区
+//!   （DragAcceptFiles + WM_DROPFILES）。
+//! - 标题栏拖动移动、四边四角缩放、右上角箭头折叠 / 展开、右键菜单改名 / 换色 / 删除。
+//! - 位置 / 大小 / 折叠 / 归入项持久化到 config.json。退出时恢复 Explorer 图标层。
 //!
 //! 全部数据仅存本机 config.json，不联网。
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use windows::core::{w, PCWSTR};
+use std::path::{Path, PathBuf};
+use windows::core::{w, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
+use windows::Win32::UI::Shell::{
+    DragAcceptFiles, DragFinish, DragQueryFileW, SHGetFileInfoW, ShellExecuteW, HDROP, SHFILEINFOW,
+    SHGFI_ICON, SHGFI_LARGEICON,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 分区窗口类名
 const CLASS: PCWSTR = w!("WinIslandZone");
 /// 重命名弹窗类名
 const RENAME_CLASS: PCWSTR = w!("WinIslandRename");
-/// 边框厚度（窗口区域 = 边框环 + 标题条）
-const BORDER: i32 = 3;
-/// 顶部标题条高度（拖动区 + 显示名称）
-const TITLE_H: i32 = 30;
-/// 命中边界厚度（四边/四角的缩放手柄宽度）
+/// 标题栏高度
+const TITLE_H: i32 = 34;
+/// 面板内边距
+const PAD: i32 = 10;
+/// 图标格宽
+const CELL_W: i32 = 96;
+/// 图标格高（图标 + 两行名称）
+const CELL_H: i32 = 86;
+/// 图标边长
+const ICON_SZ: i32 = 32;
+/// 圆角半径
+const RADIUS: i32 = 12;
+/// 缩放手柄厚度
 const EDGE: i32 = 8;
+/// 最小宽 / 高
+const MIN_W: i32 = 160;
+const MIN_H: i32 = TITLE_H + 18;
+/// 毛玻璃打底色（AABBGGRR）：A≈70%，深灰绿
+const TINT: u32 = 0xB4_24_26_1E;
+/// 分区主题色 ID 列表（右键菜单换色用）
+const COLOR_IDS: [&str; 7] = ["blue", "teal", "green", "purple", "pink", "orange", "red"];
 
 thread_local! {
-    /// 与 config.zones 对齐的活窗口：None = 该分区当前无窗口（隐藏 / 未启用）
+    /// 与 config.zones 对齐的活窗口
     static WIN: RefCell<Vec<Option<HWND>>> = const { RefCell::new(Vec::new()) };
-    /// 分区窗口类是否已注册
     static CLASSED: Cell<bool> = const { Cell::new(false) };
-    /// 重命名弹窗类是否已注册
     static REN_CLASSED: Cell<bool> = const { Cell::new(false) };
-    /// 当前正在重命名的分区索引（无则 None）
     static RENAME_IDX: Cell<Option<usize>> = const { Cell::new(None) };
-    /// 自绘拖动/缩放状态
     static DRAG: RefCell<Option<DragState>> = const { RefCell::new(None) };
-    /// 是否处于「编辑分区」模式（仅作设置页按钮兼容；交互已常驻，仅控制手柄高亮显示）
     static EDITING: Cell<bool> = const { Cell::new(false) };
+    /// 文件名 → HICON（isize），懒加载缓存
+    static ICONS: RefCell<HashMap<String, isize>> = RefCell::new(HashMap::new());
+    /// 当前桌面项快照
+    static ITEMS: RefCell<Vec<DeskItem>> = const { RefCell::new(Vec::new()) };
+    /// 桌面项签名（用于轮询变更）
+    static SIGN: RefCell<String> = RefCell::new(String::new());
+}
+
+#[derive(Clone)]
+struct DeskItem {
+    name: String,
+    path: PathBuf,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -57,6 +90,7 @@ enum DragMode {
     TopRight,
     BottomLeft,
     BottomRight,
+    None,
 }
 
 struct DragState {
@@ -65,7 +99,9 @@ struct DragState {
     start_rect: RECT, // 屏幕坐标
 }
 
-/// 取某个分区在 config 中的主题色（0xRRGGBB）
+// ── 小工具 ──
+
+/// 主题色 id → 0xRRGGBB
 fn zone_rgb(id: &str) -> u32 {
     crate::theme::THEMES
         .iter()
@@ -74,10 +110,17 @@ fn zone_rgb(id: &str) -> u32 {
         .unwrap_or(0x4E8FFF)
 }
 
-/// 分区主题色 ID 列表（右键菜单换色用）
-const COLOR_IDS: [&str; 7] = ["blue", "teal", "green", "purple", "pink", "orange", "red"];
+/// RGB → GDI COLORREF（0x00BBGGRR）
+fn rgb(r: u32, g: u32, b: u32) -> u32 {
+    (b << 16) | (g << 8) | r
+}
 
-/// 找桌面图标宿主的父层（layer = 壁纸之上的那一层，是分区窗口要挂的父）与图标宿主（def）。
+/// 转 NUL 结尾 UTF-16（所有 LPCWSTR 参数必须 NUL 结尾，否则读越界乱码）
+fn wide_nul(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 找桌面图标宿主（def = SHELLDLL_DefView）及其父层（layer）
 fn shell() -> (HWND, HWND) {
     unsafe {
         let prog = match FindWindowW(w!("Progman"), None) {
@@ -124,12 +167,66 @@ fn shell() -> (HWND, HWND) {
     }
 }
 
-/// 把一段 Rust 字符串转成 Win32 需要的、以 NUL 结尾的 UTF-16 缓冲。
-/// 关键：SetWindowTextW / CreateWindowExW 等 LPCWSTR 参数必须 NUL 结尾，
-/// 直接用 encode_utf16().collect() 不带结尾 0 会导致读越界 → 中文乱码。
-fn wide_nul(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
+/// 隐藏 / 显示 Explorer 桌面图标层（图标由本模块托管）
+fn set_shell_icons_visible(show: bool) {
+    let (_, def) = shell();
+    if def.0.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(def, if show { SW_SHOW } else { SW_HIDE });
+    }
 }
+
+// ── 毛玻璃 ──
+
+#[repr(C)]
+struct AccentPolicy {
+    state: i32,
+    flags: i32,
+    gradient_color: u32,
+    animation_id: i32,
+}
+
+#[repr(C)]
+struct WcaData {
+    attrib: i32,
+    data: *mut c_void,
+    /// WINDOWCOMPOSITIONATTRIBDATA.cbData 在 x64 下是 SIZE_T（8 字节），
+    /// 曾经写成 u32 导致结构错位 → 调用永远失败 → 毛玻璃不生效。
+    size: usize,
+}
+
+/// 给**顶层窗口**设置丙烯酸毛玻璃。argb 为 AABBGGRR。
+fn set_acrylic(hw: HWND, argb: u32) {
+    const WCA_ACCENT_POLICY: i32 = 19;
+    const ACCENT_ENABLE_ACRYLICBLURBEHIND: i32 = 4;
+    unsafe {
+        let lib = match LoadLibraryW(w!("user32.dll")) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let proc = GetProcAddress(lib, PCSTR(b"SetWindowCompositionAttribute\0".as_ptr()));
+        let f: Option<unsafe extern "system" fn(HWND, *mut WcaData) -> i32> =
+            std::mem::transmute(proc);
+        if let Some(f) = f {
+            let mut ap = AccentPolicy {
+                state: ACCENT_ENABLE_ACRYLICBLURBEHIND,
+                flags: 0x20 | 0x40 | 0x80,
+                gradient_color: argb,
+                animation_id: 0,
+            };
+            let mut d = WcaData {
+                attrib: WCA_ACCENT_POLICY,
+                data: &mut ap as *mut _ as *mut c_void,
+                size: std::mem::size_of::<AccentPolicy>(),
+            };
+            f(hw, &mut d);
+        }
+    }
+}
+
+// ── 类注册 ──
 
 fn register_class() {
     if CLASSED.with(|c| c.get()) {
@@ -137,13 +234,12 @@ fn register_class() {
     }
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap();
-        // 用 NULL_BRUSH：窗口区域（边框+标题条）由 WM_PAINT 自绘，不需要默认填充
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst.into(),
             lpszClassName: CLASS,
             hbrBackground: std::mem::transmute(GetStockObject(NULL_BRUSH)),
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             ..Default::default()
         };
         RegisterClassW(&wc);
@@ -161,7 +257,7 @@ fn register_rename_class() {
             lpfnWndProc: Some(rename_wndproc),
             hInstance: hinst.into(),
             lpszClassName: RENAME_CLASS,
-            hbrBackground: CreateSolidBrush(COLORREF(0x1E2438)),
+            hbrBackground: CreateSolidBrush(COLORREF(rgb(30, 38, 36))),
             style: CS_HREDRAW | CS_VREDRAW,
             ..Default::default()
         };
@@ -170,36 +266,108 @@ fn register_rename_class() {
     REN_CLASSED.with(|c| c.set(true));
 }
 
-/// 给分区窗口设置镂空区域：只保留「边框环 + 顶部标题条」。
-/// 中间区域不属于窗口 → 壁纸/图标透出、鼠标穿透桌面（拖放不再 🚫）。
-fn apply_zone_region(hwnd: HWND, w: i32, h: i32) {
-    if w <= BORDER * 2 || h <= TITLE_H + BORDER {
-        return;
-    }
+/// 圆角窗口区域
+fn round_region(hwnd: HWND, w: i32, h: i32) {
     unsafe {
-        // 外框（整块）
-        let outer = CreateRectRgn(0, 0, w, h);
-        // 内框（要挖空的部分）：跳过标题条与四周边框
-        let inner = CreateRectRgn(BORDER, TITLE_H, w - BORDER, h - BORDER);
-        // 边框环 = 外框 - 内框
-        let frame = CreateRectRgn(0, 0, 0, 0);
-        CombineRgn(Some(frame), Some(outer), Some(inner), RGN_DIFF);
-        // 并把顶部标题条并回来（标题条是拖动区 + 名称显示区，需要可交互）
-        let title = CreateRectRgn(0, 0, w, TITLE_H);
-        CombineRgn(Some(frame), Some(frame), Some(title), RGN_OR);
-        // SetWindowRgn 接管 frame 的所有权，不要 DeleteObject(frame)
-        SetWindowRgn(hwnd, Some(frame), true);
-        let _ = DeleteObject(outer.into());
-        let _ = DeleteObject(inner.into());
-        let _ = DeleteObject(title.into());
+        let r = CreateRoundRectRgn(0, 0, w + 1, h + 1, RADIUS * 2, RADIUS * 2);
+        if !r.0.is_null() {
+            SetWindowRgn(hwnd, Some(r), true);
+        }
     }
 }
 
-/// 创建/摆放一个分区窗口。用 WS_POPUP 挂在桌面层（owner），配合镂空 region：
-/// 边框与标题条浮在图标之上可见可交互，中间镂空不遮挡、不拦截桌面。
-fn create_zone(layer: HWND, z: &crate::config::ZoneConf, idx: usize, parent_visible: bool) -> Option<HWND> {
+// ── 桌面项枚举与图标 ──
+
+fn desktop_items() -> Vec<DeskItem> {
+    let mut out: Vec<DeskItem> = Vec::new();
+    let mut dirs: Vec<PathBuf> = vec![crate::modules::files::desktop_dir()];
+    if let Ok(pubd) = std::env::var("PUBLIC") {
+        dirs.push(PathBuf::from(pubd).join("Desktop"));
+    }
+    for d in dirs {
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.is_empty() || name.starts_with('.') {
+                    continue;
+                }
+                if name.eq_ignore_ascii_case("desktop.ini") {
+                    continue;
+                }
+                let p = e.path();
+                out.push(DeskItem { name, path: p });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
+
+fn refresh_items() {
+    let items = desktop_items();
+    let mut names: Vec<String> = items.iter().map(|i| i.name.clone()).collect();
+    names.sort();
+    let sig = names.join("\u{1}");
+    ITEMS.with(|v| *v.borrow_mut() = items);
+    SIGN.with(|s| *s.borrow_mut() = sig);
+}
+
+fn path_of(name: &str) -> Option<PathBuf> {
+    ITEMS.with(|v| {
+        v.borrow()
+            .iter()
+            .find(|i| i.name == name)
+            .map(|i| i.path.clone())
+    })
+}
+
+/// 取某桌面项的 HICON（懒加载并缓存）。返回 0 表示失败。
+fn icon_of(name: &str) -> isize {
+    if let Some(v) = ICONS.with(|m| m.borrow().get(name).copied()) {
+        return v;
+    }
+    let path = match path_of(name) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let wide = wide_nul(&path.to_string_lossy());
+    let mut fi = SHFILEINFOW::default();
+    let ok = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut fi),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON,
+        )
+    };
+    let h = if ok != 0 { fi.hIcon.0 as isize } else { 0 };
+    ICONS.with(|m| m.borrow_mut().insert(name.to_string(), h));
+    h
+}
+
+fn open_item(name: &str) {
+    if let Some(p) = path_of(name) {
+        let wide = wide_nul(&p.to_string_lossy());
+        unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(wide.as_ptr()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            );
+        }
+    }
+}
+
+// ── 窗口创建 ──
+
+fn create_zone(z: &crate::config::ZoneConf, idx: usize) -> Option<HWND> {
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap();
+        let h = if z.collapsed { TITLE_H } else { z.h.max(MIN_H) };
         let hw = match CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
             CLASS,
@@ -207,9 +375,9 @@ fn create_zone(layer: HWND, z: &crate::config::ZoneConf, idx: usize, parent_visi
             WS_POPUP,
             z.x,
             z.y,
-            z.w.max(96),
-            z.h.max(64),
-            Some(layer),
+            z.w.max(MIN_W),
+            h,
+            None,
             None,
             Some(hinst.into()),
             None,
@@ -221,68 +389,97 @@ fn create_zone(layer: HWND, z: &crate::config::ZoneConf, idx: usize, parent_visi
             return None;
         }
         SetWindowLongPtrW(hw, GWLP_USERDATA, idx as isize);
-        apply_zone_region(hw, z.w.max(96), z.h.max(64));
-        if parent_visible {
-            let _ = ShowWindow(hw, SW_SHOWNOACTIVATE);
-        } else {
-            let _ = ShowWindow(hw, SW_HIDE);
+        set_acrylic(hw, TINT);
+        round_region(hw, z.w.max(MIN_W), h);
+        DragAcceptFiles(hw, true);
+        let _ = SetWindowPos(
+            hw,
+            Some(HWND_BOTTOM),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        let _ = ShowWindow(
+            hw,
+            if z.visible {
+                SW_SHOWNOACTIVATE
+            } else {
+                SW_HIDE
+            },
+        );
+        if idx == 0 {
+            SetTimer(Some(hw), 1, 3000, None);
         }
         Some(hw)
     }
 }
 
-/// 由 config 驱动的同步：创建 / 更新 / 销毁分区窗口。在 app 主线程调用。
+// ── 生命周期 ──
+
+/// 由 config 驱动同步：创建 / 更新 / 销毁分区窗口。在 app 主线程调用。
 pub fn sync() {
     register_class();
     register_rename_class();
     let enabled = crate::app::with_cfg(|c| c.modules.zones);
     if !enabled {
+        set_shell_icons_visible(true);
         teardown();
         return;
     }
-
+    refresh_items();
+    // 从旧版本升级上来的分区没有 items 字段（全空）→ 清空重新按类型分类，
+    // 否则用户会看到一堆空面板 + 一个塞满的「其他」。
+    let stale = crate::app::with_cfg(|c| {
+        !c.zones.is_empty() && c.zones.iter().all(|z| z.items.is_empty())
+    });
+    if stale && !ITEMS.with(|v| v.borrow().is_empty()) {
+        crate::app::with_cfg(|c| c.zones.clear());
+    }
     if crate::app::with_cfg(|c| c.zones.is_empty()) {
         seed_if_needed();
     }
-    let cfg2 = crate::app::with_cfg(|c| c.zones.clone());
-
-    let (layer, _def) = shell();
-    if layer.0.is_null() {
-        return;
-    }
+    reconcile_items();
+    let zones = crate::app::with_cfg(|c| c.zones.clone());
+    // 接管桌面图标：隐藏 Explorer 图标层
+    set_shell_icons_visible(false);
 
     WIN.with(|ws| {
         let mut v = ws.borrow_mut();
-        if v.len() > cfg2.len() {
-            for hw in v.iter_mut().skip(cfg2.len()) {
+        if v.len() > zones.len() {
+            for hw in v.iter_mut().skip(zones.len()) {
                 if let Some(h) = hw.take() {
-                    unsafe { let _ = DestroyWindow(h); }
+                    unsafe {
+                        let _ = DestroyWindow(h);
+                    }
                 }
             }
         }
-        v.resize_with(cfg2.len(), || None);
+        v.resize_with(zones.len(), || None);
 
-        for (i, z) in cfg2.iter().enumerate() {
+        for (i, z) in zones.iter().enumerate() {
+            let want_h = if z.collapsed { TITLE_H } else { z.h.max(MIN_H) };
             match v[i] {
-                Some(hw) if z.visible => {
-                    unsafe {
+                Some(hw) => unsafe {
+                    if z.visible {
                         let _ = SetWindowPos(
                             hw,
                             None,
                             z.x,
                             z.y,
-                            z.w.max(96),
-                            z.h.max(64),
+                            z.w.max(MIN_W),
+                            want_h,
                             SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
                         );
+                        round_region(hw, z.w.max(MIN_W), want_h);
+                        let _ = InvalidateRect(Some(hw), None, true);
+                    } else {
+                        let _ = ShowWindow(hw, SW_HIDE);
                     }
-                    apply_zone_region(hw, z.w.max(96), z.h.max(64));
-                }
-                Some(hw) => {
-                    unsafe { let _ = ShowWindow(hw, SW_HIDE); }
-                }
+                },
                 None if z.visible => {
-                    if let Some(hw) = create_zone(layer, z, i, true) {
+                    if let Some(hw) = create_zone(z, i) {
                         v[i] = Some(hw);
                     }
                 }
@@ -292,98 +489,204 @@ pub fn sync() {
     });
 }
 
-/// 是否处于编辑模式（兼容设置页接口；交互已常驻，仅控制手柄高亮）
+/// 重新枚举桌面项并同步（设置页 / 右键「刷新」）
+pub fn refresh() {
+    refresh_items();
+    sync();
+}
+
+/// 兼容设置页接口（面板常驻可拖动/缩放，不做独立编辑模式）
 #[allow(dead_code)]
 pub fn is_editing() -> bool {
     EDITING.with(|c| c.get())
 }
 
-/// 进入 / 退出「编辑分区」模式（仅切换四角手柄高亮，交互本身常驻可用）
+/// 兼容设置页接口
+#[allow(dead_code)]
 pub fn toggle_edit() -> bool {
     let now = EDITING.with(|c| {
         let n = !c.get();
         c.set(n);
         n
     });
-    // 重绘所有分区以反映手柄高亮
     WIN.with(|ws| {
         if let Ok(v) = ws.try_borrow() {
             for hw in v.iter().flatten() {
-                unsafe { let _ = InvalidateRect(Some(*hw), None, true); }
+                unsafe {
+                    let _ = InvalidateRect(Some(*hw), None, true);
+                }
             }
         }
     });
     now
 }
 
-/// 销毁所有分区窗口（模块关闭 / 退出）。
 fn teardown() {
     WIN.with(|ws| {
         let mut v = ws.borrow_mut();
         for hw in v.iter_mut() {
             if let Some(h) = hw.take() {
-                unsafe { let _ = DestroyWindow(h); }
+                unsafe {
+                    let _ = KillTimer(Some(h), 1);
+                    let _ = DestroyWindow(h);
+                }
             }
         }
     });
 }
 
-/// 首次启用且分区为空时，铺一批示例分区（进程内只做一次）。
-fn seed_if_needed() {
-    use std::sync::OnceLock;
-    static SEEDED: OnceLock<()> = OnceLock::new();
-    SEEDED.get_or_init(|| {
-        unsafe {
-            let sw = GetSystemMetrics(SM_CXSCREEN);
-            let sh = GetSystemMetrics(SM_CYSCREEN);
-            let samples: [(&str, f32, f32, i32, i32); 3] = [
-                ("项目", 0.06, 0.10, 420, 150),
-                ("文档", 0.06, 0.32, 420, 150),
-                ("应用", 0.06, 0.54, 420, 150),
-            ];
-            let mut zones: Vec<crate::config::ZoneConf> = Vec::new();
-            for (i, (name, fx, fy, w, h)) in samples.iter().enumerate() {
-                zones.push(crate::config::ZoneConf {
-                    name: name.to_string(),
-                    x: (sw as f32 * fx) as i32,
-                    y: (sh as f32 * fy) as i32,
-                    w: *w,
-                    h: *h,
-                    color: ["blue", "teal", "purple"][i % 3].to_string(),
-                    visible: true,
-                });
+/// 清理失效项；把未归入任何分区的桌面项收进「其他」分区，保证图标不丢。
+fn reconcile_items() {
+    let names: Vec<String> = ITEMS.with(|v| v.borrow().iter().map(|i| i.name.clone()).collect());
+    let nameset: HashSet<String> = names.iter().cloned().collect();
+    crate::app::with_cfg(|c| {
+        for z in c.zones.iter_mut() {
+            z.items.retain(|n| nameset.contains(n));
+        }
+        let mut used: HashSet<String> = HashSet::new();
+        for z in c.zones.iter() {
+            for n in &z.items {
+                used.insert(n.clone());
             }
-            crate::app::with_cfg(|c| {
-                c.zones = zones;
+        }
+        let loose: Vec<String> = names
+            .iter()
+            .filter(|n| !used.contains(*n))
+            .cloned()
+            .collect();
+        if loose.is_empty() {
+            return;
+        }
+        if c.zones.is_empty() {
+            c.zones.push(crate::config::ZoneConf {
+                name: "其他".into(),
+                x: 60,
+                y: 120,
+                w: 340,
+                h: 210,
+                color: "purple".into(),
+                visible: true,
+                collapsed: false,
+                items: loose,
             });
-            crate::app::save_now();
+        } else {
+            let target = c.zones.iter().position(|z| z.name == "其他").unwrap_or(0);
+            c.zones[target].items.extend(loose);
         }
     });
 }
 
-/// 设置页「＋ 新建分区」：在桌面中央偏下的位置新增一个默认分区。
+/// 首次启用：按扩展名把桌面项自动分到「文档 / 应用 / 其他」三个面板。
+fn seed_if_needed() {
+    {
+        let items = ITEMS.with(|v| v.borrow().clone());
+        let mut docs: Vec<String> = Vec::new();
+        let mut apps: Vec<String> = Vec::new();
+        let mut others: Vec<String> = Vec::new();
+        for it in &items {
+            let ext = it
+                .path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let is_dir = it.path.is_dir();
+            let is_doc = matches!(
+                ext.as_str(),
+                "docx"
+                    | "doc"
+                    | "xlsx"
+                    | "xls"
+                    | "pptx"
+                    | "ppt"
+                    | "pdf"
+                    | "txt"
+                    | "md"
+                    | "csv"
+                    | "rtf"
+                    | "one"
+            );
+            if ext == "lnk" || ext == "url" || ext == "exe" {
+                apps.push(it.name.clone());
+            } else if is_doc || is_dir {
+                docs.push(it.name.clone());
+            } else {
+                others.push(it.name.clone());
+            }
+        }
+
+        let sw = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        let sh = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+        let x = (sw as f32 * 0.04) as i32;
+        let w = 340;
+        let cols = ((w - 2 * PAD) / CELL_W).max(1);
+        let mut zones: Vec<crate::config::ZoneConf> = Vec::new();
+        let mut y = (sh as f32 * 0.10) as i32;
+        let groups: [(&str, Vec<String>, &str); 3] = [
+            ("文档", docs, "blue"),
+            ("应用", apps, "teal"),
+            ("其他", others, "purple"),
+        ];
+        for (name, list, color) in groups {
+            if list.is_empty() {
+                continue;
+            }
+            let rows = ((list.len() as i32 + cols - 1) / cols).max(1);
+            let h = (TITLE_H + PAD * 2 + rows * CELL_H).min((sh as f32 * 0.42) as i32);
+            zones.push(crate::config::ZoneConf {
+                name: name.to_string(),
+                x,
+                y,
+                w,
+                h,
+                color: color.to_string(),
+                visible: true,
+                collapsed: false,
+                items: list,
+            });
+            y += h + 18;
+        }
+        if zones.is_empty() {
+            zones.push(crate::config::ZoneConf {
+                name: "新围栏".into(),
+                x,
+                y: (sh as f32 * 0.12) as i32,
+                w,
+                h: 210,
+                color: "blue".into(),
+                visible: true,
+                collapsed: false,
+                items: Vec::new(),
+            });
+        }
+        crate::app::with_cfg(|c| c.zones = zones);
+        crate::app::save_now();
+    }
+}
+
+/// 设置页「＋ 新建围栏」：在桌面新增一个空面板。
 pub fn add_zone() {
     register_rename_class();
     let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
     crate::app::with_cfg(|c| {
         let count = c.zones.len();
-        let base_x = sw / 2 - 210;
-        let base_y = sh / 2 - 80 + (count % 4) as i32 * 28;
         c.zones.push(crate::config::ZoneConf {
-            name: format!("分区 {}", count + 1),
-            x: base_x,
-            y: base_y,
-            w: 420,
-            h: 150,
-            color: COLOR_IDS[count % COLOR_IDS.len()].to_string(),
+            name: format!("新建围栏 {}", count + 1),
+            x: sw / 2 - 170 + (count % 4) as i32 * 24,
+            y: sh / 2 - 100 + (count % 4) as i32 * 24,
+            w: 340,
+            h: 210,
+            color: ["blue", "teal", "green", "purple", "pink", "orange", "red"][count % 7]
+                .to_string(),
             visible: true,
+            collapsed: false,
+            items: Vec::new(),
         });
     });
     crate::app::save_now();
     sync();
 }
 
-/// 设置页「隐藏 / 显示全部」：翻转所有分区显隐。
+/// 设置页「隐藏 / 显示全部」
 pub fn toggle_all() -> bool {
     crate::app::with_cfg(|c| {
         for z in c.zones.iter_mut() {
@@ -396,42 +699,94 @@ pub fn toggle_all() -> bool {
     hidden
 }
 
-/// 程序退出干净清理。
+/// 程序退出：恢复 Explorer 图标层 + 销毁分区窗口。
 pub fn shutdown() {
     teardown();
+    set_shell_icons_visible(true);
 }
 
-// ── 命中测试：判断鼠标落在分区的哪个部位 ──
+// ── 命中测试 ──
 
-/// 屏幕坐标 → 命中部位。中间镂空区域收不到消息，这里只处理边框与标题条。
+fn client_size(hwnd: HWND) -> (i32, i32) {
+    let mut rc = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rc);
+    }
+    (rc.right - rc.left, rc.bottom - rc.top)
+}
+
 fn hit_mode(hwnd: HWND, screen_pt: POINT, w: i32, h: i32) -> DragMode {
     let mut pt = screen_pt;
-    unsafe { let _ = ScreenToClient(hwnd, &mut pt); }
+    unsafe {
+        let _ = ScreenToClient(hwnd, &mut pt);
+    }
     let (x, y) = (pt.x, pt.y);
-
     let left = x <= EDGE;
     let right = x >= w - 1 - EDGE;
     let top = y <= EDGE;
     let bottom = y >= h - 1 - EDGE;
-
-    if left && top { DragMode::TopLeft }
-    else if right && top { DragMode::TopRight }
-    else if left && bottom { DragMode::BottomLeft }
-    else if right && bottom { DragMode::BottomRight }
-    else if left { DragMode::Left }
-    else if right { DragMode::Right }
-    else if top { DragMode::Top }
-    else if bottom { DragMode::Bottom }
-    else { DragMode::Move } // 标题条内部：整块移动
+    if left && top {
+        DragMode::TopLeft
+    } else if right && top {
+        DragMode::TopRight
+    } else if left && bottom {
+        DragMode::BottomLeft
+    } else if right && bottom {
+        DragMode::BottomRight
+    } else if left {
+        DragMode::Left
+    } else if right {
+        DragMode::Right
+    } else if top {
+        DragMode::Top
+    } else if bottom {
+        DragMode::Bottom
+    } else if y < TITLE_H {
+        DragMode::Move
+    } else {
+        DragMode::None
+    }
 }
 
-fn client_size(hwnd: HWND) -> (i32, i32) {
-    let mut rc = RECT::default();
-    unsafe { let _ = GetClientRect(hwnd, &mut rc); }
-    (rc.right - rc.left, rc.bottom - rc.top)
+/// 标题栏右侧折叠箭头的命中框
+fn in_chevron(pt: POINT, w: i32) -> bool {
+    pt.x >= w - 34 && pt.x <= w - 8 && pt.y >= 4 && pt.y <= TITLE_H - 4
 }
 
-/// 拖动 / 缩放结束后，把窗口几何写回 config 并落盘。
+/// 内部坐标点落在第几个图标格
+fn icon_at(hwnd: HWND, screen_pt: POINT) -> Option<usize> {
+    let idx = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
+    if idx < 0 {
+        return None;
+    }
+    let idx = idx as usize;
+    let (collapsed, count) = crate::app::with_cfg(|c| {
+        c.zones
+            .get(idx)
+            .map(|z| (z.collapsed, z.items.len()))
+            .unwrap_or((false, 0))
+    });
+    if collapsed || count == 0 {
+        return None;
+    }
+    let mut pt = screen_pt;
+    unsafe {
+        let _ = ScreenToClient(hwnd, &mut pt);
+    }
+    let (w, _) = client_size(hwnd);
+    let cols = ((w - 2 * PAD) / CELL_W).max(1);
+    for i in 0..count {
+        let col = i as i32 % cols;
+        let row = i as i32 / cols;
+        let cx = PAD + col * CELL_W;
+        let cy = TITLE_H + PAD + row * CELL_H;
+        if pt.x >= cx && pt.x < cx + CELL_W && pt.y >= cy && pt.y < cy + CELL_H {
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn commit_rect(hwnd: HWND) {
     let idx = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
     if idx < 0 {
@@ -445,60 +800,138 @@ fn commit_rect(hwnd: HWND) {
             if let Some(z) = c.zones.get_mut(idx) {
                 z.x = rc.left;
                 z.y = rc.top;
-                z.w = (rc.right - rc.left).max(96);
-                z.h = (rc.bottom - rc.top).max(64);
+                z.w = (rc.right - rc.left).max(MIN_W);
+                // 折叠态时窗口高度只是标题栏，不要把展开高度覆盖掉
+                if !z.collapsed {
+                    z.h = (rc.bottom - rc.top).max(MIN_H);
+                }
             }
         });
     }
     crate::app::save_now();
 }
 
+/// 折叠 / 展开切换
+fn toggle_collapse(idx: usize) {
+    let (now_collapsed, full_h) = crate::app::with_cfg(|c| {
+        c.zones
+            .get(idx)
+            .map(|z| (z.collapsed, z.h))
+            .unwrap_or((false, 200))
+    });
+    let nc = !now_collapsed;
+    crate::app::with_cfg(|c| {
+        if let Some(z) = c.zones.get_mut(idx) {
+            z.collapsed = nc;
+        }
+    });
+    crate::app::save_now();
+    let hw = WIN.with(|v| v.borrow().get(idx).copied().flatten());
+    if let Some(hw) = hw {
+        unsafe {
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(hw, &mut rc);
+            let w = (rc.right - rc.left).max(MIN_W);
+            let nh = if nc { TITLE_H } else { full_h.max(MIN_H) };
+            let _ = SetWindowPos(
+                hw,
+                None,
+                rc.left,
+                rc.top,
+                w,
+                nh,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            round_region(hw, w, nh);
+            let _ = InvalidateRect(Some(hw), None, true);
+        }
+    }
+}
+
 // ── 右键菜单 ──
 
 const MENU_RENAME: u32 = 2001;
-const MENU_HIDE: u32 = 2002;
-const MENU_EXIT_EDIT: u32 = 2003;
-const MENU_COLOR_BASE: u32 = 2100; // +idx
+const MENU_DELETE: u32 = 2002;
+const MENU_NEW: u32 = 2003;
+const MENU_HIDE_ALL: u32 = 2004;
+const MENU_REFRESH: u32 = 2005;
+const MENU_COLLAPSE: u32 = 2006;
+const MENU_COLOR_BASE: u32 = 2100;
 
 fn popup_menu(hwnd: HWND, idx: usize) {
-    let (_name, color_id) = crate::app::with_cfg(|c| {
+    let color_id = crate::app::with_cfg(|c| {
         c.zones
             .get(idx)
-            .map(|z| (z.name.clone(), z.color.clone()))
-            .unwrap_or_else(|| ("分区".to_string(), "blue".to_string()))
+            .map(|z| z.color.clone())
+            .unwrap_or_else(|| "blue".to_string())
     });
-    let checked_color = COLOR_IDS.iter().position(|c| *c == color_id).unwrap_or(0);
+    let collapsed = crate::app::with_cfg(|c| c.zones.get(idx).map(|z| z.collapsed).unwrap_or(false));
+    let checked = COLOR_IDS.iter().position(|c| *c == color_id).unwrap_or(0);
 
     unsafe {
-        let menu = CreatePopupMenu().unwrap();
+        let menu = match CreatePopupMenu() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let cm = match CreatePopupMenu() {
+            Ok(m) => m,
+            Err(_) => {
+                let _ = DestroyMenu(menu);
+                return;
+            }
+        };
         let _ = AppendMenuW(menu, MF_STRING, MENU_RENAME as usize, w!("重命名…"));
-        let cm = CreatePopupMenu().unwrap();
         for (i, cid) in COLOR_IDS.iter().enumerate() {
             let label: Vec<u16> = match *cid {
-                "blue" => "海蓝".encode_utf16().collect(),
-                "teal" => "青碧".encode_utf16().collect(),
-                "green" => "青草".encode_utf16().collect(),
-                "purple" => "罗兰".encode_utf16().collect(),
-                "pink" => "樱粉".encode_utf16().collect(),
-                "orange" => "落橙".encode_utf16().collect(),
-                _ => "绯红".encode_utf16().collect(),
+                "blue" => "海蓝",
+                "teal" => "青碧",
+                "green" => "青草",
+                "purple" => "罗兰",
+                "pink" => "樱粉",
+                "orange" => "落橙",
+                _ => "绯红",
+            }
+            .encode_utf16()
+            .collect();
+            let lz: Vec<u16> = label.into_iter().chain(std::iter::once(0)).collect();
+            let flags = if i == checked {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
             };
-            let lz: Vec<u16> = label.iter().copied().chain(std::iter::once(0)).collect();
-            let flags = if i == checked_color { MF_STRING | MF_CHECKED } else { MF_STRING };
-            let _ = AppendMenuW(cm, flags, (MENU_COLOR_BASE + i as u32) as usize, PCWSTR(lz.as_ptr()));
+            let _ = AppendMenuW(
+                cm,
+                flags,
+                (MENU_COLOR_BASE + i as u32) as usize,
+                PCWSTR(lz.as_ptr()),
+            );
         }
         let _ = AppendMenuW(menu, MF_POPUP, cm.0 as usize, w!("配色"));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_COLLAPSE as usize,
+            if collapsed { w!("展开") } else { w!("折叠") },
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(menu, MF_STRING, MENU_HIDE as usize, w!("隐藏"));
-        let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT_EDIT as usize, w!("退出编辑"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_NEW as usize, w!("新建围栏"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_HIDE_ALL as usize, w!("隐藏全部围栏"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_REFRESH as usize, w!("刷新"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_DELETE as usize, w!("删除围栏"));
 
         let mut pos = POINT::default();
         let _ = GetCursorPos(&mut pos);
-        let root = GetAncestor(hwnd, GA_ROOT);
-        if !root.0.is_null() {
-            let _ = SetForegroundWindow(root);
-        }
-        let _ = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_RIGHTBUTTON, pos.x, pos.y, Some(0), hwnd, None);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = TrackPopupMenu(
+            menu,
+            TPM_LEFTALIGN | TPM_RIGHTBUTTON,
+            pos.x,
+            pos.y,
+            Some(0),
+            hwnd,
+            None,
+        );
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(cm);
         let _ = DestroyMenu(menu);
@@ -511,12 +944,19 @@ const RENAME_EDIT: i32 = 3001;
 const RENAME_OK: i32 = 3002;
 const RENAME_CANCEL: i32 = 3003;
 
-unsafe extern "system" fn rename_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn rename_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_CREATE => {
             let hinst = GetModuleHandleW(None).unwrap();
-            let edit_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL as u32);
-            let btn_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32);
+            let edit_style =
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL as u32);
+            let btn_style =
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32);
             let _ = CreateWindowExW(
                 WS_EX_CLIENTEDGE,
                 w!("Edit"),
@@ -524,7 +964,7 @@ unsafe extern "system" fn rename_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 edit_style,
                 16,
                 16,
-                248,
+                288,
                 24,
                 Some(hwnd),
                 Some(HMENU(RENAME_EDIT as *mut c_void)),
@@ -536,7 +976,7 @@ unsafe extern "system" fn rename_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 w!("Button"),
                 w!("确定"),
                 btn_style,
-                60,
+                80,
                 56,
                 72,
                 26,
@@ -551,7 +991,7 @@ unsafe extern "system" fn rename_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 w!("Button"),
                 w!("取消"),
                 cancel_style,
-                148,
+                168,
                 56,
                 72,
                 26,
@@ -560,9 +1000,9 @@ unsafe extern "system" fn rename_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 Some(hinst.into()),
                 None,
             );
-            // 预填当前名字（wide_nul 保证 NUL 结尾，修复中文乱码）
             if let Some(idx) = RENAME_IDX.with(|c| c.get()) {
-                if let Some(cur) = crate::app::with_cfg(|c| c.zones.get(idx).map(|z| z.name.clone())) {
+                if let Some(cur) = crate::app::with_cfg(|c| c.zones.get(idx).map(|z| z.name.clone()))
+                {
                     let cur_w = wide_nul(&cur);
                     if let Ok(edit) = GetDlgItem(Some(hwnd), RENAME_EDIT) {
                         let _ = SetWindowTextW(edit, PCWSTR(cur_w.as_ptr()));
@@ -588,11 +1028,12 @@ unsafe extern "system" fn rename_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                                 }
                             });
                             crate::app::save_now();
-                            // 立即重绘对应分区名称
                             WIN.with(|ws| {
                                 if let Ok(v) = ws.try_borrow() {
                                     if let Some(Some(hw)) = v.get(idx) {
-                                        unsafe { let _ = InvalidateRect(Some(*hw), None, true); }
+                                        unsafe {
+                                            let _ = InvalidateRect(Some(*hw), None, true);
+                                        }
                                     }
                                 }
                             });
@@ -613,12 +1054,7 @@ unsafe extern "system" fn rename_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             RENAME_IDX.with(|c| c.set(None));
             LRESULT(0)
         }
-        WM_PAINT => {
-            let mut ps = PAINTSTRUCT::default();
-            let _hdc = BeginPaint(hwnd, &mut ps);
-            let _ = EndPaint(hwnd, &ps);
-            LRESULT(0)
-        }
+        WM_ERASEBKGND => LRESULT(1),
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -631,12 +1067,12 @@ fn open_rename(idx: usize) {
         let hw = match CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
             RENAME_CLASS,
-            w!("重命名分区"),
+            w!("重命名围栏"),
             WS_POPUP | WS_CAPTION | WS_SYSMENU,
             0,
             0,
-            300,
-            120,
+            330,
+            130,
             None,
             None,
             Some(hinst.into()),
@@ -654,7 +1090,15 @@ fn open_rename(idx: usize) {
         let _ = GetWindowRect(hw, &mut rc);
         let w = rc.right - rc.left;
         let h = rc.bottom - rc.top;
-        let _ = SetWindowPos(hw, None, (sw - w) / 2, (sh - h) / 2, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        let _ = SetWindowPos(
+            hw,
+            None,
+            (sw - w) / 2,
+            (sh - h) / 2,
+            w,
+            h,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         let _ = ShowWindow(hw, SW_SHOW);
     }
 }
@@ -670,11 +1114,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
-        WM_ERASEBKGND => LRESULT(1), // 由 WM_PAINT 全量自绘
-        WM_NCHITTEST => {
-            // 中间镂空区域不属于窗口，收不到此消息；这里只对边框/标题条返回客户区，
-            // 交给自绘拖动/缩放。返回 HTCLIENT 让鼠标消息进入。
-            LRESULT(HTCLIENT as isize)
+        WM_ERASEBKGND => LRESULT(1),
+        WM_SIZE => {
+            let (w, h) = client_size(hwnd);
+            round_region(hwnd, w, h);
+            LRESULT(0)
         }
         WM_SETCURSOR => {
             let (w, h) = client_size(hwnd);
@@ -686,7 +1130,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 DragMode::Top | DragMode::Bottom => IDC_SIZENS,
                 DragMode::TopLeft | DragMode::BottomRight => IDC_SIZENWSE,
                 DragMode::TopRight | DragMode::BottomLeft => IDC_SIZENESW,
-                _ => IDC_SIZEALL,
+                DragMode::Move => IDC_SIZEALL,
+                _ => IDC_ARROW,
             };
             if let Ok(cur) = LoadCursorW(None, idc) {
                 let _ = SetCursor(Some(cur));
@@ -695,18 +1140,60 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONDOWN => {
+            let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if idx < 0 {
+                return LRESULT(0);
+            }
+            let idx = idx as usize;
+            let cx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
+            let cy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
+            let local = POINT { x: cx, y: cy };
+            let mut sp = local;
+            let _ = ClientToScreen(hwnd, &mut sp);
             let (w, h) = client_size(hwnd);
+
+            // 折叠箭头
+            if in_chevron(local, w) {
+                toggle_collapse(idx);
+                return LRESULT(0);
+            }
+            // 点在图标上：不启动拖动（等双击打开）
+            if icon_at(hwnd, sp).is_some() {
+                return LRESULT(0);
+            }
+            let mode = hit_mode(hwnd, sp, w, h);
+            if mode == DragMode::None {
+                return LRESULT(0);
+            }
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rc);
+            DRAG.with(|d| {
+                *d.borrow_mut() = Some(DragState {
+                    mode,
+                    start_screen: sp,
+                    start_rect: rc,
+                });
+            });
+            let _ = SetCapture(hwnd);
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
+            let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if idx < 0 {
+                return LRESULT(0);
+            }
             let cx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
             let cy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
             let mut sp = POINT { x: cx, y: cy };
             let _ = ClientToScreen(hwnd, &mut sp);
-            let mode = hit_mode(hwnd, sp, w, h);
-            let mut rc = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut rc);
-            DRAG.with(|d| {
-                *d.borrow_mut() = Some(DragState { mode, start_screen: sp, start_rect: rc });
-            });
-            let _ = SetCapture(hwnd);
+            let idx = idx as usize;
+            if let Some(i) = icon_at(hwnd, sp) {
+                let name =
+                    crate::app::with_cfg(|c| c.zones.get(idx).and_then(|z| z.items.get(i).cloned()));
+                if let Some(n) = name {
+                    open_item(&n);
+                }
+            }
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -723,38 +1210,91 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let dx = sp.x - st.x;
                 let dy = sp.y - st.y;
                 let (mut l, mut t, mut r, mut b) = (sr.left, sr.top, sr.right, sr.bottom);
-                let (minw, minh) = (120, 80);
                 match mode {
-                    DragMode::Move => { l += dx; t += dy; r += dx; b += dy; }
-                    DragMode::Left => { l += dx; if l > r - minw { l = r - minw; } }
-                    DragMode::Right => { r += dx; if r < l + minw { r = l + minw; } }
-                    DragMode::Top => { t += dy; if t > b - minh { t = b - minh; } }
-                    DragMode::Bottom => { b += dy; if b < t + minh { b = t + minh; } }
-                    DragMode::TopLeft => { l += dx; t += dy; if l > r - minw { l = r - minw; } if t > b - minh { t = b - minh; } }
-                    DragMode::TopRight => { r += dx; t += dy; if r < l + minw { r = l + minw; } if t > b - minh { t = b - minh; } }
-                    DragMode::BottomLeft => { l += dx; b += dy; if l > r - minw { l = r - minw; } if b < t + minh { b = t + minh; } }
-                    DragMode::BottomRight => { r += dx; b += dy; if r < l + minw { r = l + minw; } if b < t + minh { b = t + minh; } }
+                    DragMode::Move => {
+                        l += dx;
+                        t += dy;
+                        r += dx;
+                        b += dy;
+                    }
+                    DragMode::Left => {
+                        l += dx;
+                        if l > r - MIN_W {
+                            l = r - MIN_W;
+                        }
+                    }
+                    DragMode::Right => {
+                        r += dx;
+                        if r < l + MIN_W {
+                            r = l + MIN_W;
+                        }
+                    }
+                    DragMode::Top => {
+                        t += dy;
+                        if t > b - MIN_H {
+                            t = b - MIN_H;
+                        }
+                    }
+                    DragMode::Bottom => {
+                        b += dy;
+                        if b < t + MIN_H {
+                            b = t + MIN_H;
+                        }
+                    }
+                    DragMode::TopLeft => {
+                        l += dx;
+                        t += dy;
+                        if l > r - MIN_W {
+                            l = r - MIN_W;
+                        }
+                        if t > b - MIN_H {
+                            t = b - MIN_H;
+                        }
+                    }
+                    DragMode::TopRight => {
+                        r += dx;
+                        t += dy;
+                        if r < l + MIN_W {
+                            r = l + MIN_W;
+                        }
+                        if t > b - MIN_H {
+                            t = b - MIN_H;
+                        }
+                    }
+                    DragMode::BottomLeft => {
+                        l += dx;
+                        b += dy;
+                        if l > r - MIN_W {
+                            l = r - MIN_W;
+                        }
+                        if b < t + MIN_H {
+                            b = t + MIN_H;
+                        }
+                    }
+                    DragMode::BottomRight => {
+                        r += dx;
+                        b += dy;
+                        if r < l + MIN_W {
+                            r = l + MIN_W;
+                        }
+                        if b < t + MIN_H {
+                            b = t + MIN_H;
+                        }
+                    }
+                    DragMode::None => {}
                 }
-                unsafe {
-                    let _ = MoveWindow(hwnd, l, t, r - l, b - t, false);
-                }
+                let _ = MoveWindow(hwnd, l, t, r - l, b - t, true);
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
-        WM_SIZE => {
-            // 尺寸变化后重建镂空区域，边框始终跟随窗口
-            let (w, h) = client_size(hwnd);
-            apply_zone_region(hwnd, w, h);
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
         WM_LBUTTONUP => {
             if DRAG.with(|d| d.borrow().is_some()) {
-                let _ = unsafe { ReleaseCapture() };
+                let _ = ReleaseCapture();
                 DRAG.with(|d| *d.borrow_mut() = None);
                 commit_rect(hwnd);
             }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            LRESULT(0)
         }
         WM_RBUTTONUP => {
             let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -767,23 +1307,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             let id = (wparam.0 as u32) & 0xffff;
             if idx >= 0 {
+                let idx = idx as usize;
                 if id == MENU_RENAME {
-                    open_rename(idx as usize);
-                } else if id == MENU_HIDE {
+                    open_rename(idx);
+                } else if id == MENU_DELETE {
                     crate::app::with_cfg(|c| {
-                        if let Some(z) = c.zones.get_mut(idx as usize) {
-                            z.visible = false;
+                        if idx < c.zones.len() {
+                            c.zones.remove(idx);
                         }
                     });
                     crate::app::save_now();
                     sync();
-                } else if id == MENU_EXIT_EDIT {
-                    EDITING.with(|c| c.set(false));
-                    let _ = InvalidateRect(Some(hwnd), None, true);
+                } else if id == MENU_NEW {
+                    add_zone();
+                } else if id == MENU_HIDE_ALL {
+                    toggle_all();
+                } else if id == MENU_REFRESH {
+                    refresh();
+                } else if id == MENU_COLLAPSE {
+                    toggle_collapse(idx);
                 } else if id >= MENU_COLOR_BASE && id < MENU_COLOR_BASE + COLOR_IDS.len() as u32 {
                     let cid = COLOR_IDS[(id - MENU_COLOR_BASE) as usize];
                     crate::app::with_cfg(|c| {
-                        if let Some(z) = c.zones.get_mut(idx as usize) {
+                        if let Some(z) = c.zones.get_mut(idx) {
                             z.color = cid.to_string();
                         }
                     });
@@ -793,50 +1339,132 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_DROPFILES => {
+            let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if idx >= 0 {
+                let idx = idx as usize;
+                let hdrop = HDROP(wparam.0 as *mut c_void);
+                let count = DragQueryFileW(hdrop, u32::MAX, None);
+                let mut added: Vec<String> = Vec::new();
+                for i in 0..count {
+                    let len = DragQueryFileW(hdrop, i, None);
+                    if len == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u16; len as usize + 1];
+                    DragQueryFileW(hdrop, i, Some(&mut buf));
+                    let p = String::from_utf16_lossy(&buf[..len as usize]);
+                    if let Some(n) = Path::new(&p)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                    {
+                        added.push(n);
+                    }
+                }
+                DragFinish(hdrop);
+                if !added.is_empty() {
+                    refresh_items();
+                    crate::app::with_cfg(|c| {
+                        for z in c.zones.iter_mut() {
+                            z.items.retain(|n| !added.contains(n));
+                        }
+                        if let Some(z) = c.zones.get_mut(idx) {
+                            z.items.extend(added.iter().cloned());
+                        }
+                    });
+                    crate::app::save_now();
+                    sync();
+                }
+            }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            let mut names: Vec<String> =
+                ITEMS.with(|v| v.borrow().iter().map(|i| i.name.clone()).collect());
+            names.sort();
+            let cur = names.join("\u{1}");
+            let old = SIGN.with(|s| s.borrow().clone());
+            if cur != old {
+                refresh();
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            let _ = KillTimer(Some(hwnd), 1);
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
-/// 用 GDI 画分区外观：**只画边框环 + 顶部标题条**（中间镂空，由 region 保证透明）。
-/// 标题条：主题色打底 + 白色名称；边框：主题色细线；编辑模式额外画四角手柄。
+// ── 绘制 ──
+
+fn draw_chevron(hdc: HDC, cx: i32, cy: i32, up: bool, col: COLORREF) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, 2, col);
+        let old = SelectObject(hdc, pen.into());
+        let d = 4;
+        if up {
+            let _ = MoveToEx(hdc, cx - d, cy + 2, None);
+            let _ = LineTo(hdc, cx, cy - 2);
+            let _ = LineTo(hdc, cx + d, cy + 2);
+        } else {
+            let _ = MoveToEx(hdc, cx - d, cy - 2, None);
+            let _ = LineTo(hdc, cx, cy + 2);
+            let _ = LineTo(hdc, cx + d, cy - 2);
+        }
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(pen.into());
+    }
+}
+
+/// 画一块分区：深色标题栏 + 名称 + 折叠箭头 + 图标网格。
+/// 背景不上色，露出 acrylic 毛玻璃。
 fn paint_zone(hwnd: HWND, idx: usize) {
-    let (name, color) = crate::app::with_cfg(|c| {
+    let (name, color, collapsed, items) = crate::app::with_cfg(|c| {
         c.zones
             .get(idx)
-            .map(|z| (z.name.clone(), zone_rgb(&z.color)))
-            .unwrap_or_else(|| ("分区".to_string(), 0x4E8FFF))
+            .map(|z| {
+                (
+                    z.name.clone(),
+                    zone_rgb(&z.color),
+                    z.collapsed,
+                    z.items.clone(),
+                )
+            })
+            .unwrap_or_else(|| ("围栏".to_string(), 0x4E8FFF, false, Vec::new()))
     });
-    let editing = EDITING.with(|c| c.get());
 
     unsafe {
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
-        let mut rc = RECT::default();
-        let _ = GetClientRect(hwnd, &mut rc);
-        let w = rc.right - rc.left;
-        let h = rc.bottom - rc.top;
+        let (w, h) = client_size(hwnd);
         if w <= 0 || h <= 0 {
             let _ = EndPaint(hwnd, &ps);
             return;
         }
 
-        // 顶部标题条：主题色填充（这是唯一不透明的实心区，也是拖动区）
-        let bar_brush = CreateSolidBrush(COLORREF(color));
-        let bar_rect = RECT { left: 0, top: 0, right: w, bottom: TITLE_H };
-        let _ = FillRect(hdc, &bar_rect, bar_brush);
-        let _ = DeleteObject(bar_brush.into());
+        // 标题栏：深色实心（比毛玻璃面板更沉，接近参考图）
+        let bar = CreateSolidBrush(COLORREF(rgb(20, 28, 26)));
+        let bar_rect = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: TITLE_H,
+        };
+        let _ = FillRect(hdc, &bar_rect, bar);
+        let _ = DeleteObject(bar.into());
 
-        // 边框：主题色细线（region 已裁成环，这里描边即只显示边框）
-        let pen = CreatePen(PS_SOLID, 2, COLORREF(color));
-        let old_pen = SelectObject(hdc, pen.into());
-        let old_br = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        let _ = Rectangle(hdc, 0, 0, w, h);
+        // 标题栏底部 1px 主题色描边
+        let line_pen = CreatePen(PS_SOLID, 1, COLORREF(color));
+        let old_pen = SelectObject(hdc, line_pen.into());
+        let _ = MoveToEx(hdc, 0, TITLE_H - 1, None);
+        let _ = LineTo(hdc, w, TITLE_H - 1);
         let _ = SelectObject(hdc, old_pen);
-        let _ = SelectObject(hdc, old_br);
-        let _ = DeleteObject(pen.into());
+        let _ = DeleteObject(line_pen.into());
 
-        // 标题条上的名称（白色小字，透明背景）
-        let font = CreateFontW(
+        // 名称
+        let font_bold = CreateFontW(
             -14,
             0,
             0,
@@ -852,21 +1480,117 @@ fn paint_zone(hwnd: HWND, idx: usize) {
             (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
             w!("Microsoft YaHei UI"),
         );
-        let old_font = SelectObject(hdc, font.into());
+        let old_font = SelectObject(hdc, font_bold.into());
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(hdc, COLORREF(0xFFFFFF));
-        let mut tr = RECT { left: 12, top: 4, right: w - 12, bottom: TITLE_H - 2 };
-        let mut wide: Vec<u16> = name.encode_utf16().collect();
-        let _ = DrawTextW(hdc, &mut wide, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        let _ = SelectObject(hdc, old_font);
-        let _ = DeleteObject(font.into());
+        let _ = SetTextColor(hdc, COLORREF(0xF0F4F2));
+        let mut tr = RECT {
+            left: 12,
+            top: 0,
+            right: w - 38,
+            bottom: TITLE_H,
+        };
+        let mut title_w: Vec<u16> = name.encode_utf16().collect();
+        let _ = DrawTextW(
+            hdc,
+            &mut title_w,
+            &mut tr,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+        // 折叠箭头
+        draw_chevron(hdc, w - 21, TITLE_H / 2, !collapsed, COLORREF(0xC8D2CE));
 
-        // 编辑模式：四角画实心小方块手柄（提示可缩放）
-        if editing {
-            let hb = CreateSolidBrush(COLORREF(0xFFFFFF));
+        if !collapsed {
+            let cols = ((w - 2 * PAD) / CELL_W).max(1);
+            let font_small = CreateFontW(
+                -12,
+                0,
+                0,
+                0,
+                FW_NORMAL.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+                w!("Microsoft YaHei UI"),
+            );
+            let old_small = SelectObject(hdc, font_small.into());
+            let _ = SetTextColor(hdc, COLORREF(0xE6ECE9));
+
+            for (i, it) in items.iter().enumerate() {
+                let col = i as i32 % cols;
+                let row = i as i32 / cols;
+                let cx = PAD + col * CELL_W;
+                let cy = TITLE_H + PAD + row * CELL_H;
+                if cy + CELL_H > h + 4 {
+                    break;
+                }
+                let ic = icon_of(it);
+                if ic != 0 {
+                    let _ = DrawIconEx(
+                        hdc,
+                        cx + (CELL_W - ICON_SZ) / 2,
+                        cy,
+                        HICON(ic as *mut c_void),
+                        ICON_SZ,
+                        ICON_SZ,
+                        0,
+                        None,
+                        DI_NORMAL,
+                    );
+                }
+                let mut nr = RECT {
+                    left: cx + 3,
+                    top: cy + ICON_SZ + 4,
+                    right: cx + CELL_W - 3,
+                    bottom: cy + CELL_H,
+                };
+                let mut nw: Vec<u16> = it.encode_utf16().collect();
+                let _ = DrawTextW(
+                    hdc,
+                    &mut nw,
+                    &mut nr,
+                    DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+            }
+            let _ = SelectObject(hdc, old_small);
+            let _ = DeleteObject(font_small.into());
+
+            if items.is_empty() {
+                let _ = SetTextColor(hdc, COLORREF(0x9BA8A4));
+                let mut er = RECT {
+                    left: PAD,
+                    top: TITLE_H + PAD,
+                    right: w - PAD,
+                    bottom: h - PAD,
+                };
+                let mut ew: Vec<u16> = "把图标拖到这里".encode_utf16().collect();
+                let _ = DrawTextW(
+                    hdc,
+                    &mut ew,
+                    &mut er,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+            }
+        }
+
+        let _ = SelectObject(hdc, old_font);
+        let _ = DeleteObject(font_bold.into());
+
+        // 编辑态（兼容旧开关）：四角手柄
+        if EDITING.with(|c| c.get()) {
+            let hb = CreateSolidBrush(COLORREF(color));
             let s = 8;
             for (hx, hy) in [(0, 0), (w - s, 0), (0, h - s), (w - s, h - s)] {
-                let hr = RECT { left: hx, top: hy, right: hx + s, bottom: hy + s };
+                let hr = RECT {
+                    left: hx,
+                    top: hy,
+                    right: hx + s,
+                    bottom: hy + s,
+                };
                 let _ = FillRect(hdc, &hr, hb);
             }
             let _ = DeleteObject(hb.into());

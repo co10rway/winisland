@@ -336,7 +336,7 @@ impl Default for ScheduleSub {
     }
 }
 
-/// 单个桌面分区：纯视觉的毛玻璃分组框，图标留在原位不动。
+/// 单个桌面分区（围栏）：一块毛玻璃面板，里面托管显示归入本分区的桌面图标。
 /// 坐标基于桌面工作区的物理像素。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -346,10 +346,14 @@ pub struct ZoneConf {
     pub y: i32,
     pub w: i32,
     pub h: i32,
-    /// 主题色 id（theme::THEMES 之一），决定边框与标题颜色
+    /// 主题色 id（theme::THEMES 之一），决定标题栏强调色
     pub color: String,
     /// 当前是否显示
     pub visible: bool,
+    /// 是否折叠（只留标题栏）
+    pub collapsed: bool,
+    /// 归入本分区的桌面项目（文件名，如 "方案.docx"）；不含路径
+    pub items: Vec<String>,
 }
 
 impl Default for ZoneConf {
@@ -362,6 +366,8 @@ impl Default for ZoneConf {
             h: 200,
             color: "blue".into(),
             visible: true,
+            collapsed: false,
+            items: Vec::new(),
         }
     }
 }

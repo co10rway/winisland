@@ -394,14 +394,14 @@ fn pages() -> Vec<Page> {
         // 7 桌面分区
         Page {
             title: "桌面分区",
-            desc: "在桌面上划出镂空描边框（仿 Fences），把图标框成一块块可视区域；框内完全透明，不搬文件",
+            desc: "在桌面上划出毛玻璃围栏，桌面图标按围栏分组收纳；图标拖进围栏即归类，不搬动文件内容",
             rows: vec![
-                Row::toggle(0, "启用桌面分区", "开启后在桌面绘制镂空分区框，中间透明不遮挡壁纸和图标"),
-                Row::toggle(1, "开机自启分区", "随系统启动自动显示分区"),
-                Row::action(4, "编辑分区", "切换四角手柄高亮；拖动标题栏移动、拖四边四角缩放、右键改名 / 换色 / 隐藏随时可用", vec![("切换手柄", 4, true, 112.0)]),
-                Row::action(2, "新建分区", "在桌面中央新增一个默认分区", vec![("＋ 新建分区", 2, true, 128.0)]),
-                Row::action(3, "显示 / 隐藏全部", "一键隐藏所有分区看干净桌面，再点一次恢复", vec![("隐藏全部", 3, true, 116.0)]),
-                Row::note("分区是镂空描边框：只有边框和标题栏可见，中间完全透明——壁纸、图标清晰可见，文件可正常拖到桌面。直接拖标题栏可移动、拖四边四角可缩放、右键可改名 / 换色 / 隐藏，全部自动保存。"),
+                Row::toggle(0, "启用桌面分区", "开启后桌面图标由毛玻璃围栏接管显示（自动按 文档 / 应用 / 其他 分好组）"),
+                Row::toggle(1, "开机自启分区", "随系统启动自动显示围栏"),
+                Row::action(2, "新建围栏", "在桌面中央新增一个空的毛玻璃围栏", vec![("＋ 新建围栏", 2, true, 128.0)]),
+                Row::action(3, "隐藏 / 显示全部", "一键淡出所有围栏看干净桌面，再点一次恢复", vec![("隐藏全部", 3, true, 116.0)]),
+                Row::action(4, "刷新桌面", "重新读取桌面图标并同步到各围栏（新建 / 删除文件后可用）", vec![("刷新", 4, true, 88.0)]),
+                Row::note("围栏是一块半透明毛玻璃面板：把文件拖进围栏即归入该组、双击图标打开、拖标题栏移动、拖四边四角缩放、点右上角箭头折叠、右键可改名 / 换色 / 删除。位置与大小自动保存。"),
             ],
         },
         // 8 邮箱验证码
@@ -1809,14 +1809,16 @@ fn on_click(hwnd: HWND, id: HitId) {
         }
         HitId::Toggle(page, slot) => {
             if page == 7 && slot == 1 {
-                // 桌面分区：开机自启（slot 0 的启用开关走 set_module_enabled 同步分区）
-                let on = crate::app::with_cfg(|c| {
-                    c.zones_autostart = !c.zones_autostart;
-                    c.zones_autostart
-                });
-                crate::app::save_now();
-                crate::app::redraw();
-                flash(if on { "分区已开机自启" } else { "已关闭分区自启" });
+                // 桌面分区：开机自启（真正写入系统启动项）
+                let want = crate::app::with_cfg(|c| !c.zones_autostart);
+                if crate::modules::autostart::set_enabled(want) {
+                    crate::app::with_cfg(|c| c.zones_autostart = want);
+                    crate::app::save_now();
+                    crate::app::redraw();
+                    flash(if want { "已设置开机自启" } else { "已关闭开机自启" });
+                } else {
+                    flash("未能写入开机自启项");
+                }
             } else if page == 0 && slot == 0 {
                 let want = !crate::app::with_cfg(|c| c.autostart);
                 if crate::modules::autostart::set_enabled(want) {
@@ -1874,8 +1876,8 @@ fn on_click(hwnd: HWND, id: HitId) {
                     invalidate(hwnd);
                 }
                 (7, 4) => {
-                    let editing = crate::modules::zones::toggle_edit();
-                    flash(if editing { "已显示缩放手柄（拖标题栏移动 / 四角缩放）" } else { "已隐藏缩放手柄" });
+                    crate::modules::zones::refresh();
+                    flash("已刷新桌面图标");
                     invalidate(hwnd);
                 }
                 (7, 3) => {
