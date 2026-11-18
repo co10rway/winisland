@@ -155,7 +155,7 @@ impl Default for Mail {
             user: String::new(),
             password: String::new(),
             folder: "INBOX".into(),
-            poll_seconds: 60,
+            poll_seconds: 20,
         }
     }
 }

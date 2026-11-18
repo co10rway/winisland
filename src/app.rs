@@ -428,6 +428,8 @@ pub fn run() {
         let mut store = Store::load();
         store.reset_day_if_needed(&clock::today_str(&st));
         let now_unix = files::now_unix();
+        // 上次残留的验证码不该在重启后弹一次：把「已提醒水位」直接对齐到它
+        let last_mail_ts = store.mail_code.as_ref().map(|m| m.ts).unwrap_or(0);
 
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
@@ -464,7 +466,7 @@ pub fn run() {
                 last_water_unix: now_unix,
                 sed_ack_idle: 0,
                 code_until: None,
-                last_mail_ts: 0,
+                last_mail_ts,
                 peak_wpm: 0,
                 rot_i: 0,
                 rot_prev: 0,

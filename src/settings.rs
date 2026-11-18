@@ -95,6 +95,8 @@ const NAV: [(usize, usize, &str); 12] = [
 
 const ID_TIMER_STATUS: usize = 1;
 const ID_TIMER_ICS: usize = 3;
+/// 邮箱「测试连接」进行中：每 500ms 重绘一次状态行，拿到结果就停
+const ID_TIMER_MAIL: usize = 4;
 const EM_SETMARGINS: u32 = 0x00D3;
 const EC_LEFTMARGIN: usize = 1;
 const EC_RIGHTMARGIN: usize = 2;
@@ -124,6 +126,8 @@ enum RowKind {
     Weekday,
     /// 时间选择器：点击弹出时/分选择面板（不创建原生 EDIT）
     Time,
+    /// 动态状态文字（目前用于邮箱验证码监听状态）
+    MailStatus,
 }
 
 struct Row {
@@ -178,6 +182,10 @@ impl Row {
     }
     fn note(text: &'static str) -> Row {
         Row { kind: RowKind::Note, slot: 0, label: text, desc: "", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
+    }
+    /// 邮箱监听状态行：文字来自后台线程，每次重绘都取最新
+    fn mail_status() -> Row {
+        Row { kind: RowKind::MailStatus, slot: 0, label: "", desc: "", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
     }
     fn hero() -> Row {
         Row { kind: RowKind::Hero, slot: 0, label: "", desc: "", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
@@ -247,6 +255,11 @@ fn layout(page: &Page) -> Layout {
                 i += 1;
             }
             RowKind::Note => {
+                placed.push(Placed { row: i, y, h: NOTE_H });
+                y += NOTE_H;
+                i += 1;
+            }
+            RowKind::MailStatus => {
                 placed.push(Placed { row: i, y, h: NOTE_H });
                 y += NOTE_H;
                 i += 1;
@@ -405,7 +418,7 @@ fn pages() -> Vec<Page> {
         // 8 邮箱验证码
         Page {
             title: "邮箱验证码",
-            desc: "IMAP 本地解析验证码，正文不留存不上传；改参数后需重启",
+            desc: "IMAP 本地解析验证码，正文不留存不上传",
             rows: vec![
                 Row::toggle(0, "启用邮箱验证码", "需要先填好下面的 IMAP 参数"),
                 Row::field(1, "IMAP 服务器", "", 220.0).ph("imap.qq.com"),
@@ -413,8 +426,9 @@ fn pages() -> Vec<Page> {
                 Row::field(3, "账号", "", 220.0).ph("you@example.com"),
                 Row::field(4, "密码 / 授权码", "QQ 邮箱请使用授权码而非登录密码", 220.0).pwd(),
                 Row::field(5, "文件夹", "", 160.0).ph("INBOX"),
-                Row::field(6, "轮询间隔", "", 108.0).suffix("秒").int(),
-                Row::action(7, "应用配置", "保存后重启程序才会重新连接", vec![("保存配置", 7, true, 116.0)]),
+                Row::field(6, "轮询间隔", "最小 10 秒", 108.0).suffix("秒").int(),
+                Row::action(7, "应用配置", "保存后立即生效，无需重启", vec![("保存配置", 7, true, 110.0), ("测试连接", 8, false, 96.0)]),
+                Row::mail_status(),
             ],
         },
         // 9 灵动图标
@@ -805,7 +819,7 @@ fn apply_page(page: usize) {
                     c.mail.folder = folder;
                 }
                 if let Some(v) = poll {
-                    c.mail.poll_seconds = v.max(15);
+                    c.mail.poll_seconds = v.clamp(10, 600);
                 }
             });
         }
@@ -1193,6 +1207,17 @@ fn draw_row(cv: &mut Canvas, row: &Row, page: usize, pl: &Placed, cx: f32, cw: f
         }
         RowKind::Note => {
             cv.text1(cx + s(2.0), ry, cw, rh, row.label, 10.5, W_NORMAL, TXT2, 0.8);
+        }
+        RowKind::MailStatus => {
+            let st = crate::modules::mail::last_status();
+            let txt = if st.is_empty() { "状态：尚未开始".to_string() } else { format!("状态：{st}") };
+            // 失败用红色提示，成功 / 监听中用次要色
+            let color = if txt.contains("失败") || txt.contains("未配置") || txt.contains("请先") {
+                0xE07A7A
+            } else {
+                TXT2
+            };
+            cv.text1(cx + s(2.0), ry, cw, rh, &txt, 10.5, W_NORMAL, color, 0.9);
         }
         RowKind::Hero => {
             draw_hero(cv, cx, ry, cw, rh);
@@ -1871,7 +1896,16 @@ fn on_click(hwnd: HWND, id: HitId) {
                 (4, 1) => crate::app::open_data_file(),
                 (8, 7) => {
                     apply_page(8);
-                    flash("已保存 · 重启后生效");
+                    flash("已保存，后台会立即按新参数重连");
+                }
+                (8, 8) => {
+                    // 先落盘再测，否则测的是旧参数
+                    apply_page(8);
+                    crate::modules::mail::test_connection_async();
+                    flash("正在测试连接…状态显示在下方");
+                    unsafe {
+                        SetTimer(Some(hwnd), ID_TIMER_MAIL, 500, None);
+                    }
                 }
                 (3, 5) => {
                     apply_page(3);
@@ -2098,6 +2132,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             STATUS.with(|c| *c.borrow_mut() = None);
             let _ = KillTimer(Some(hwnd), ID_TIMER_STATUS);
             invalidate(hwnd);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == ID_TIMER_MAIL => {
+            invalidate(hwnd);
+            let st = crate::modules::mail::last_status();
+            if !st.starts_with("正在测试") {
+                let _ = KillTimer(Some(hwnd), ID_TIMER_MAIL);
+                if !st.is_empty() {
+                    flash(&st);
+                }
+            }
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == ID_TIMER_ICS => {

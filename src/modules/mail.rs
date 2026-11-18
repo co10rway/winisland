@@ -1,5 +1,12 @@
 //! 邮箱验证码 — IMAPS 拉取（rustls 静态编译），仅本地解析邮件主题/正文前 2KB
 //! 中的验证码数字；除登录必需外不上传任何数据。
+//!
+//! 协议层是自己写的极简 IMAP 客户端，但必须遵守两条硬规则，之前的实现都踩了：
+//! 1. **响应必须要读到 tag 完成行**（`a001 OK ...`）才算结束。旧实现靠"读到的数据
+//!    以 CRLF 结尾 + 250ms 内没数据"判断结束，而那次探测超时会被当成"还有数据"，
+//!    于是每轮都会继续阻塞 20 秒再超时失败——这就是「配好了也收不到提醒」的主因。
+//! 2. **去重要用 UID**。旧的 key 是「发件人|主题」，验证码邮件的主题往往就是
+//!    「验证码」四个字，第二次之后全被当成同一条跳过。
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -15,146 +22,310 @@ pub struct MailShared {
 
 pub type SharedMail = Arc<Mutex<MailShared>>;
 
+/// 最近一次状态（供设置页显示，跨线程读取）
+static STATUS: Mutex<String> = Mutex::new(String::new());
+
+fn set_status(shared: &SharedMail, s: impl Into<String>) {
+    let s = s.into();
+    if let Ok(mut g) = STATUS.lock() {
+        *g = s.clone();
+    }
+    if let Ok(mut g) = shared.lock() {
+        g.status = s;
+    }
+}
+
+/// 设置页展示用：邮箱监听当前状态
+pub fn last_status() -> String {
+    STATUS.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
 pub fn spawn(shared: SharedMail) {
     std::thread::spawn(move || loop {
-        let cfg = crate::config::Config::load().mail;
-        let enabled = crate::config::Config::load().modules.mailcode;
-        if !enabled || cfg.imap_host.is_empty() || cfg.user.is_empty() {
-            if let Ok(mut s) = shared.lock() {
-                s.status = if enabled {
-                    "未配置 · 请在 config.json 填写 IMAP 信息".into()
-                } else {
-                    "已关闭".into()
-                };
-            }
+        let cfg_all = crate::config::Config::load();
+        let cfg = cfg_all.mail;
+        let enabled = cfg_all.modules.mailcode;
+        if !enabled {
+            set_status(&shared, "已关闭");
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        }
+        if cfg.imap_host.trim().is_empty() || cfg.user.trim().is_empty() || cfg.password.is_empty() {
+            set_status(&shared, "未配置 · 请填写 IMAP 服务器 / 账号 / 授权码");
             std::thread::sleep(Duration::from_secs(5));
             continue;
         }
         match poll_once(&cfg, &shared) {
             Ok(()) => {
-                if let Ok(mut s) = shared.lock() {
-                    s.status = "监听中".into();
-                }
-                std::thread::sleep(Duration::from_secs(cfg.poll_seconds.max(20) as u64));
+                let wait = cfg.poll_seconds.clamp(10, 600) as u64;
+                // 状态里带上轮询节奏，用户能确认它真的在跑
+                set_status(&shared, format!("监听中 · 每 {} 秒检查一次", wait));
+                std::thread::sleep(Duration::from_secs(wait));
             }
             Err(e) => {
-                if let Ok(mut s) = shared.lock() {
-                    s.status = format!("连接失败: {e}（60 秒后重试）");
-                }
-                std::thread::sleep(Duration::from_secs(60));
+                set_status(&shared, format!("连接失败：{e}（30 秒后重试）"));
+                std::thread::sleep(Duration::from_secs(30));
             }
         }
     });
 }
 
-fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<(), String> {
+// ── 一次完整拉取 ──
+
+/// 连接 + 登录，返回可用的 IMAP 连接
+fn connect(cfg: &crate::config::Mail) -> Result<ImapConn<TlsStream>, String> {
     use rustls::pki_types::ServerName;
 
-    let server_name = ServerName::try_from(cfg.imap_host.clone())
-        .map_err(|_| "服务器名无效".to_string())?;
+    let server_name =
+        ServerName::try_from(cfg.imap_host.trim().to_string()).map_err(|_| "服务器名无效".to_string())?;
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
-    let config = rustls::ClientConfig::builder()
+    let tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let tcp = std::net::TcpStream::connect((cfg.imap_host.as_str(), cfg.imap_port))
-        .map_err(|e| e.to_string())?;
+    let tcp = std::net::TcpStream::connect((cfg.imap_host.trim(), cfg.imap_port))
+        .map_err(|e| format!("无法连接 {}:{} —— {e}", cfg.imap_host.trim(), cfg.imap_port))?;
     tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
-    let mut tls = rustls::StreamOwned::new(
-        rustls::ClientConnection::new(Arc::new(config), server_name).map_err(|e| e.to_string())?,
-        tcp,
-    );
+    tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
+    let tls = rustls::ClientConnection::new(Arc::new(tls_config), server_name)
+        .map_err(|e| format!("TLS 初始化失败：{e}"))?;
+    let mut conn = ImapConn {
+        stream: rustls::StreamOwned::new(tls, tcp),
+        buf: Vec::with_capacity(8192),
+        tag: 0,
+    };
 
-    let mut conn = ImapConn { stream: &mut tls, tag: 0 };
+    // 问候
+    let greet = conn.read_line()?;
+    if !greet.to_uppercase().contains("OK") {
+        return Err(format!("服务器问候异常：{greet}"));
+    }
+    // 登录
+    let user = cfg.user.trim();
+    let pass = cfg.password.trim();
+    let r = conn.cmd(&format!(
+        "LOGIN \"{}\" \"{}\"",
+        imap_escape(user),
+        imap_escape(pass)
+    ))?;
+    if !is_ok(&r) {
+        return Err(format!(
+            "登录被拒绝（QQ/163 等需用「授权码」而非登录密码）：{}",
+            first_tag_line(&r)
+        ));
+    }
+    // 网易（163/126）在登录后会要求客户端声明身份，否则 SELECT 返回 Unsafe Login。
+    // 不支持的服务器回 BAD，忽略即可。
+    let _ = conn.cmd("ID (\"name\" \"WinIsland\" \"version\" \"0.14\" \"vendor\" \"winisland\")");
+    Ok(conn)
+}
 
-    conn.read_resp()?; // greeting
-    conn.cmd(&format!("LOGIN \"{}\" \"{}\"", imap_escape(&cfg.user), imap_escape(&cfg.password)))?;
-    let exists = conn.select(&cfg.folder)?;
-    let from = exists.saturating_sub(4).max(1);
-    let (headers, bodies) = conn.fetch_range(from, exists)?;
+/// 设置页「测试连接」：只握手 + 登录 + 打开收件箱，不消费任何验证码
+pub fn test_connection_async() {
+    if let Ok(mut g) = STATUS.lock() {
+        *g = "正在测试连接…".into();
+    }
+    std::thread::spawn(|| {
+        let cfg = crate::config::Config::load();
+        let m = cfg.mail;
+        if m.imap_host.trim().is_empty() || m.user.trim().is_empty() {
+            set_only_status("请先填写 IMAP 服务器与账号".to_string());
+            return;
+        }
+        if m.password.is_empty() {
+            set_only_status("请先填写密码 / 授权码".to_string());
+            return;
+        }
+        let r = connect(&m).and_then(|mut conn| {
+            let folder = if m.folder.trim().is_empty() { "INBOX" } else { m.folder.trim() };
+            conn.select(folder)
+        });
+        match r {
+            Ok(n) => set_only_status(format!("连接成功 · 「{}」共 {} 封邮件", if m.folder.trim().is_empty() { "INBOX" } else { m.folder.trim() }, n)),
+            Err(e) => set_only_status(format!("连接失败：{e}")),
+        }
+    });
+}
 
-    let store = crate::store::Store::load();
-    let mut seen = store.seen_mail_ids.clone();
-    let mut latest = store.mail_code.clone();
+fn set_only_status(s: String) {
+    if let Ok(mut g) = STATUS.lock() {
+        *g = s;
+    }
+}
 
-    for i in 0..headers.len().min(bodies.len()) {
-        let (from, subject) = &headers[i];
-        let text = &bodies[i];
-        let key = format!("{}|{}", from, subject);
-        if seen.iter().any(|s| *s == key) {
+fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<(), String> {
+    let mut conn = connect(cfg)?;
+    let folder = if cfg.folder.trim().is_empty() { "INBOX" } else { cfg.folder.trim() };
+    let exists = conn.select(folder)?;
+
+    let mut store = crate::store::Store::load();
+    let last_uid = store.mail_last_uid;
+    let msgs = conn.fetch_since(last_uid, exists)?;
+
+    // 只认 UID 更大的（服务端在 UID 越界时会回最后一条，靠这里过滤）
+    let mut newest: Option<(u32, MailCode)> = None;
+    let mut max_uid = last_uid;
+    for m in msgs {
+        max_uid = max_uid.max(m.uid);
+        if m.uid <= last_uid {
             continue;
         }
-        if let Some(code) = extract_code(subject, text) {
-            seen.push(key.clone());
-            if seen.len() > 50 {
-                seen.drain(..seen.len() - 50);
+        if let Some(code) = extract_code(&m.subject, &m.body) {
+            let ok = newest.as_ref().map(|(u, _)| m.uid > *u).unwrap_or(true);
+            if ok {
+                newest = Some((
+                    m.uid,
+                    MailCode {
+                        code,
+                        from: clean_from(&m.from),
+                        ts: crate::modules::files::now_unix(),
+                    },
+                ));
             }
-            latest = Some(MailCode {
-                code,
-                from: clean_from(from),
-                ts: crate::modules::files::now_unix(),
-            });
         }
     }
 
-    if let Ok(mut s) = shared.lock() {
-        s.latest = latest.clone();
+    store.mail_last_uid = max_uid;
+    if let Some((_, mc)) = newest {
+        store.mail_code = Some(mc.clone());
+        if let Ok(mut s) = shared.lock() {
+            s.latest = Some(mc);
+        }
+    } else if let Ok(mut s) = shared.lock() {
+        // 没有新验证码时保留已有展示内容，不覆盖
+        if s.latest.is_none() {
+            s.latest = store.mail_code.clone();
+        }
     }
-    let mut st = crate::store::Store::load();
-    st.seen_mail_ids = seen;
-    st.mail_code = latest;
-    st.save();
+    store.save();
     Ok(())
 }
 
-struct ImapConn<'a> {
-    stream: &'a mut rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>,
+fn is_ok(reply: &str) -> bool {
+    reply
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| {
+            let u = l.to_uppercase();
+            u.contains(" OK")
+        })
+        .unwrap_or(false)
+}
+
+fn first_tag_line(reply: &str) -> String {
+    reply
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("a0") || l.contains(" NO ") || l.contains(" BAD "))
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
+}
+
+// ── IMAP 连接 ──
+
+type TlsStream = rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>;
+
+struct ImapConn<S: Read + Write> {
+    stream: S,
+    /// 已从 socket 读入但还没消费的字节
+    buf: Vec<u8>,
     tag: u32,
 }
 
-impl<'a> ImapConn<'a> {
-    fn read_resp(&mut self) -> Result<String, String> {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let n = self.stream.read(&mut chunk).map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            // 简化：读到以 CRLF 结尾且包含 tag 完成行或一定量后停
-            if buf.ends_with(b"\r\n") {
-                let s = String::from_utf8_lossy(&buf).to_string();
-                // 连续多行响应（如 FETCH）：尝试在 300ms 静默后认为读完
-                if pending_more(self.stream) {
-                    continue;
-                }
-                return Ok(s);
-            }
-            if buf.len() > 4 * 1024 * 1024 {
-                break;
-            }
+struct MailMsg {
+    uid: u32,
+    from: String,
+    subject: String,
+    body: String,
+}
+
+impl<S: Read + Write> ImapConn<S> {
+    fn fill(&mut self) -> Result<(), String> {
+        let mut chunk = [0u8; 8192];
+        let n = self.stream.read(&mut chunk).map_err(|e| format!("读取超时/断开：{e}"))?;
+        if n == 0 {
+            return Err("服务器关闭了连接".into());
         }
-        Ok(String::from_utf8_lossy(&buf).to_string())
+        self.buf.extend_from_slice(&chunk[..n]);
+        Ok(())
     }
 
-    fn cmd(&mut self, command: &str) -> Result<String, String> {
+    /// 读一行（不含 CRLF）
+    fn read_line(&mut self) -> Result<String, String> {
+        loop {
+            if let Some(pos) = find_crlf(&self.buf) {
+                let line = String::from_utf8_lossy(&self.buf[..pos]).to_string();
+                self.buf.drain(..pos + 2);
+                return Ok(line);
+            }
+            if self.buf.len() > 8 * 1024 * 1024 {
+                return Err("响应过大".into());
+            }
+            self.fill()?;
+        }
+    }
+
+    fn read_n(&mut self, n: usize) -> Result<Vec<u8>, String> {
+        while self.buf.len() < n {
+            self.fill()?;
+        }
+        let out = self.buf[..n].to_vec();
+        self.buf.drain(..n);
+        Ok(out)
+    }
+
+    fn next_tag(&mut self) -> String {
         self.tag += 1;
-        let tag = format!("a{:03}", self.tag);
+        format!("a{:04}", self.tag)
+    }
+
+    /// 发一条命令，读到该 tag 的完成行（含中间的字面量）为止
+    fn cmd(&mut self, command: &str) -> Result<String, String> {
+        let tag = self.next_tag();
         let line = format!("{} {}\r\n", tag, command);
         self.stream
             .write_all(line.as_bytes())
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("发送失败：{e}"))?;
         self.stream.flush().ok();
-        self.read_resp()
+        self.read_until_tag(&tag)
+    }
+
+    fn read_until_tag(&mut self, tag: &str) -> Result<String, String> {
+        let mut out = String::new();
+        loop {
+            let line = self.read_line()?;
+            // 字面量：行尾 `{123}`，后面紧跟 123 字节原样数据
+            if let Some(n) = trailing_literal(&line) {
+                out.push_str(&line);
+                out.push('\n');
+                let data = self.read_n(n)?;
+                out.push_str(&String::from_utf8_lossy(&data));
+                continue;
+            }
+            out.push_str(&line);
+            out.push('\n');
+            if line.starts_with(&format!("{tag} ")) {
+                return Ok(out);
+            }
+            if line.to_uppercase().starts_with("* BYE") {
+                return Err("服务器主动断开（BYE）".into());
+            }
+        }
     }
 
     fn select(&mut self, folder: &str) -> Result<u32, String> {
-        let resp = self.cmd(&format!("SELECT \"{}\"", folder))?;
+        let resp = self.cmd(&format!("SELECT \"{}\"", imap_escape(folder)))?;
+        if !is_ok(&resp) {
+            return Err(format!("打不开邮箱文件夹「{folder}」：{}", first_tag_line(&resp)));
+        }
         for line in resp.lines() {
-            let line = line.trim();
-            if let Some(rest) = line.strip_prefix("* ") {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("* ") {
                 if let Some(n_str) = rest.strip_suffix(" EXISTS") {
                     if let Ok(n) = n_str.trim().parse() {
                         return Ok(n);
@@ -165,57 +336,149 @@ impl<'a> ImapConn<'a> {
         Ok(0)
     }
 
-    fn fetch_range(&mut self, from: u32, to: u32) -> Result<(Vec<(String, String)>, Vec<String>), String> {
-        let resp = self.cmd(&format!(
-            "FETCH {}:{} (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODY.PEEK[TEXT]<0.2048>)",
-            from, to
-        ))?;
-        let mut headers: Vec<(String, String)> = Vec::new();
-        let mut bodies: Vec<String> = Vec::new();
-        let mut cur_from = String::new();
-        let mut cur_subj = String::new();
-        let mut in_header = false;
-        let mut body_acc = String::new();
-        for line in resp.lines() {
-            if line.starts_with("* ") && line.contains("FETCH (") {
-                if !cur_subj.is_empty() || !cur_from.is_empty() {
-                    headers.push((std::mem::take(&mut cur_from), std::mem::take(&mut cur_subj)));
-                    bodies.push(std::mem::take(&mut body_acc));
+    /// 拉取新邮件（首轮只取最近 10 封，避免一次拉满）。
+    /// 返回每条邮件的 UID、头部原文、正文片段。
+    ///
+    /// 注意首轮必须用**序号**（`FETCH 41:50`）而不是 UID（`UID FETCH 41:50`）：
+    /// 后者取的是 UID 41~50 那几封，对一个有几千封信的邮箱来说是最老的那批，
+    /// 反而不是最近的。
+    fn fetch_since(&mut self, last_uid: u32, exists: u32) -> Result<Vec<MailMsg>, String> {
+        if exists == 0 {
+            return Ok(Vec::new());
+        }
+        let (word, range) = if last_uid == 0 {
+            (
+                "FETCH",
+                format!("{}:{}", exists.saturating_sub(9).max(1), exists),
+            )
+        } else {
+            ("UID FETCH", format!("{}:*", last_uid + 1))
+        };
+        let tag = self.next_tag();
+        let req = format!(
+            "{} {} {} (UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODY.PEEK[TEXT]<0.4096>)\r\n",
+            tag, word, range
+        );
+        self.stream
+            .write_all(req.as_bytes())
+            .map_err(|e| format!("发送失败：{e}"))?;
+        self.stream.flush().ok();
+
+        // 一条 FETCH 响应里按顺序有 2 个字面量：头部、正文
+        let mut out: Vec<MailMsg> = Vec::new();
+        let mut cur = MailMsg {
+            uid: 0,
+            from: String::new(),
+            subject: String::new(),
+            body: String::new(),
+        };
+        let mut has_cur = false;
+        let mut lit_idx = 0usize;
+        let mut head_raw = Vec::new();
+        let mut body_raw = Vec::new();
+
+        loop {
+            let line = self.read_line()?;
+            if line.starts_with(&format!("{tag} ")) {
+                if !is_ok(&line) {
+                    return Err(format!("拉取失败：{}", line.trim()));
                 }
-                in_header = true;
-                continue;
+                break;
             }
-            if in_header {
-                let low = line.to_lowercase();
-                if low.starts_with("from:") {
-                    cur_from = line[5..].trim().to_string();
-                } else if low.starts_with("subject:") {
-                    cur_subj = decode_subj(line[8..].trim());
-                } else if low.starts_with("body[") || low.starts_with(") ") {
-                    in_header = false;
+            // 先认「新的一条」再处理字面量：首条响应行本身就以 `{N}` 结尾，
+            // 如果先判字面量就会在读字面量后 continue，永远建不出 cur（旧 bug）
+            if line.contains("FETCH (") || line.contains("FETCH(") {
+                if has_cur {
+                    out.push(finish_msg(&cur, &head_raw, &body_raw));
                 }
-            } else if !line.is_empty() && !line.starts_with("a0") {
-                if body_acc.len() < 4096 {
-                    body_acc.push_str(line);
-                    body_acc.push('\n');
+                cur = MailMsg {
+                    uid: parse_uid(&line),
+                    from: String::new(),
+                    subject: String::new(),
+                    body: String::new(),
+                };
+                has_cur = true;
+                lit_idx = 0;
+                head_raw = Vec::new();
+                body_raw = Vec::new();
+            }
+            if let Some(n) = trailing_literal(&line) {
+                let data = self.read_n(n)?;
+                if lit_idx == 0 {
+                    head_raw = data;
+                } else if lit_idx == 1 {
+                    body_raw = data;
                 }
+                lit_idx += 1;
             }
         }
-        if !cur_subj.is_empty() || !cur_from.is_empty() {
-            headers.push((cur_from, cur_subj));
-            bodies.push(body_acc);
+        if has_cur {
+            out.push(finish_msg(&cur, &head_raw, &body_raw));
         }
-        Ok((headers, bodies))
+        Ok(out)
     }
 }
 
-/// 250ms 静默检测：TLS 流是否还有更多数据可读
-fn pending_more(stream: &mut rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>) -> bool {
-    stream.sock.set_read_timeout(Some(Duration::from_millis(250))).ok();
-    let mut probe = [0u8; 1];
-    let more = matches!(stream.read(&mut probe), Ok(0)) == false;
-    stream.sock.set_read_timeout(Some(Duration::from_secs(20))).ok();
-    more
+fn finish_msg(cur: &MailMsg, head: &[u8], body: &[u8]) -> MailMsg {
+    let h = String::from_utf8_lossy(head).to_string();
+    let b = String::from_utf8_lossy(body).to_string();
+    MailMsg {
+        uid: cur.uid,
+        from: header_field(&h, "from"),
+        subject: decode_header(&header_field(&h, "subject")),
+        body: decode_body(&b),
+    }
+}
+
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\r\n")
+}
+
+/// 行尾的 IMAP 字面量长度标记 `{123}`
+fn trailing_literal(line: &str) -> Option<usize> {
+    let t = line.trim_end();
+    if !t.ends_with('}') {
+        return None;
+    }
+    let open = t.rfind('{')?;
+    let inner = &t[open + 1..t.len() - 1];
+    // `{123}` 或 `{123+}`（非同步字面量）
+    let inner = inner.strip_suffix('+').unwrap_or(inner);
+    inner.parse::<usize>().ok()
+}
+
+fn parse_uid(line: &str) -> u32 {
+    let up = line.to_uppercase();
+    if let Some(p) = up.find("UID ") {
+        let rest = &line[p + 4..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse() {
+            return n;
+        }
+    }
+    0
+}
+
+/// 从原始头部文本里取某个字段（支持折行续行）
+fn header_field(text: &str, name: &str) -> String {
+    let mut out: Option<String> = None;
+    for line in text.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(o) = out.as_mut() {
+                o.push_str(line.trim());
+            }
+            continue;
+        }
+        if out.is_some() {
+            break;
+        }
+        if let Some((n, v)) = line.split_once(':') {
+            if n.trim().eq_ignore_ascii_case(name) {
+                out = Some(v.trim().to_string());
+            }
+        }
+    }
+    out.unwrap_or_default()
 }
 
 fn imap_escape(s: &str) -> String {
@@ -224,30 +487,135 @@ fn imap_escape(s: &str) -> String {
 
 fn clean_from(s: &str) -> String {
     // "GitHub <noreply@github.com>" -> "noreply@github.com"
-    if let Some(a) = s.rfind('<') {
-        if let Some(b) = s.rfind('>') {
-            if b > a {
-                return s[a + 1..b].to_string();
-            }
+    if let (Some(a), Some(b)) = (s.rfind('<'), s.rfind('>')) {
+        if b > a {
+            return s[a + 1..b].to_string();
         }
     }
     s.trim().to_string()
 }
 
-fn decode_subj(s: &str) -> String {
-    // 只处理 =?utf-8?B?...?= 与 =?UTF-8?Q?...?= 的常见形态
-    let mut out = s.to_string();
-    let low = s.to_lowercase();
-    if let (Some(bpos), Some(eidx)) = (low.find("?b?"), s.rfind("?=")) {
-        if let Some(start) = s.find("=?") {
-            if let Ok(bytes) = base64_decode(&s[bpos + 3..eidx]) {
-                if let Ok(txt) = String::from_utf8(bytes) {
-                    out = txt;
+// ── 解码 ──
+
+/// RFC 2047 编码字解码：`=?UTF-8?B?...?=` / `=?gb2312?Q?...?=`，可多段拼接
+///
+/// 注意不能靠 `find("?=")` 找编码字结尾：Q 编码里 `?=` 会先出现在 `Q?=` 处，
+/// 导致整个编码字被误判、原样输出（旧实现的 bug）。
+fn decode_header(s: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < s.len() {
+        if s[i..].starts_with("=?") {
+            let rest = &s[i + 2..];
+            // charset?enc?text?=
+            let mut parts = rest.splitn(3, '?');
+            if let (Some(charset), Some(enc), Some(tail)) =
+                (parts.next(), parts.next(), parts.next())
+            {
+                if let Some(rel_end) = tail.find("?=") {
+                    let encoded = &tail[..rel_end];
+                    if let Some(txt) = decode_rfc2047_word(charset, enc, encoded) {
+                        out.push_str(&txt);
+                        i += 2 + charset.len() + 1 + enc.len() + 1 + rel_end + 2;
+                        continue;
+                    }
                 }
             }
-            let _ = start;
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn decode_rfc2047_word(charset: &str, enc: &str, text: &str) -> Option<String> {
+    let charset = charset.to_lowercase();
+    let raw = match enc.to_lowercase().as_str() {
+        "b" => base64_decode(text).ok()?,
+        "q" => q_decode(text),
+        _ => return None,
+    };
+    Some(decode_charset(&raw, &charset))
+}
+
+/// 尽力解码字符集：UTF-8 直接转；GBK 系没有内置码表，用 latin1 兜底
+/// （验证码是 ASCII 数字，兜底后依然能认出，不会漏提醒）
+fn decode_charset(raw: &[u8], charset: &str) -> String {
+    if charset.contains("utf") || charset.contains("ascii") {
+        if let Ok(s) = std::str::from_utf8(raw) {
+            return s.to_string();
+        }
+        return String::from_utf8_lossy(raw).to_string();
+    }
+    // GB2312/GBK/BIG5/ISO-8859-* 等：ASCII 部分保持原样即可
+    raw.iter()
+        .map(|&b| if b < 0x80 { b as char } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn q_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'_' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'=' if i + 2 < b.len() => {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
+                if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    out.push(v);
+                    i += 3;
+                } else {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
         }
     }
+    out
+}
+
+/// 正文可能被 base64 / quoted-printable 编码（中文邮件非常常见），
+/// 这里把「解码后的文本」和「原文」都拼在一起返回，交给 extract_code 逐个尝试
+fn decode_body(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    let mut out = String::new();
+    // 1) base64 段：从 "base64" 那一行之后开始取，跳过空行，直到 MIME 边界 / 下一个头部
+    if let Some(pos) = lower.find("base64") {
+        let start = raw[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(raw.len());
+        let chunk: String = raw[start..]
+            .lines()
+            .skip_while(|l| l.trim().is_empty())
+            .take_while(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with("--") && !t.contains(':')
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        if chunk.len() >= 16 {
+            if let Ok(bytes) = base64_decode(&chunk) {
+                out.push_str(&String::from_utf8_lossy(&bytes));
+                out.push('\n');
+            }
+        }
+    }
+    // 2) quoted-printable
+    if lower.contains("quoted-printable") {
+        out.push_str(&String::from_utf8_lossy(&q_decode(raw)));
+        out.push('\n');
+    }
+    out.push_str(raw);
     out
 }
 
@@ -257,7 +625,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
     let mut bits = 0u32;
     let mut out = Vec::new();
     for ch in s.bytes() {
-        if ch == b'=' || ch == b'\r' || ch == b'\n' || ch == b' ' {
+        if ch == b'=' || ch == b'\r' || ch == b'\n' || ch == b' ' || ch == b'\t' {
             continue;
         }
         let v = TBL.iter().position(|&c| c == ch).ok_or(())? as u32;
@@ -268,8 +636,13 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
             out.push((acc >> bits) as u8);
         }
     }
+    if out.is_empty() {
+        return Err(());
+    }
     Ok(out)
 }
+
+// ── 验证码提取 ──
 
 /// 从主题/正文中提取验证码（本地启发式，绝不外传内容）
 pub fn extract_code(subject: &str, body: &str) -> Option<String> {
@@ -277,19 +650,33 @@ pub fn extract_code(subject: &str, body: &str) -> Option<String> {
         if text.is_empty() {
             continue;
         }
-        // "验证码 123456" / "验证码: 123456" / "code is 123456"
-        for kw in ["验证码", "码是", "code is", "verification code", "code:"] {
-            let low = text.to_lowercase();
+        // 统一在**小写副本**上做查找和切片，避免 to_lowercase 改变字节长度后
+        // 用旧下标切原文导致 panic（个别 Unicode 字符会变长）
+        let low = text.to_lowercase();
+        for kw in [
+            "验证码",
+            "校验码",
+            "动态码",
+            "确认码",
+            "激活码",
+            "code is",
+            "verification code",
+            "your code",
+            "code:",
+            "code：",
+        ] {
             if let Some(pos) = low.find(kw) {
-                let rest = &text[pos + kw.len()..];
+                let rest = &low[pos + kw.len()..];
                 if let Some(code) = first_digit_run(rest, 4, 8) {
                     return Some(code);
                 }
             }
         }
         // "123456 is your ..."（GitHub 风格）
-        if let Some(code) = first_digit_run(&text[..text.len().min(20)], 4, 8) {
-            if text[code.len()..].trim_start().to_lowercase().starts_with("is your") {
+        let head: String = low.chars().take(24).collect();
+        if let Some(code) = first_digit_run(&head, 4, 8) {
+            let tail = head[code.len()..].trim_start();
+            if tail.starts_with("is your") || tail.starts_with("是您") {
                 return Some(code);
             }
         }
@@ -315,4 +702,44 @@ fn first_digit_run(s: &str, min: usize, max: usize) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_alphabet_must_be_standard() {
+        // 回归：字母表曾把 0123456789 写成 0123456789，所有 base64 解码全错
+        assert_eq!(base64_decode("MTIzNDU2").unwrap(), b"123456");
+    }
+
+    #[test]
+    fn decodes_rfc2047_subject() {
+        let s = "=?utf-8?B?6aqM6K+B56CBIDEyMzQ1Ng==?=";
+        assert!(decode_header(s).contains("123456"));
+    }
+
+    #[test]
+    fn extracts_code_after_chinese_keyword() {
+        assert_eq!(
+            extract_code("验证码", "您的验证码为 456123，5 分钟内有效"),
+            Some("456123".into())
+        );
+        // 只有关键词没有数字时不能瞎猜
+        assert_eq!(extract_code("【某某】验证码", "请勿泄露"), None);
+    }
+
+    #[test]
+    fn extracts_github_style_code() {
+        assert_eq!(
+            extract_code("123456 is your GitHub launch code", ""),
+            Some("123456".into())
+        );
+    }
+
+    #[test]
+    fn ignores_short_numbers() {
+        assert_eq!(extract_code("你的订单已发货", "订单号 12，预计 3 天到达"), None);
+    }
 }

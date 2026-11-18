@@ -44,6 +44,9 @@ pub struct Store {
     pub files: Vec<FileItem>,
     pub mail_code: Option<MailCode>,
     pub seen_mail_ids: Vec<String>,
+    /// 已处理过的最大邮件 UID（IMAP）——验证码邮件主题往往都叫「验证码」，
+    /// 用「发件人|主题」当 key 会把后续同主题的码全当成重复跳过，必须用 UID
+    pub mail_last_uid: u32,
     // 打字统计（按本地日期归零）
     pub typing_day: String,
     pub typing_keys: u64,
