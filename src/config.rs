@@ -245,6 +245,11 @@ pub struct Config {
     pub zones_autostart: bool,
     /// 桌面分区列表（纯视觉分组，不移动/不删除任何文件）
     pub zones: Vec<ZoneConf>,
+    /// 分区分类方案版本标记：旧版（文档/应用/其他）配置升级到完整分类后置 true，
+    /// 避免每次启动都把用户已调整过的分区重置
+    pub zones_migrated: bool,
+    /// 分区面板不透明度（80-230），越小壁纸越清楚；右键菜单三档可调
+    pub zone_alpha: u32,
     /// 剪贴板历史条数
     pub clipboard_history: usize,
     /// 文件中转站最多暂存的文件数（只存路径引用，此上限仅为列表管理，非内存约束）
@@ -383,6 +388,8 @@ impl Default for Config {
             autostart: false,
             zones_autostart: true,
             zones: Vec::new(),
+            zones_migrated: false,
+            zone_alpha: 150,
             clipboard_history: 20,
             filehub_cap: crate::modules::files::DEFAULT_FILEHUB_CAP,
             theme: "blue".into(),

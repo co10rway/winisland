@@ -396,12 +396,10 @@ fn pages() -> Vec<Page> {
             title: "桌面分区",
             desc: "在桌面上划出毛玻璃围栏，桌面图标按围栏分组收纳；图标拖进围栏即归类，不搬动文件内容",
             rows: vec![
-                Row::toggle(0, "启用桌面分区", "开启后桌面图标由毛玻璃围栏接管显示（自动按 文档 / 应用 / 其他 分好组）"),
+                Row::toggle(0, "启用桌面分区", "开启后桌面图标由毛玻璃围栏接管显示（首次自动按文件类型分组）"),
                 Row::toggle(1, "开机自启分区", "随系统启动自动显示围栏"),
-                Row::action(2, "新建围栏", "在桌面中央新增一个空的毛玻璃围栏", vec![("＋ 新建围栏", 2, true, 128.0)]),
-                Row::action(3, "隐藏 / 显示全部", "一键淡出所有围栏看干净桌面，再点一次恢复", vec![("隐藏全部", 3, true, 116.0)]),
-                Row::action(4, "刷新桌面", "重新读取桌面图标并同步到各围栏（新建 / 删除文件后可用）", vec![("刷新", 4, true, 88.0)]),
                 Row::note("围栏是一块半透明毛玻璃面板：把文件拖进围栏即归入该组、双击图标打开、拖标题栏移动、拖四边四角缩放、点右上角箭头折叠、右键可改名 / 换色 / 删除。位置与大小自动保存。"),
+                Row::note("桌面文件有任何增删改名都会自动同步并归入对应围栏，无需手动刷新。在围栏上点右键可新建围栏、隐藏 / 显示全部围栏。"),
             ],
         },
         // 8 邮箱验证码
@@ -1871,20 +1869,6 @@ fn on_click(hwnd: HWND, id: HitId) {
         HitId::Btn(page, slot) => {
             match (page, slot) {
                 (4, 1) => crate::app::open_data_file(),
-                (7, 2) => {
-                    crate::modules::zones::add_zone();
-                    invalidate(hwnd);
-                }
-                (7, 4) => {
-                    crate::modules::zones::refresh();
-                    flash("已刷新桌面图标");
-                    invalidate(hwnd);
-                }
-                (7, 3) => {
-                    let on = crate::modules::zones::toggle_all();
-                    flash(if on { "已隐藏全部分区" } else { "已显示全部分区" });
-                    invalidate(hwnd);
-                }
                 (8, 7) => {
                     apply_page(8);
                     flash("已保存 · 重启后生效");
