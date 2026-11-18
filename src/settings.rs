@@ -471,7 +471,7 @@ enum HitId {
     /// 工作日（0=周一 … 6=周日）
     Weekday(usize),
     Sound,
-    /// 底部「同步」按钮：保存所有页配置 + 刷新面板数据
+    /// 底部「保存并应用」按钮：保存所有页配置 + 刷新面板数据
     Sync,
     /// 时间选择器字段（点击弹出面板）
     Time(usize, i32),
@@ -1532,16 +1532,16 @@ fn draw_footer(cv: &mut Canvas, w: f32, h: f32, hover: HitId, hits: &mut Vec<Hit
     let bh = s(34.0);
     let by = fy + (s(FOOT_H) - bh) / 2.0;
 
-    // 右侧「同步」按钮
-    let sw = s(96.0);
+    // 右侧「保存并应用」按钮
+    let sw = s(120.0);
     let sx = w - s(PAD) - sw;
-    draw_button(cv, sx, by, sw, bh, "同步", true, hover == HitId::Sync, 1.0);
+    draw_button(cv, sx, by, sw, bh, "保存并应用", true, hover == HitId::Sync, 1.0);
     push_hit(hits, HitId::Sync, sx, by, sw, bh);
 
     let st = STATUS.with(|c| c.borrow().clone());
     let (msg, c, saved) = match st {
         Some((m, until)) if Instant::now() < until => (m, GREEN, true),
-        _ => ("修改后点击「同步」保存到本机并刷新面板".to_string(), TXT3, false),
+        _ => ("修改后点击「保存并应用」保存到本机并刷新面板".to_string(), TXT3, false),
     };
     let tx = s(SIDE_W + PAD);
     let maxw = (sx - s(12.0) - tx).max(s(40.0));
@@ -1800,7 +1800,7 @@ fn on_click(hwnd: HWND, id: HitId) {
         HitId::Nav(p) => {
             let cur = PAGE.with(|c| c.get());
             if cur != p {
-                // 切页不自动提交输入：所有改动统一由底部「同步」按钮保存并生效
+                // 切页不自动提交输入：所有改动统一由底部「保存并应用」按钮保存并生效
                 unsafe { show_page(hwnd, p) };
             }
         }
@@ -1942,7 +1942,7 @@ fn on_click(hwnd: HWND, id: HitId) {
             apply_all();
             crate::app::save_now();
             crate::app::reload_runtime();
-            flash("已保存并同步到面板");
+            flash("已保存并应用到面板");
             invalidate(hwnd);
         }
         HitId::Time(page, slot) => {
@@ -1981,7 +1981,7 @@ fn on_click(hwnd: HWND, id: HitId) {
                 let hh = TIME_H.with(|c| c.get());
                 let mm = TIME_M.with(|c| c.get());
                 set_field(page, slot, &format!("{hh:02}:{mm:02}"));
-                flash("时间已选择 · 点底部「同步」生效");
+                flash("时间已选择 · 点底部「保存并应用」生效");
             }
             TIME_PICK.with(|c| c.set(None));
             invalidate(hwnd);
@@ -2182,7 +2182,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if code == EN_SETFOCUS_CODE {
                 invalidate(hwnd);
             } else if code == EN_KILLFOCUS_CODE {
-                // 失焦不再自动保存/生效：所有修改统一由底部「同步」按钮提交
+                // 失焦不再自动保存/生效：所有修改统一由底部「保存并应用」按钮提交
                 invalidate(hwnd);
             }
             LRESULT(0)

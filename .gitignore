@@ -10,3 +10,6 @@ Cargo.lock.orig
 # 编译产物与历史归档（不进版本库）
 /winisland.exe
 /winisland-git-history.zip
+
+# macOS
+.DS_Store
