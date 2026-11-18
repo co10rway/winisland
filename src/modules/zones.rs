@@ -19,7 +19,7 @@ use windows::core::{s, w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 分区窗口类名（顶层子窗，随主窗线程的消息循环一起分发）
@@ -30,8 +30,6 @@ const RENAME_CLASS: PCWSTR = w!("WinIslandRename");
 const RADIUS: i32 = 12;
 /// 命中边界厚度（四边/四角的缩放手柄宽度）
 const EDGE: i32 = 6;
-/// 顶部标题区高度（在此区域内可拖动整块分区）
-const GRAB_H: i32 = 22;
 
 thread_local! {
     /// 与 config.zones 对齐的活窗口：None = 该分区当前无窗口（隐藏 / 未启用）
@@ -44,6 +42,27 @@ thread_local! {
     static RENAME_IDX: Cell<Option<usize>> = const { Cell::new(None) };
     /// 是否处于「编辑分区」模式（分区上浮到图标之上、可拖动/缩放/右键）
     static EDITING: Cell<bool> = const { Cell::new(false) };
+    /// 自绘拖动/缩放状态
+    static DRAG: RefCell<Option<DragState>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DragMode {
+    Move,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+struct DragState {
+    mode: DragMode,
+    start_screen: POINT,
+    start_rect: RECT, // 屏幕坐标
 }
 
 // ── 丙烯酸毛玻璃：动态调用 user32!SetWindowCompositionAttribute（Win10 1803+ 可用） ──
@@ -193,17 +212,23 @@ fn register_rename_class() {
     REN_CLASSED.with(|c| c.set(true));
 }
 
-/// 创建/摆放一个分区窗口。挂在桌面层之下，套丙烯酸毛玻璃。
+/// 创建/摆放一个分区窗口。作为桌面层的**真子窗口**（WS_CHILD），
+/// 这样它和图标宿主 def 是兄弟，z 序可被精确比较——平时沉到 def 之下，编辑时浮到其上。
+/// 若用 WS_POPUP，parent 参数只是 owner，owned popup 永远在 owner 的子窗口之上，
+/// 无法沉到图标之下（这正是「拖入显示禁止 / 拦截桌面拖放」的根因）。
 fn create_zone(layer: HWND, z: &crate::config::ZoneConf, idx: usize, parent_visible: bool) -> Option<HWND> {
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap();
+        // config 存屏幕坐标；WS_CHILD 坐标相对父窗口客户区，需转换
+        let mut pos = POINT { x: z.x, y: z.y };
+        let _ = ScreenToClient(layer, &mut pos);
         let hw = match CreateWindowExW(
-            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            WS_EX_NOACTIVATE,
             CLASS,
             w!(""),
-            WS_POPUP,
-            z.x,
-            z.y,
+            WS_CHILD | WS_VISIBLE,
+            pos.x,
+            pos.y,
             z.w.max(96),
             z.h.max(64),
             Some(layer),
@@ -265,11 +290,13 @@ pub fn sync() {
             match v[i] {
                 Some(hw) if z.visible => {
                     unsafe {
+                        let mut pos = POINT { x: z.x, y: z.y };
+                        let _ = ScreenToClient(layer, &mut pos);
                         let _ = SetWindowPos(
                             hw,
                             None,
-                            z.x,
-                            z.y,
+                            pos.x,
+                            pos.y,
                             z.w.max(96),
                             z.h.max(64),
                             SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
@@ -289,20 +316,19 @@ pub fn sync() {
         }
     });
 
-    // 层序：编辑模式把每个分区顶到最上（浮到图标之上、可交互）；
-    // 平时把图标宿主顶到最上（分区沉到图标之下，图标清晰可点、可拖放、不干扰）。
+    // 层序：zone 与 def 同为 layer 的子窗口（兄弟），z 序可精确比较。
+    // 编辑模式把每个分区顶到最上（浮到图标之上、可交互）；
+    // 平时把每个分区沉到最底（在图标宿主之下：壁纸透出、图标清晰可点、拖放不干扰）。
+    let _ = def;
     unsafe {
-        if editing {
-            WIN.with(|ws| {
-                if let Ok(v) = ws.try_borrow() {
-                    for hw in v.iter().flatten() {
-                        let _ = SetWindowPos(*hw, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                    }
+        WIN.with(|ws| {
+            if let Ok(v) = ws.try_borrow() {
+                let anchor = if editing { HWND_TOP } else { HWND_BOTTOM };
+                for hw in v.iter().flatten() {
+                    let _ = SetWindowPos(*hw, Some(anchor), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
-            });
-        } else {
-            let _ = SetWindowPos(def, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        }
+            }
+        });
     }
     // 层序变化后重绘
     WIN.with(|ws| {
@@ -418,50 +444,33 @@ pub fn shutdown() {
 
 // ── 命中测试：决定分区上每个点的角色（拖动 / 缩放 / 穿透） ──
 
-/// 把屏幕坐标转成 lParam 形式（WM_NCHITTEST 用）
-fn hit_test(hwnd: HWND, screen_pt: POINT, w: i32, h: i32) -> i32 {
-    // 屏幕坐标 → 客户区坐标
+/// 判断鼠标落在分区的哪个部位：四角/四边缩放，其余整块移动（自绘，不依赖系统 hit）。
+fn hit_mode(hwnd: HWND, screen_pt: POINT, w: i32, h: i32) -> DragMode {
     let mut pt = screen_pt;
     unsafe { let _ = ScreenToClient(hwnd, &mut pt); }
-    let x = pt.x;
-    let y = pt.y;
+    let (x, y) = (pt.x, pt.y);
 
     let left = x <= EDGE;
     let right = x >= w - 1 - EDGE;
     let top = y <= EDGE;
     let bottom = y >= h - 1 - EDGE;
 
-    // 四角优先
-    if left && top {
-        return HTTOPLEFT as i32;
-    }
-    if right && top {
-        return HTTOPRIGHT as i32;
-    }
-    if left && bottom {
-        return HTBOTTOMLEFT as i32;
-    }
-    if right && bottom {
-        return HTBOTTOMRIGHT as i32;
-    }
-    if left {
-        return HTLEFT as i32;
-    }
-    if right {
-        return HTRIGHT as i32;
-    }
-    if top {
-        return HTTOP as i32;
-    }
-    if bottom {
-        return HTBOTTOM as i32;
-    }
-    // 顶部标题区：拖动整块分区
-    if y < GRAB_H {
-        return HTCAPTION as i32;
-    }
-    // 编辑模式下内部也算可交互（好让右键菜单在任意处生效）
-    HTCLIENT as i32
+    if left && top { DragMode::TopLeft }
+    else if right && top { DragMode::TopRight }
+    else if left && bottom { DragMode::BottomLeft }
+    else if right && bottom { DragMode::BottomRight }
+    else if left { DragMode::Left }
+    else if right { DragMode::Right }
+    else if top { DragMode::Top }
+    else if bottom { DragMode::Bottom }
+    else { DragMode::Move }
+}
+
+/// 客户区尺寸
+fn client_size(hwnd: HWND) -> (i32, i32) {
+    let mut rc = RECT::default();
+    unsafe { let _ = GetClientRect(hwnd, &mut rc); }
+    (rc.right - rc.left, rc.bottom - rc.top)
 }
 
 /// 交接 WM_MOVING / WM_SIZING 结束（拖动或缩放完成）后，把窗口几何写回 config 并落盘。
@@ -528,8 +537,12 @@ fn popup_menu(hwnd: HWND, idx: usize) {
 
         let mut pos = POINT::default();
         let _ = GetCursorPos(&mut pos);
-        // 关键：右键菜单要求窗口为前台，否则可能一闪即逝 / 不响应
-        let _ = SetForegroundWindow(hwnd);
+        // 关键：TrackPopupMenu 要求调用线程的前台窗口属于本线程。
+        // 分区是 WS_CHILD，不能设为前台，改设其根祖先（桌面层所在的顶层窗）。
+        let root = GetAncestor(hwnd, GA_ROOT);
+        if !root.0.is_null() {
+            let _ = SetForegroundWindow(root);
+        }
         let _ = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_RIGHTBUTTON, pos.x, pos.y, Some(0), hwnd, None);
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(cm);
@@ -698,36 +711,103 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_ERASEBKGND => LRESULT(1), // 由 WM_PAINT 全量重绘，避免闪烁
         WM_NCHITTEST => {
-            let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-            if idx < 0 {
-                return LRESULT(HTNOWHERE as isize);
+            // 编辑模式：整块作为客户区接收鼠标（自绘拖动/缩放/右键）；
+            // 平时：分区沉在图标之下返回穿透，进一步确保不拦截任何桌面交互。
+            if EDITING.with(|c| c.get()) {
+                LRESULT(HTCLIENT as isize)
+            } else {
+                LRESULT(HTTRANSPARENT as isize)
             }
-            // 非编辑模式：整块分区不接收鼠标（它在图标之下，本就碰不到；返回穿透更保险）
-            if !EDITING.with(|c| c.get()) {
-                return LRESULT(HTTRANSPARENT as isize);
-            }
-            let (w, h) = unsafe {
-                let mut rc = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rc);
-                (rc.right - rc.left, rc.bottom - rc.top)
-            };
-            // WM_NCHITTEST 的 lParam 高位/低位是屏幕坐标
-            let sx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
-            let sy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
-            let ht = hit_test(hwnd, POINT { x: sx, y: sy }, w, h);
-            LRESULT(ht as isize)
         }
-        WM_MOVING | WM_SIZING => {
-            // 拖动 / 缩放中：先用默认行为移动窗口，结束时再落盘
+        WM_SETCURSOR => {
+            if EDITING.with(|c| c.get()) {
+                let (w, h) = client_size(hwnd);
+                let mut sp = POINT::default();
+                let _ = GetCursorPos(&mut sp);
+                let mode = hit_mode(hwnd, sp, w, h);
+                let idc = match mode {
+                    DragMode::Left | DragMode::Right => IDC_SIZEWE,
+                    DragMode::Top | DragMode::Bottom => IDC_SIZENS,
+                    DragMode::TopLeft | DragMode::BottomRight => IDC_SIZENWSE,
+                    DragMode::TopRight | DragMode::BottomLeft => IDC_SIZENESW,
+                    _ => IDC_SIZEALL,
+                };
+                if let Ok(cur) = LoadCursorW(None, idc) {
+                    let _ = SetCursor(Some(cur));
+                    return LRESULT(1);
+                }
+            }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
-        WM_EXITSIZEMOVE => {
-            commit_rect(hwnd);
-            LRESULT(0)
+        WM_LBUTTONDOWN => {
+            if EDITING.with(|c| c.get()) {
+                let (w, h) = client_size(hwnd);
+                let cx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
+                let cy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
+                let mut sp = POINT { x: cx, y: cy };
+                let _ = ClientToScreen(hwnd, &mut sp);
+                let mode = hit_mode(hwnd, sp, w, h);
+                let mut rc = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut rc);
+                DRAG.with(|d| {
+                    *d.borrow_mut() = Some(DragState { mode, start_screen: sp, start_rect: rc });
+                });
+                let _ = SetCapture(hwnd);
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_MOUSEMOVE => {
+            if EDITING.with(|c| c.get()) && DRAG.with(|d| d.borrow().is_some()) {
+                let cx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
+                let cy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
+                let mut sp = POINT { x: cx, y: cy };
+                let _ = ClientToScreen(hwnd, &mut sp);
+                let (st, sr, mode) = DRAG.with(|d| {
+                    let b = d.borrow();
+                    let s = b.as_ref().unwrap();
+                    (s.start_screen, s.start_rect, s.mode)
+                });
+                let dx = sp.x - st.x;
+                let dy = sp.y - st.y;
+                let (mut l, mut t, mut r, mut b) = (sr.left, sr.top, sr.right, sr.bottom);
+                let (minw, minh) = (120, 80);
+                match mode {
+                    DragMode::Move => { l += dx; t += dy; r += dx; b += dy; }
+                    DragMode::Left => { l += dx; if l > r - minw { l = r - minw; } }
+                    DragMode::Right => { r += dx; if r < l + minw { r = l + minw; } }
+                    DragMode::Top => { t += dy; if t > b - minh { t = b - minh; } }
+                    DragMode::Bottom => { b += dy; if b < t + minh { b = t + minh; } }
+                    DragMode::TopLeft => { l += dx; t += dy; if l > r - minw { l = r - minw; } if t > b - minh { t = b - minh; } }
+                    DragMode::TopRight => { r += dx; t += dy; if r < l + minw { r = l + minw; } if t > b - minh { t = b - minh; } }
+                    DragMode::BottomLeft => { l += dx; b += dy; if l > r - minw { l = r - minw; } if b < t + minh { b = t + minh; } }
+                    DragMode::BottomRight => { r += dx; b += dy; if r < l + minw { r = l + minw; } if b < t + minh { b = t + minh; } }
+                }
+                // 新矩形是屏幕坐标，转换为父窗口（layer）客户区坐标后 MoveWindow
+                let parent = unsafe { GetParent(hwnd).unwrap_or_default() };
+                let mut pt = POINT { x: l, y: t };
+                if !parent.0.is_null() {
+                    unsafe { let _ = ScreenToClient(parent, &mut pt); }
+                }
+                unsafe {
+                    let _ = MoveWindow(hwnd, pt.x, pt.y, r - l, b - t, false);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                }
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_LBUTTONUP => {
+            if DRAG.with(|d| d.borrow().is_some()) {
+                let _ = unsafe { ReleaseCapture() };
+                DRAG.with(|d| *d.borrow_mut() = None);
+                commit_rect(hwnd);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_CONTEXTMENU => {
             let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-            if idx >= 0 {
+            if idx >= 0 && EDITING.with(|c| c.get()) {
                 popup_menu(hwnd, idx as usize);
             }
             LRESULT(0)
