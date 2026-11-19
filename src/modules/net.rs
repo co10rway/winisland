@@ -26,6 +26,28 @@ pub fn https_req(
     headers: &[(&str, String)],
     body: Option<&str>,
 ) -> Option<(u16, String)> {
+    let (code, buf) = https_bytes(host, path, method, headers, body)?;
+    Some((code, String::from_utf8_lossy(&buf).to_string()))
+}
+
+/// GET https://{host}{path}，返回原始响应体字节（通过 UTF-8 无损转换不了的
+/// 编码——如行情接口的 GBK——时用这个再自己做解码）。
+pub fn https_get_bytes(host: &str, path: &str) -> Option<Vec<u8>> {
+    let (code, body) = https_bytes(host, path, "GET", &[], None)?;
+    if code != 200 {
+        return None;
+    }
+    Some(body)
+}
+
+/// HTTPS 请求主实现，返回原始响应体字节（调用方自行决定怎么解码）
+fn https_bytes(
+    host: &str,
+    path: &str,
+    method: &str,
+    headers: &[(&str, String)],
+    body: Option<&str>,
+) -> Option<(u16, Vec<u8>)> {
     use rustls::pki_types::ServerName;
 
     let tcp = std::net::TcpStream::connect((host, 443u16)).ok()?;
@@ -81,10 +103,10 @@ pub fn https_req(
             Err(_) => break, // 服务器直接断开时也能拿到已收到的部分
         }
     }
-    parse_response(&buf)
+    parse_response_bytes(&buf)
 }
 
-fn parse_response(buf: &[u8]) -> Option<(u16, String)> {
+fn parse_response_bytes(buf: &[u8]) -> Option<(u16, Vec<u8>)> {
     // 找响应头结束标记 \r\n\r\n
     let sep = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head = String::from_utf8_lossy(&buf[..sep]).to_string();
@@ -105,7 +127,7 @@ fn parse_response(buf: &[u8]) -> Option<(u16, String)> {
     } else {
         body.to_vec()
     };
-    Some((code, String::from_utf8_lossy(&body).to_string()))
+    Some((code, body))
 }
 
 /// 解析 chunked 编码（jsdelivr 常见）

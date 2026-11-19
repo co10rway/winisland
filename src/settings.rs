@@ -78,7 +78,7 @@ const NAV_ON: u32 = 0x1E1E27;
 // ───────────────────────── 导航表 ─────────────────────────
 // (页码, 分组, 导航文字) —— 页码与配置页一一对应，不随展示顺序变化
 const GROUPS: [&str; 4] = ["外观", "效率", "关怀", "其他"];
-const NAV: [(usize, usize, &str); 12] = [
+const NAV: [(usize, usize, &str); 13] = [
     (0, 0, "通用"),
     (11, 0, "面板页面"),
     (2, 1, "打工鼓励器"),
@@ -88,6 +88,7 @@ const NAV: [(usize, usize, &str); 12] = [
     (6, 1, "剪贴板中转"),
     (7, 1, "桌面分区"),
     (9, 1, "灵动图标"),
+    (12, 1, "盯盘助手"),
     (1, 2, "健康提醒"),
     (8, 2, "邮箱验证码"),
     (10, 3, "关于"),
@@ -455,6 +456,17 @@ fn pages() -> Vec<Page> {
         },
         // 11 面板页面
         panel_page(),
+        // 12 盯盘助手
+        Page {
+            title: "盯盘助手",
+            desc: "自选实时行情 · 今日盈亏 · 涨跌提醒",
+            rows: vec![
+                Row::toggle(0, "启用盯盘助手", "面板「盯盘助手」页实时显示自选行情与今日盈亏"),
+                Row::field(1, "刷新间隔", "每隔多少秒拉一次行情，最小 5", 108.0).suffix("秒").int(),
+                Row::field(2, "涨跌提醒", "自选涨跌幅超过该百分比时提醒，填 0 关闭", 96.0).suffix("%"),
+                Row::note("自选与持仓在面板「盯盘助手」页点「＋ 编辑自选持仓」配置。每行一条：代码 名称 成本价 数量（计入今日盈亏）或 代码（仅自选）。代码支持沪 60/68、深 00/30、北 4/8/92。红涨绿跌，费用本地展示，不下单。"),
+            ],
+        },
     ]
 }
 
@@ -591,6 +603,7 @@ fn module_enabled(page: usize) -> bool {
         7 => cfg.modules.zones,
         8 => cfg.modules.mailcode,
         9 => cfg.modules.typing,
+        12 => cfg.modules.stock,
         _ => true,
     })
 }
@@ -598,6 +611,7 @@ fn module_enabled(page: usize) -> bool {
 fn page_on(page: usize) -> bool {
     match page {
         1..=8 => module_enabled(page),
+        12 => module_enabled(12),
         // 图标页含「样式 / 声音」等与打字开关无关的通用配置，始终常亮
         _ => true,
     }
@@ -614,6 +628,7 @@ fn set_module_enabled(page: usize, on: bool) {
         7 => cfg.modules.zones = on,
         8 => cfg.modules.mailcode = on,
         9 => cfg.modules.typing = on,
+        12 => cfg.modules.stock = on,
         _ => {}
     });
     crate::app::save_now();
@@ -829,6 +844,20 @@ fn apply_page(page: usize) {
                 }
             });
         }
+        12 => {
+            if let Some(v) = field_text(12, 1).trim().parse::<u32>().ok() {
+                crate::app::with_cfg(|c| c.stock.refresh_secs = v.clamp(5, 600));
+            }
+            let prev = crate::app::with_cfg(|c| c.stock.alert_pct);
+            if let Some(v) = field_text(12, 2).trim().parse::<f64>().ok() {
+                let v = v.clamp(0.0, 100.0);
+                crate::app::with_cfg(|c| c.stock.alert_pct = v);
+                // 阈值变化时清空当天已提醒记录，新阈值立即对已超标股票生效
+                if (v - prev).abs() > 1e-9 {
+                    crate::modules::stock::reset_alerts();
+                }
+            }
+        }
         _ => {}
     }
     crate::app::save_now();
@@ -870,6 +899,8 @@ fn sync_page(page: usize) {
             (8, 4) => c.mail.password.clone(),
             (8, 5) => c.mail.folder.clone(),
             (8, 6) => c.mail.poll_seconds.to_string(),
+            (12, 1) => c.stock.refresh_secs.to_string(),
+            (12, 2) => fmt_num(c.stock.alert_pct),
             _ => String::new(),
         });
         set_field(page, r.slot, &v);
@@ -898,7 +929,7 @@ fn parse_hhmm(s: &str) -> Option<(u32, u32)> {
 }
 
 fn sync_all() {
-    for i in 0..12 {
+    for i in 0..13 {
         sync_page(i);
     }
 }
@@ -1122,7 +1153,7 @@ fn draw_sidebar(cv: &mut Canvas, h: f32, page: usize, hover: HitId, hits: &mut V
             cv.text1(item_x + s(16.0), y, item_w - s(44.0), item_h, label, 12.0, w, c, 1.0);
 
             // 模块状态点：实心 = 开，空心 = 关
-            if (1..=9).contains(p) {
+            if (1..=9).contains(p) || *p == 12 {
                 let dx = item_x + item_w - s(14.0);
                 let dy = y + item_h / 2.0;
                 if module_enabled(*p) {

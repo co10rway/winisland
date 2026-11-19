@@ -1,6 +1,6 @@
 [package]
 name = "winisland"
-version = "0.14.3"
+version = "0.15.0"
 edition = "2021"
 description = "Windows 灵动岛 — 单一原生 exe、零运行时依赖的桌面灵动岛"
 license = "MIT"
@@ -47,6 +47,9 @@ windows-numerics = "0.3"
 # 邮箱验证码（IMAPS），静态编译进 exe，无外部依赖
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "0.26"
+
+# 盯盘助手：A 股行情接口返回 GBK 编码，需转 UTF-8（纯 Rust，静态编译，仍为单一 exe）
+encoding_rs = "0.8"
 
 [profile.release]
 lto = true

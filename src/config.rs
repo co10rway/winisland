@@ -16,6 +16,8 @@ pub struct Modules {
     pub filehub: bool,
     pub zones: bool,
     pub mailcode: bool,
+    /// 盯盘助手：自选实时行情 / 涨跌提醒 / 今日盈亏
+    pub stock: bool,
 }
 
 impl Default for Modules {
@@ -31,6 +33,7 @@ impl Default for Modules {
             filehub: true,
             zones: true,
             mailcode: false, // 需要用户自行配置 IMAP 后开启
+            stock: true,     // 无自选时仅显示引导，不联网；配好自选后自动轮询
         }
     }
 }
@@ -45,6 +48,7 @@ impl Modules {
             "clips" => self.clipboard,
             "health" => self.health,
             "salary" => self.salary,
+            "watch" => self.stock,
             _ => true, // overview
         }
     }
@@ -160,11 +164,40 @@ impl Default for Mail {
     }
 }
 
+// ───────── 盯盘助手 ─────────
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct Stock {
+    /// 拉取实时行情的间隔（秒）
+    pub refresh_secs: u32,
+    /// 涨跌提醒阈值（百分比绝对值）；0 = 不提醒
+    pub alert_pct: f64,
+    /// 交易时段外是否仍持续轮询（默认只在交易时段拉取，省流量）
+    pub off_hours: bool,
+}
+
+impl Default for Stock {
+    fn default() -> Self {
+        Stock {
+            refresh_secs: 10,
+            alert_pct: 0.0,
+            off_hours: false,
+        }
+    }
+}
+
+/// 盯盘数据文件（%APPDATA%\WinIsland\watchlist.txt）的路径。
+/// 每行一条：`代码 名称 成本价 数量`；名称可留空自动获取，成本价+数量>0 计入今日盈亏。
+pub fn watchlist_path() -> PathBuf {
+    data_dir().join("watchlist.txt")
+}
+
 // ───────── 面板轮播页 ─────────
 
 /// 面板可轮播页面的固定清单（id, 展示名）。顺序即默认轮播顺序。
 /// id 一旦发布不可改（用户配置里存的是 id）。
-pub const PANEL_KINDS: [(&str, &str); 7] = [
+pub const PANEL_KINDS: [(&str, &str); 8] = [
     ("overview", "今日概览"),
     ("schedule", "日程安排"),
     ("todo", "待办清单"),
@@ -172,6 +205,7 @@ pub const PANEL_KINDS: [(&str, &str); 7] = [
     ("clips", "剪贴板中转"),
     ("health", "健康提醒"),
     ("salary", "打工鼓励器"),
+    ("watch", "盯盘助手"),
 ];
 
 /// id -> 展示名（未知 id 返回 "其他"）
@@ -240,6 +274,7 @@ pub struct Config {
     pub salary: Salary,
     pub health: Health,
     pub mail: Mail,
+    pub stock: Stock,
     pub autostart: bool,
     /// 桌面分区：是否随系统启动自动显示
     pub zones_autostart: bool,
@@ -385,6 +420,7 @@ impl Default for Config {
             salary: Salary::default(),
             health: Health::default(),
             mail: Mail::default(),
+            stock: Stock::default(),
             autostart: false,
             zones_autostart: true,
             zones: Vec::new(),

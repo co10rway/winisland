@@ -44,6 +44,8 @@ pub enum ToastKind {
     Sedentary,
     /// 日程临近
     Schedule,
+    /// 盯盘助手：自选涨跌幅触发提醒
+    Stock,
 }
 
 impl ToastKind {
@@ -53,6 +55,7 @@ impl ToastKind {
             ToastKind::Water => "喝好了",
             ToastKind::Sedentary => "起来走走",
             ToastKind::Schedule => "知道了",
+            ToastKind::Stock => "知道了",
         }
     }
 }
@@ -423,6 +426,7 @@ pub fn run() {
         audio::spawn(); // 系统音量峰值采样（独立线程，只取 0..1 标量）
         workday::init(&cfg.salary); // 读本地节假日缓存，必要时后台联网同步
         crate::modules::sched_ics::init(); // 外部日历（ICS 订阅）缓存
+        crate::modules::stock::spawn(); // 盯盘助手：后台拉取自选行情
 
         let st = clock::local_time();
         let mut store = Store::load();
@@ -1506,6 +1510,7 @@ fn ack_reminder(app: &mut App) {
             app.sed_ack_idle = now_idle_secs();
         }
         ToastKind::Schedule => {}
+        ToastKind::Stock => {}
     }
     app.leave_at = None;
     app.apply_vis();
@@ -1595,6 +1600,16 @@ fn tick_second() {
                 }
             }
         }
+
+        // 盯盘助手：行情刷新 → 重绘当前页；某只涨跌幅超过阈值 → 弹一次提醒（当天不重复）
+        if app.cfg.modules.stock && crate::modules::stock::take_dirty() {
+            app.dirty = true;
+            if app.reminder.is_none() && app.cfg.stock.alert_pct > 0.0 {
+                if let Some(msg) = crate::modules::stock::next_alert(app.cfg.stock.alert_pct) {
+                    raise_reminder(app, ToastKind::Stock, msg);
+                }
+            }
+        }
         // 提醒不做自动过期：必须用户点确认按钮才消失（见 click / HitId::ReminderAck）
         // 定时保存
         if app.dirty && app.last_save.elapsed() > Duration::from_secs(2) {
@@ -1646,6 +1661,17 @@ fn click(h: &HitId) {
         let res = crate::modules::todo_add::prompt();
         if let crate::modules::todo_add::Result2::Confirm(txt) = &res {
             push_todo(txt);
+            crate::app::redraw();
+        }
+        return;
+    }
+
+    // 「编辑自选持仓」同样在 APP 借用之外处理：模态对话框的消息循环会再次触达
+    // 主窗口事件，若此刻还持有 APP 借用会重入冲突。
+    if let HitId::WatchEdit = h {
+        if let Some(items) = crate::modules::watch_edit::edit() {
+            crate::modules::stock::save_items(&items);
+            crate::modules::stock::reset_alerts();
             crate::app::redraw();
         }
         return;
@@ -1715,6 +1741,8 @@ fn click(h: &HitId) {
             }
             // 已在 click 开头单独处理（模态对话框需在 APP 借用之外运行）
             HitId::TodoAdd => {} 
+            // 同上：编辑自选持仓的模态对话框也在此借用之外处理
+            HitId::WatchEdit => {}
             HitId::TodoDel(i) => {
                 // 二次确认删除：第一次点 → 该行进入「确认删除」态；再点同一行才真删。
                 // 防止悬停 × 误触直接丢数据。

@@ -44,6 +44,8 @@ const UNIT: u32 = 0xC2C2CC;
 
 const GREEN: u32 = 0x4ADE80;
 const ORANGE: u32 = 0xF5A623;
+/// A 股行情红涨绿跌：涨用红的醒目值（与 GREEN 相对）
+const RED: u32 = 0xF4554F;
 
 #[derive(Clone, PartialEq)]
 pub enum HitId {
@@ -54,6 +56,8 @@ pub enum HitId {
     Collapse,
     /// 待办页「＋ 新增待办」按钮
     TodoAdd,
+    /// 盯盘助手页「＋ 编辑自选持仓」按钮（弹程序内编辑窗口）
+    WatchEdit,
     /// 待办行「完成/未完成」切换（点击整行）
     TodoToggle(usize),
     /// 待办行尾「×」删除按钮（悬停显示）
@@ -116,13 +120,18 @@ pub fn panel_scroll_max(app: &App, kind: &str) -> f32 {
         "todo" => app.store.todos.len(),
         "files" => app.store.files.len(),
         "clips" => app.store.clips.len(),
+        "watch" => crate::modules::stock::read_items().len(),
         _ => 0,
     };
     if n == 0 {
         return 0.0;
     }
-    // 待办页顶部多一块「+ 新增待办」固定按钮区，列表从其下开始
-    let top_offset = if kind == "todo" { s(TODO_ADD_H) + s(6.0) } else { 0.0 };
+    // 待办页顶部多一块「+ 新增待办」固定按钮区；盯盘页顶部有「+ 编辑自选持仓」按钮 + 盈亏卡
+    let top_offset = match kind {
+        "todo" => s(TODO_ADD_H) + s(6.0),
+        "watch" => s(TODO_ADD_H) + s(6.0) + s(WATCH_CARD_H) + s(4.0),
+        _ => 0.0,
+    };
     let content_end = s(BODY_TOP) + top_offset + n as f32 * row + s(4.0);
     (content_end - body_clip_bottom()).max(0.0)
 }
@@ -273,6 +282,22 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
                     cv.rrect(btn_x, by, bw, s(24.0), s(12.0), ROW2, alpha);
                     cv.rrect_stroke(btn_x + 0.5, by + 0.5, bw - 1.0, s(23.0), s(12.0), BORDER, alpha * 0.8, 1.0);
                     cv.text_c(btn_x, by, bw, s(24.0), "知道了", 11.0, W_MED, TXT, alpha);
+                    push_hit(hits, HitId::ReminderAck, btn_x, by, bw, s(24.0));
+                    return;
+                }
+                // 盯盘涨跌提醒：红色圆点 + 精简文案 + 确认按钮
+                crate::app::ToastKind::Stock => {
+                    let msg = if t.msg.is_empty() { "盯盘提醒".to_string() } else { t.msg.clone() };
+                    let disp = ellipsize(&msg, 13.0, pw - 150.0);
+                    let bx = x + 22.0;
+                    cv.circle(bx, y + ph / 2.0, s(6.0), RED, alpha);
+                    cv.text_ex(bx + 12.0, y, pw - 140.0, ph, &disp, 13.0, W_SEMI, TXT, alpha, 0, 1);
+                    let bw = s(58.0);
+                    let btn_x = x + pw - bw - 16.0;
+                    let by = y + ph / 2.0 - s(12.0);
+                    cv.rrect(btn_x, by, bw, s(24.0), s(12.0), ROW2, alpha);
+                    cv.rrect_stroke(btn_x + 0.5, by + 0.5, bw - 1.0, s(23.0), s(12.0), RED, alpha * 0.8, 1.0);
+                    cv.text_c(btn_x, by, bw, s(24.0), "知道了", 11.0, W_MED, RED, alpha);
                     push_hit(hits, HitId::ReminderAck, btn_x, by, bw, s(24.0));
                     return;
                 }
@@ -585,6 +610,7 @@ pub fn pill_mode_key(app: &App) -> u32 {
             crate::app::ToastKind::Water => 1,
             crate::app::ToastKind::Sedentary => 2,
             crate::app::ToastKind::Schedule => 4,
+            crate::app::ToastKind::Stock => 6,
         };
     }
     if let Some(until) = app.code_until {
@@ -601,6 +627,8 @@ const HEADER_H: f32 = 48.0;
 const BODY_TOP: f32 = 76.0;
 /// 待办页「＋ 新增待办」按钮区高度（固定在标题下，列表从其下方滚动）
 const TODO_ADD_H: f32 = 32.0;
+/// 盯盘页「＋ 编辑自选持仓」按钮复用同一高度
+const WATCH_CARD_H: f32 = 58.0;
 
 /// 依据配置推导实际参与轮播的页面（顺序即展示顺序；模块关闭时自动跳过）
 pub fn effective_pages(cfg: &crate::config::Config) -> Vec<&'static str> {
@@ -743,6 +771,13 @@ fn draw_reminder_bar(
                 r.msg.clone()
             }
         }
+        ToastKind::Stock => {
+            if r.msg.is_empty() {
+                "盯盘提醒".to_string()
+            } else {
+                r.msg.clone()
+            }
+        }
     };
 
     let bw = s(78.0);
@@ -772,6 +807,7 @@ fn draw_page(app: &App, cv: &mut Canvas, kind: &str, w: f32, alpha: f32, hits: &
         "clips" => page_clips(app, cv, w, alpha, hits),
         "health" => page_health(app, cv, w, alpha, hits),
         "salary" => page_salary(app, cv, w, alpha),
+        "watch" => page_watch(app, cv, w, alpha, hits),
         _ => page_overview(app, cv, w, alpha, hits),
     }
 }
@@ -1243,6 +1279,105 @@ fn page_salary(app: &App, cv: &mut Canvas, w: f32, alpha: f32) {
     cv.text1(pad + s(14.0), y2 + s(8.0), iw - s(28.0), s(16.0), &label, 10.5, W_MED, TXT, alpha);
     let ratio = if total > 0 { worked as f32 / total as f32 } else { 0.0 };
     cv.progress(pad + s(14.0), y2 + s(28.0), iw - s(28.0), s(5.0), ratio, GREEN, ROW2);
+}
+
+// ---- 8 盯盘助手（A 股红涨绿跌）----
+
+fn page_watch(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>) {
+    let pad = s(18.0);
+    let iw = w - pad * 2.0;
+    let quotes = crate::modules::stock::snapshot();
+    let items = crate::modules::stock::read_items();
+
+    let holding: Vec<&crate::modules::stock::Item> =
+        items.iter().filter(|i| i.qty > 0.0).collect();
+    draw_label(
+        app,
+        cv,
+        w,
+        crate::config::panel_name("watch"),
+        Some(format!("{} 只持仓", holding.len())),
+        alpha,
+    );
+
+    // ── 「＋ 编辑自选持仓」固定按钮（置于标题下，始终可见；样式同待办「＋ 新增待办」）──
+    let ay = s(BODY_TOP);
+    let ah = s(TODO_ADD_H);
+    let ahp = app.anims.hover_p(&HitId::WatchEdit);
+    cv.rrect(pad, ay, iw, ah, s(9.0), mix(0x1E1E25, crate::theme::main(), ahp * 0.5), alpha * (0.85 + 0.15 * ahp));
+    cv.rrect_stroke(pad, ay, iw, ah, s(9.0), crate::theme::main(), alpha * (0.5 + 0.5 * ahp), s(1.0));
+    cv.text1(pad, ay, iw, ah, "＋ 编辑自选持仓", 12.0, W_SEMI, mix(TXT2, crate::theme::tint(), ahp), alpha);
+    push_hit(hits, HitId::WatchEdit, pad, ay, iw, ah);
+
+    if items.is_empty() {
+        // 空状态引导：放在按钮下方，避免盖住按钮
+        let hy = s(BODY_TOP) + s(TODO_ADD_H) + s(6.0);
+        cv.text_ex(pad, hy, iw, s(24.0), "暂无自选，点上方「＋ 编辑自选持仓」添加第一条", 10.5, W_NORMAL, TXT3, alpha, 1, 1);
+        cv.text_ex(pad, hy + s(24.0), iw, s(18.0), "每行一条：代码 名称 成本价 数量（可只填代码）· 红涨绿跌", 8.5, W_NORMAL, TXT3, alpha, 1, 1);
+        return;
+    }
+
+    // ── 顶部盈亏卡 ──
+    let y = s(BODY_TOP) + s(TODO_ADD_H) + s(6.0);
+    let ch = s(WATCH_CARD_H);
+    cv.rrect(pad, y, iw, ch, s(12.0), ROW, alpha);
+    if !holding.is_empty() {
+        let pnl = crate::modules::stock::today_pnl(&quotes, &items);
+        let fc = pnl_color(pnl);
+        cv.text1(pad + s(14.0), y + s(9.0), iw - s(70.0), s(14.0), "今日盈亏", 9.5, W_NORMAL, TXT2, alpha);
+        cv.text1(pad + s(14.0), y + s(23.0), iw - s(70.0), s(29.0), &format!("¥{:+.2}", pnl), 20.0, W_BOLD, fc, alpha);
+        let fp = crate::modules::stock::float_pnl(&quotes, &items);
+        cv.text_ex(pad, y + s(7.0), iw - s(14.0), s(13.0), &format!("持仓浮盈 {:+.2}", fp), 8.5, W_NORMAL, pnl_color(fp), alpha, 2, 1);
+        cv.text_ex(pad, y + s(21.0), iw - s(14.0), s(13.0), &format!("{} 只持仓 · 交易时段自动刷新", holding.len()), 8.5, W_NORMAL, TXT3, alpha, 2, 1);
+    } else {
+        cv.text1(pad + s(14.0), y + s(10.0), iw - s(28.0), s(14.0), "今日盈亏", 9.5, W_NORMAL, TXT2, alpha);
+        cv.text1(pad + s(14.0), y + s(25.0), iw - s(28.0), s(26.0), "暂无持仓 · 仅监控自选", 15.0, W_SEMI, TXT, alpha);
+        cv.text_ex(pad, y + s(20.0), iw - s(14.0), s(14.0), "给条目填成本价与数量即可计入盈亏，点上方按钮编辑", 8.5, W_NORMAL, TXT3, alpha, 2, 1);
+    }
+
+    // ── 行情列表（可滚动）──
+    let list_top = y + ch + s(4.0);
+    let row_h = s(27.0);
+    let sc = app.panel_scroll.min(panel_scroll_max(app, "watch"));
+    let mut yy = list_top - sc;
+    cv.push_clip(0.0, list_top - s(2.0), w, (body_clip_bottom() - list_top + s(2.0)).max(0.0));
+
+    for it in &items {
+        let q = crate::modules::stock::quote_for(&quotes, &it.code);
+        // 名称：优先用户填写，缺省用接口名称
+        let nm = if it.name.is_empty() { q.map(|x| x.name.as_str()).unwrap_or("") } else { it.name.as_str() };
+        cv.text1(pad, yy, iw * 0.52, row_h, &format!("{} {}", nm, it.code), 11.0, W_MED, TXT, alpha);
+        // 现价
+        let pc = q.map(|x| color_pct(x.chg_pct));
+        let price = q.map(|x| format!("{:.2}", x.price)).unwrap_or_else(|| "--".into());
+        cv.text_ex(pad + iw * 0.52, yy, iw * 0.22, row_h, &price, 11.0, W_SEMI, pc.unwrap_or(TXT), alpha, 1, 1);
+        // 涨跌幅
+        let pct = q.map(|x| format!("{:+.2}%", x.chg_pct)).unwrap_or_else(|| "-".into());
+        cv.text_ex(pad + iw * 0.78, yy, iw * 0.22, row_h, &pct, 10.5, W_SEMI, pc.unwrap_or(TXT3), alpha, 2, 1);
+        yy += row_h;
+    }
+    cv.pop_clip();
+}
+
+/// A 股习惯：正红负绿，0 用灰
+fn pnl_color(v: f64) -> u32 {
+    if v > 0.001 {
+        RED
+    } else if v < -0.001 {
+        GREEN
+    } else {
+        TXT
+    }
+}
+
+fn color_pct(pct: f64) -> u32 {
+    if pct > 0.001 {
+        RED
+    } else if pct < -0.001 {
+        GREEN
+    } else {
+        TXT
+    }
 }
 
 // ---- 底部翻页条：左箭头 · 页码圆点 · 右箭头 ----
