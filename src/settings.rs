@@ -491,6 +491,8 @@ enum HitId {
     Time(usize, i32),
     /// 时间选择面板内的步进按钮：参数 (部件, 方向)，部件 0=时 1=分；方向 +1/-1
     TimeStep(usize, i32),
+    /// 直接点时/分数字框进入键盘输入（部件 0=时 1=分）
+    TimeNum(usize),
     /// 时间选择面板确定 / 取消
     TimeOk,
     TimeCancel,
@@ -531,6 +533,10 @@ thread_local! {
     /// 选择器里正在调整的时 / 分
     static TIME_H: Cell<u32> = const { Cell::new(9) };
     static TIME_M: Cell<u32> = const { Cell::new(0) };
+    /// 哪个数字框正在键盘输入：0=时 1=分，None=没有（保留 ▲▼ 步进行为）
+    static TIME_EDIT: Cell<Option<usize>> = const { Cell::new(None) };
+    /// 键盘输入时的原始字符串缓冲（用户可输 "8" 或 "08"），空串表示未输入
+    static TIME_BUF: RefCell<[String; 2]> = const { RefCell::new([String::new(), String::new()]) };
 }
 
 fn tw(txt: &str, size: f32) -> f32 {
@@ -935,7 +941,7 @@ fn draw_time_picker(cv: &mut Canvas, w: f32, h: f32, hover: HitId, hits: &mut Ve
 
     let title = match slot { 4 => "上午上班", 5 => "下班时间", 6 => "午休开始", _ => "下午上班" };
     cv.text_c(px, py + s(16.0), pw, s(28.0), title, 15.0, W_SEMI, TXT, 1.0);
-    cv.text_c(px, py + s(46.0), pw, s(18.0), "点击 ▲ ▼ 调整时 / 分", 10.5, W_NORMAL, TXT3, 0.9);
+    cv.text_c(px, py + s(46.0), pw, s(18.0), "点击数字框直接输入 · 或 ▲ ▼ 调整", 10.5, W_NORMAL, TXT3, 0.9);
 
     // 时 / 分两列
     let col_y = py + s(76.0);
@@ -944,8 +950,8 @@ fn draw_time_picker(cv: &mut Canvas, w: f32, h: f32, hover: HitId, hits: &mut Ve
     let hx = px + (pw - col_w * 2.0 - gap) / 2.0;
     let mx = hx + col_w + gap;
 
-    draw_time_col(cv, hx, col_y, col_w, TIME_H.with(|c| c.get()), "时", hover, HitId::TimeStep(0, 1), HitId::TimeStep(0, -1), hits);
-    draw_time_col(cv, mx, col_y, col_w, TIME_M.with(|c| c.get()), "分", hover, HitId::TimeStep(1, 1), HitId::TimeStep(1, -1), hits);
+    draw_time_col(cv, hx, col_y, col_w, TIME_H.with(|c| c.get()), "时", 0, hover, HitId::TimeStep(0, 1), HitId::TimeStep(0, -1), hits);
+    draw_time_col(cv, mx, col_y, col_w, TIME_M.with(|c| c.get()), "分", 1, hover, HitId::TimeStep(1, 1), HitId::TimeStep(1, -1), hits);
     cv.text_c(px + (pw - s(20.0)) / 2.0, col_y + s(40.0), s(20.0), s(56.0), ":", 24.0, W_MED, TXT3, 0.9);
 
     // 底部按钮：取消 / 确定
@@ -964,16 +970,34 @@ fn draw_time_picker(cv: &mut Canvas, w: f32, h: f32, hover: HitId, hits: &mut Ve
 }
 
 /// 时间选择器的一列：上箭头 + 大数字 + 下箭头 + 单位标签
-fn draw_time_col(cv: &mut Canvas, x: f32, y: f32, w: f32, val: u32, unit: &str, hover: HitId, up: HitId, down: HitId, hits: &mut Vec<Hit>) {
+/// `part` 0=时 1=分；当该列正在键盘输入时，画输入缓冲 + 光标，边框高亮。
+fn draw_time_col(cv: &mut Canvas, x: f32, y: f32, w: f32, val: u32, unit: &str, part: usize, hover: HitId, up: HitId, down: HitId, hits: &mut Vec<Hit>) {
     let bh = s(30.0);
     let num_y = y + bh;
     let num_h = s(56.0);
-    // 数字框
+    let editing = TIME_EDIT.with(|c| c.get()) == Some(part);
+    let buf = TIME_BUF.with(|b| b.borrow()[part].clone());
+    // 数字框（编辑态描蓝边）
     cv.rrect(x, num_y, w, num_h, s(10.0), INPUT_BG, 1.0);
-    cv.rrect_stroke(x + 0.5, num_y + 0.5, w - 1.0, num_h - 1.0, s(10.0), INPUT_BD, 1.0, s(1.0));
-    cv.text_c(x, num_y, w, num_h, &format!("{val:02}"), 26.0, W_SEMI, TXT, 1.0);
+    cv.rrect_stroke(
+        x + 0.5, num_y + 0.5, w - 1.0, num_h - 1.0, s(10.0),
+        if editing { 0x4B85F0 } else { INPUT_BD }, 1.0,
+        if editing { s(1.6) } else { s(1.0) },
+    );
+    if editing {
+        // 输入中：显示缓冲，末尾画一条竖光标
+        let disp = if buf.is_empty() { format!("{val:02}") } else { buf.clone() };
+        cv.text_c(x, num_y, w - s(6.0), num_h, &disp, 26.0, W_SEMI, TXT, 1.0);
+        let txt_w = tw(&disp, 26.0);
+        let cursor_x = x + (w - txt_w) / 2.0 + txt_w / 2.0 + s(2.0);
+        cv.rrect(cursor_x, num_y + s(13.0), s(2.0), num_h - s(26.0), 0.0, 0x7FB4FF, 1.0);
+    } else {
+        cv.text_c(x, num_y, w, num_h, &format!("{val:02}"), 26.0, W_SEMI, TXT, 1.0);
+    }
     // 单位
     cv.text_c(x, y + bh + num_h + s(4.0), w, s(18.0), unit, 10.5, W_NORMAL, TXT3, 0.9);
+    // 数字框本体可点击 → 进入键盘输入
+    push_hit(hits, HitId::TimeNum(part), x, num_y, w, num_h);
     // 上 / 下箭头按钮
     let ah = s(26.0);
     let up_hov = hover == up;
@@ -1810,6 +1834,76 @@ unsafe fn paint(hwnd: HWND) {
     let _ = EndPaint(hwnd, &ps);
 }
 
+/// 把键盘输入缓冲同步到时/分数值；缓冲为空时保留原值。
+fn time_apply_buf(part: usize) {
+    let txt = TIME_BUF.with(|b| b.borrow()[part].clone());
+    if txt.is_empty() {
+        return;
+    }
+    if let Ok(v) = txt.parse::<u32>() {
+        if part == 0 {
+            TIME_H.with(|c| c.set(v.min(23)));
+        } else {
+            TIME_M.with(|c| c.set(v.min(59)));
+        }
+    }
+}
+
+/// 键盘输入一位数字。
+/// 缓冲只存用户真实敲入的位（1~2 位）；若该位本身已超十位上限（时的 3~9 / 分的 6~9），
+/// 则它必然是个位，立即完成该列（时列自动跳到分）。满两位或该位越十位时，
+/// 把缓冲规范成两位显示并钳制数值；此后再输入视为重新开始一位。
+fn time_type_digit(part: usize, ch: char) {
+    if !ch.is_ascii_digit() {
+        return;
+    }
+    let max: u32 = if part == 0 { 23 } else { 59 };
+    let digit = ch.to_digit(10).unwrap_or(0);
+    let mut buf = TIME_BUF.with(|b| b.borrow()[part].clone());
+    // 已完成状态（满两位，或首位已超十位）下再输入 → 从新的一位开始
+    let first_over = buf
+        .chars()
+        .next()
+        .map(|c| c.to_digit(10).unwrap_or(0) > max / 10)
+        .unwrap_or(false);
+    if buf.len() >= 2 || first_over {
+        buf.clear();
+    }
+    buf.push(ch);
+    let value = buf.parse::<u32>().unwrap_or(0).min(max);
+    let this_over = digit > max / 10;
+    if buf.len() >= 2 || this_over {
+        // 该列完成：规范成两位、钳制数值、时列跳到分
+        buf = format!("{value:02}");
+        if part == 0 {
+            TIME_EDIT.with(|c| c.set(Some(1)));
+        }
+    }
+    TIME_BUF.with(|b| b.borrow_mut()[part] = buf);
+    time_apply_buf(part);
+}
+
+/// 退格：删掉当前缓冲最后一位。
+fn time_backspace(part: usize) {
+    let mut buf = TIME_BUF.with(|b| b.borrow()[part].clone());
+    buf.pop();
+    TIME_BUF.with(|b| b.borrow_mut()[part] = buf);
+    time_apply_buf(part);
+}
+
+/// 确定时间选择并关闭浮层。
+fn confirm_time(hwnd: HWND) {
+    if let Some((page, slot)) = TIME_PICK.with(|c| c.get()) {
+        let hh = TIME_H.with(|c| c.get());
+        let mm = TIME_M.with(|c| c.get());
+        set_field(page, slot, &format!("{hh:02}:{mm:02}"));
+        flash("时间已选择 · 点底部「保存并应用」生效");
+    }
+    TIME_PICK.with(|c| c.set(None));
+    TIME_EDIT.with(|c| c.set(None));
+    invalidate(hwnd);
+}
+
 fn hit_at(x: i32, y: i32) -> HitId {
     HITS.with(|c| {
         c.borrow()
@@ -1997,10 +2091,15 @@ fn on_click(hwnd: HWND, id: HitId) {
             let (hh, mm) = parse_hhmm(&val).unwrap_or((9, 0));
             TIME_H.with(|c| c.set(hh));
             TIME_M.with(|c| c.set(mm));
+            TIME_BUF.with(|b| *b.borrow_mut() = [String::new(), String::new()]);
+            TIME_EDIT.with(|c| c.set(None));
             TIME_PICK.with(|c| c.set(Some((page, slot))));
             invalidate(hwnd);
         }
         HitId::TimeStep(part, dir) => {
+            // 用 ▲▼ 时退出键盘输入态，并以当前数值为准步进
+            TIME_EDIT.with(|c| c.set(None));
+            TIME_BUF.with(|b| *b.borrow_mut() = [String::new(), String::new()]);
             if part == 0 {
                 TIME_H.with(|c| {
                     let v = c.get() as i32 + dir;
@@ -2014,18 +2113,22 @@ fn on_click(hwnd: HWND, id: HitId) {
             }
             invalidate(hwnd);
         }
-        HitId::TimeOk => {
-            if let Some((page, slot)) = TIME_PICK.with(|c| c.get()) {
-                let hh = TIME_H.with(|c| c.get());
-                let mm = TIME_M.with(|c| c.get());
-                set_field(page, slot, &format!("{hh:02}:{mm:02}"));
-                flash("时间已选择 · 点底部「保存并应用」生效");
+        HitId::TimeNum(part) => {
+            // 点数字框：进入键盘输入态，缓冲置空（首键即从 0 开始），并设置焦点接收字符
+            TIME_EDIT.with(|c| c.set(Some(part)));
+            TIME_BUF.with(|b| b.borrow_mut()[part].clear());
+            unsafe {
+                let hwnd_now = WIN.with(|c| c.get());
+                if hwnd_now != 0 {
+                    let _ = SetFocus(Some(HWND(hwnd_now as *mut core::ffi::c_void)));
+                }
             }
-            TIME_PICK.with(|c| c.set(None));
             invalidate(hwnd);
         }
+        HitId::TimeOk => confirm_time(hwnd),
         HitId::TimeCancel => {
             TIME_PICK.with(|c| c.set(None));
+            TIME_EDIT.with(|c| c.set(None));
             invalidate(hwnd);
         }
         HitId::Weekday(i) => {
@@ -2236,15 +2339,79 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
-        WM_KEYDOWN => {
-            if wparam.0 == 0x1B {
-                // Esc：优先关闭时间选择面板，否则关闭设置窗口
-                if TIME_PICK.with(|c| c.get()).is_some() {
-                    TIME_PICK.with(|c| c.set(None));
-                    invalidate(hwnd);
-                } else {
-                    hide_and_restore(hwnd);
+        0x0102 => {
+            // WM_CHAR：时间选择面板里，数字直接输入到当前编辑列
+            if let Some(part) = TIME_EDIT.with(|c| c.get()) {
+                let ch = char::from_u32((wparam.0 & 0xFFFF) as u32).unwrap_or('\0');
+                if ch.is_ascii_digit() {
+                    time_type_digit(part, ch);
+                } else if ch == '\r' {
+                    // 回车确定
+                    confirm_time(hwnd);
+                    return LRESULT(0);
                 }
+                invalidate(hwnd);
+                return LRESULT(0);
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            const VK_TAB: usize = 0x09;
+            const VK_BACK: usize = 0x08;
+            const VK_RETURN: usize = 0x0D;
+            const VK_UP: usize = 0x26;
+            const VK_DOWN: usize = 0x28;
+            // 时间选择面板打开时的键盘操作
+            if TIME_PICK.with(|c| c.get()).is_some() {
+                if wparam.0 == 0x1B {
+                    // Esc：关闭时间选择面板（不保存）
+                    TIME_PICK.with(|c| c.set(None));
+                    TIME_EDIT.with(|c| c.set(None));
+                    invalidate(hwnd);
+                    return LRESULT(0);
+                }
+                if wparam.0 == VK_TAB {
+                    // Tab：在时/分之间切换输入列
+                    let cur = TIME_EDIT.with(|c| c.get()).unwrap_or(0);
+                    TIME_EDIT.with(|c| c.set(Some(1 - cur)));
+                    invalidate(hwnd);
+                    return LRESULT(0);
+                }
+                if wparam.0 == VK_BACK {
+                    if let Some(part) = TIME_EDIT.with(|c| c.get()) {
+                        time_backspace(part);
+                        invalidate(hwnd);
+                    }
+                    return LRESULT(0);
+                }
+                if wparam.0 == VK_RETURN {
+                    confirm_time(hwnd);
+                    return LRESULT(0);
+                }
+                if wparam.0 == VK_UP || wparam.0 == VK_DOWN {
+                    // 上下键：沿用 ▲▼ 步进（不受是否在输入态影响）
+                    let part = TIME_EDIT.with(|c| c.get()).unwrap_or(0);
+                    let dir = if wparam.0 == VK_UP { 1 } else { -1 };
+                    TIME_EDIT.with(|c| c.set(None));
+                    TIME_BUF.with(|b| *b.borrow_mut() = [String::new(), String::new()]);
+                    if part == 0 {
+                        TIME_H.with(|c| {
+                            let v = c.get() as i32 + dir;
+                            c.set((((v % 24) + 24) % 24) as u32);
+                        });
+                    } else {
+                        TIME_M.with(|c| {
+                            let v = c.get() as i32 + dir;
+                            c.set((((v % 60) + 60) % 60) as u32);
+                        });
+                    }
+                    invalidate(hwnd);
+                    return LRESULT(0);
+                }
+            }
+            if wparam.0 == 0x1B {
+                // Esc：没有时间面板时关闭设置窗口
+                hide_and_restore(hwnd);
             }
             LRESULT(0)
         }
