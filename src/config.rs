@@ -171,7 +171,7 @@ impl Default for Mail {
 pub struct Stock {
     /// 拉取实时行情的间隔（秒）
     pub refresh_secs: u32,
-    /// 涨跌提醒阈值（百分比绝对值）；0 = 不提醒
+    /// 新增自选条目时预填的默认提醒阈值（百分比绝对值）；每支股票实际阈值存在 watchlist.txt 里独立设置
     pub alert_pct: f64,
     /// 交易时段外是否仍持续轮询（默认只在交易时段拉取，省流量）
     pub off_hours: bool,

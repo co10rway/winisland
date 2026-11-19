@@ -144,6 +144,18 @@ pub fn prompt() -> Result2 {
             }
         }
 
+        // 主窗口退出投递的 WM_QUIT 被本模态循环消费后，弹窗自身尚未销毁，
+        // 且退出信号已被吃掉 —— 销毁弹窗并回投，避免「退出后待办弹窗残留 / 进程卡住」。
+        if msg.message == WM_QUIT {
+            DONE.with(|c| c.set(true));
+            let _ = DestroyWindow(hwnd);
+            WIN.with(|c| c.set(0));
+            EDIT.with(|c| c.set(0));
+            crate::app::set_island_topmost(true);
+            PostQuitMessage(0);
+            return Result2::Cancel;
+        }
+
         let txt = RESULT.with(|c| c.borrow().clone());
         WIN.with(|c| c.set(0));
         EDIT.with(|c| c.set(0));
@@ -215,6 +227,21 @@ unsafe fn build_edit_ui(parent: HWND) {
     let wide = HSTRING::from("输入待办内容，回车添加");
     let _ = SendMessageW(h, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(wide.as_ptr() as isize)));
     EDIT.with(|c| c.set(h.0 as isize));
+}
+
+/// 退出程序时主动关闭可能开着的弹窗（避免残留）
+pub fn close_for_quit() {
+    let h = WIN.with(|c| c.get());
+    if h != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(h as *mut core::ffi::c_void)),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
 }
 
 /// 确认操作：必须在销毁窗口【之前】读取 EDIT 文本。

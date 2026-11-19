@@ -29,9 +29,11 @@ pub struct Quote {
 #[derive(Clone, Debug)]
 pub struct Item {
     pub code: String,
-    pub name: String, // 用户填的名称（可为空，自动取接口名称）
+    pub name: String, // 接口名称（自动补全，可含空格）
     pub cost: f64,
     pub qty: f64,
+    /// 该股独立涨跌提醒阈值（百分比绝对值）；0 = 这只不提醒
+    pub alert: f64,
 }
 
 struct Shared {
@@ -55,7 +57,61 @@ fn alerted() -> &'static Mutex<HashSet<String>> {
     ALERT_KEY.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// 按需查询的行情缓存：编辑窗口输入一个【尚未加入 watchlist】的新代码时，
+/// 主轮询线程只会拉 watchlist 里的代码，快照里根本没有它 —— 这正是
+/// 「输入代码后名称/现价一直不显示」的根因。这里补一份按代码单独拉取的缓存，
+/// snapshot() 会把它和主快照合并，主面板 / 编辑窗口都能立即读到。
+static EXTRA_QUOTES: OnceLock<Mutex<HashMap<String, Quote>>> = OnceLock::new();
+fn extra_quotes() -> &'static Mutex<HashMap<String, Quote>> {
+    EXTRA_QUOTES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// 已发起过按需查询的 6 位代码，避免编辑时每次按键都起线程（输入不卡的前提）
+static LOOKUP_TRIED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+fn lookup_tried() -> &'static Mutex<HashSet<String>> {
+    LOOKUP_TRIED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 // ───────────────────────── 自选/持仓 读写 ─────────────────────────
+
+/// watchlist.txt 每行格式：`代码 成本价 数量 提醒阈值 名称…`
+/// 数字字段固定在前面、名称放最后（可含空格），避免名称里的空格把成本/数量解析错位。
+/// 同时兼容旧格式 `代码 名称 成本价 数量`：判据是第 2 个 token 能否解析为数字。
+fn parse_line(line: &str) -> Option<Item> {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let raw = *toks.first()?;
+    let _full = normalize_code(raw)?; // 校验为 6 位代码
+    let code: String = raw.trim().chars().filter(|c| c.is_ascii_digit()).collect();
+    if code.len() != 6 {
+        return None;
+    }
+
+    // 新格式：toks[1]=成本, [2]=数量, [3]=提醒, [4..]=名称（可含空格）
+    let new_fmt = toks.len() >= 2 && toks[1].parse::<f64>().is_ok();
+    let (cost, qty, alert, name) = if new_fmt {
+        let cost = toks[1].parse::<f64>().unwrap_or(0.0);
+        let qty = toks.get(2).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        let alert = toks.get(3).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        let name = if toks.len() > 4 { toks[4..].join(" ") } else { String::new() };
+        (cost, qty, alert, name)
+    } else {
+        // 旧格式：代码 名称… 成本 数量 —— 名称可能含空格，取「所有非数字 token」拼接；
+        // 末尾的数字 token 依次是成本、数量（数量可省略）。
+        let mut nums: Vec<f64> = Vec::new();
+        let mut name_parts: Vec<&str> = Vec::new();
+        for t in toks.iter().skip(1) {
+            if let Ok(v) = t.parse::<f64>() {
+                nums.push(v);
+            } else {
+                name_parts.push(t);
+            }
+        }
+        let cost = nums.first().copied().unwrap_or(0.0);
+        let qty = nums.get(1).copied().unwrap_or(0.0);
+        let name = name_parts.join(" ");
+        (cost, qty, 0.0, name)
+    };
+    Some(Item { code, name, cost, qty, alert })
+}
 
 /// 读取盯盘数据文件，按行解析成 Item 列表。解析失败 / 空返回空列表。
 pub fn read_items() -> Vec<Item> {
@@ -63,38 +119,14 @@ pub fn read_items() -> Vec<Item> {
     let Ok(txt) = std::fs::read_to_string(&p) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for line in txt.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut toks = line.split_whitespace();
-        let Some(raw) = toks.next() else { continue };
-        // 校验为 6 位代码；Item.code 统一存纯 6 位（不带交易所前缀），
-        // 展示与 quote_for 匹配都以它为准
-        let Some(full) = normalize_code(raw) else { continue };
-        let dig: String = raw.trim().chars().filter(|c| c.is_ascii_digit()).collect();
-        let code = if !dig.is_empty() { dig } else { full };
-        // 剩余 token：非数字 → 名称；数字依次 → 成本价、数量
-        let mut name = String::new();
-        let mut nums: Vec<f64> = Vec::new();
-        for t in toks {
-            if let Ok(v) = t.parse::<f64>() {
-                nums.push(v);
-            } else if name.is_empty() {
-                name.push_str(t);
-            }
-        }
-        let cost = nums.first().copied().unwrap_or(0.0);
-        let qty = nums.get(1).copied().unwrap_or(0.0);
-        out.push(Item { code, name, cost, qty });
-    }
-    out
+    txt.lines().filter_map(|l| {
+        let l = l.trim();
+        if l.is_empty() || l.starts_with('#') { None } else { parse_line(l) }
+    }).collect()
 }
 
-/// 将自选列表写回 watchlist.txt（每行：代码 名称 成本价 数量）。
-/// 名称由编辑窗口按代码自动补全后写入；持仓为空时只写代码 + 名称。
+/// 将自选列表写回 watchlist.txt。
+/// 每行 `代码 成本价 数量 提醒阈值 名称…`；成本/数量/提醒为 0 时写 0，名称可空。
 /// 传入的 code 可为 6 位或带前缀，写入时统一归一为 6 位。
 pub fn save_items(items: &[Item]) {
     let mut s = String::new();
@@ -105,12 +137,10 @@ pub fn save_items(items: &[Item]) {
             continue;
         }
         let nm = it.name.trim();
-        let has_pos = it.qty.abs() > 1e-9 || it.cost.abs() > 1e-9;
-        if has_pos || !nm.is_empty() {
-            s.push_str(&format!("{} {} {:.2} {:.0}\n", code, nm, it.cost, it.qty));
-        } else {
-            s.push_str(&format!("{}\n", code));
-        }
+        s.push_str(&format!(
+            "{} {:.2} {:.0} {:.2} {}\n",
+            code, it.cost, it.qty, it.alert, nm
+        ));
     }
     let p = crate::config::watchlist_path();
     let _ = std::fs::create_dir_all(p.parent().unwrap());
@@ -199,9 +229,51 @@ fn parse_body(txt: &str) -> Vec<Quote> {
 
 // ───────────────────────── 状态读取 ─────────────────────────
 
-/// 取最近一次成功行情快照
+/// 取最近一次成功行情快照（主轮询结果 + 编辑窗口按需查询的新代码）
 pub fn snapshot() -> Vec<Quote> {
-    shared().quotes.lock().unwrap().clone()
+    let mut out = shared().quotes.lock().unwrap().clone();
+    let extra = extra_quotes().lock().unwrap();
+    for q in extra.values() {
+        // 主快照里已有的代码优先（主轮询数据更新），不重复追加
+        if !out.iter().any(|x| x.code == q.code) {
+            out.push(q.clone());
+        }
+    }
+    out
+}
+
+/// 按需拉一只尚未加入 watchlist 的股票行情（编辑窗口输入 6 位代码时调用）。
+/// 完全异步：本函数只登记代码并起一个后台线程，不阻塞 UI；同一代码进程内只查一次，
+/// 所以连续输入 / 退格都不会反复联网，保持"打字不卡"。
+pub fn request_lookup(code: &str) {
+    let Some(full) = normalize_code(code) else { return };
+    let pure: String = full.chars().filter(|c| c.is_ascii_digit()).collect();
+    if pure.len() != 6 {
+        return;
+    }
+    // 快照里已经有的（watchlist 中已存在或之前查过）直接跳过
+    if quote_for(&snapshot(), &pure).is_some() {
+        return;
+    }
+    {
+        let mut tried = lookup_tried().lock().unwrap();
+        if !tried.insert(pure.clone()) {
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        let qs = fetch(&[full]);
+        if qs.is_empty() {
+            // 拉取失败允许下次再试（不把失败永久记进 tried）
+            lookup_tried().lock().unwrap().remove(&pure);
+            return;
+        }
+        let mut extra = extra_quotes().lock().unwrap();
+        for q in qs {
+            extra.insert(q.code.clone(), q);
+        }
+        shared().dirty.store(true, Ordering::Relaxed);
+    });
 }
 
 /// 本模块是否有新数据待消费（主线程读取后置回 false）
@@ -214,56 +286,12 @@ pub fn quote_for<'a>(quotes: &'a [Quote], code: &str) -> Option<&'a Quote> {
     quotes.iter().find(|q| q.code == code)
 }
 
-/// 名称持久缓存：代码 → 名称。编辑自选时异步补全，之后跨面板复用，
-/// 不受后台轮询「整体替换快照」影响。
-static NAME_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-fn name_cache() -> &'static Mutex<HashMap<String, String>> {
-    NAME_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 记住一个代码对应的名称（异步补全 / 行情拉取后调用）
-pub fn remember_name(code: &str, name: &str) {
-    if !code.is_empty() && !name.is_empty() {
-        name_cache()
-            .lock()
-            .unwrap()
-            .insert(code.to_string(), name.to_string());
-    }
-}
-
-/// 查已知名称：持久缓存 → 内存行情快照 → 空串（不联网，输入时即时调用）
-pub fn name_known(code: &str) -> String {
-    if let Some(n) = name_cache().lock().unwrap().get(code) {
-        if !n.is_empty() {
-            return n.clone();
-        }
-    }
-    name_from_snapshot(code)
-}
-
 /// 只从内存行情快照查名称（不联网、不卡 UI）
 pub fn name_from_snapshot(code: &str) -> String {
     let snap = snapshot();
     quote_for(&snap, code)
         .map(|q| q.name.clone())
         .unwrap_or_default()
-}
-
-/// 按代码自动补全证券名称：持久缓存 → 快照 → 同步拉一次行情
-/// （只在编辑自选保存时按行调用，非交易时段也能补出名称）。失败返回空串。
-pub fn resolve_name(code: &str) -> String {
-    let known = name_known(code);
-    if !known.is_empty() {
-        return known;
-    }
-    if let Some(full) = normalize_code(code) {
-        let qs = fetch(&[full]);
-        if let Some(q) = qs.first() {
-            remember_name(&q.code, &q.name);
-            return q.name.clone();
-        }
-    }
-    String::new()
 }
 
 /// 清空「当天已提醒」记录（设置里改阈值后调用，让新阈值立即生效）
@@ -293,20 +321,21 @@ pub fn float_pnl(quotes: &[Quote], items: &[Item]) -> f64 {
     total
 }
 
-/// 涨跌提醒：返回第一条涨幅超阈值且当天未提醒过的自选提示；无则 None。
-/// 命中后当天不再重复提醒同一只。
-pub fn next_alert(alert_pct: f64) -> Option<String> {
-    if alert_pct <= 0.0 {
-        return None;
-    }
+/// 涨跌提醒：按每支股票自己设置的阈值判断，返回第一条涨幅超阈值且当天未提醒过的自选提示；
+/// 无则 None。某支 alert<=0 表示这支不提醒。命中后当天不再重复提醒同一只。
+pub fn next_alert() -> Option<String> {
     let quotes = snapshot();
     let items = read_items();
     let today = crate::modules::clock::today_str(&crate::modules::clock::local_time());
     let mut seen = alerted().lock().unwrap();
     for it in &items {
+        // 每支股票独立阈值：0 = 这支不提醒
+        if it.alert <= 0.0 {
+            continue;
+        }
         if let Some(q) = quote_for(&quotes, &it.code) {
-            if q.chg_pct.abs() >= alert_pct {
-                let key = format!("{}|{}", today, q.code);
+            if q.chg_pct.abs() >= it.alert {
+                let key = format!("{}|{}|{:.2}", today, q.code, it.alert);
                 if !seen.contains(&key) {
                     seen.insert(key);
                     // 顺手清理非今天的旧 key，避免无限增长
@@ -346,6 +375,13 @@ fn is_trading_time() -> bool {
     (555..=690).contains(&m) || (780..=900).contains(&m) // 9:15-11:30 & 13:00-15:00
 }
 
+/// 首次启动是否已完成过一次成功的行情拉取。
+/// 默认 false：第一轮无条件拉一次，保证「刚打开面板就有数据」，
+/// 不再依赖点编辑触发的按需查询。拉取成功后置 true，此后才由
+/// `off_hours` / 交易时段决定是否继续刷新；若首次拉取失败则保持 false，
+/// 非交易时段也会按刷新间隔重试，直到成功为止（网络兜底）。
+static BOOTSTRAPPED: AtomicBool = AtomicBool::new(false);
+
 /// 启动后台行情轮询线程。间隔 / 自选每次循环从配置与数据文件重读，改后可立即生效。
 pub fn spawn() {
     std::thread::spawn(|| loop {
@@ -353,7 +389,9 @@ pub fn spawn() {
         let items = read_items();
         if cfg.modules.stock && !items.is_empty() {
             let codes = request_codes(&items);
-            let want = cfg.stock.off_hours || is_trading_time();
+            // 首次循环强制拉一次（即使非交易时段 / off_hours=false），
+            // 让主面板首次打开即有行情；之后才尊重刷新开关。
+            let want = !BOOTSTRAPPED.load(Ordering::Relaxed) || cfg.stock.off_hours || is_trading_time();
             if !codes.is_empty() && want {
                 // 交易时段里价格实时变，间隔秒数短；行情接口免费，拉取内容仅自选代码
                 let q = fetch(&codes);
@@ -361,6 +399,7 @@ pub fn spawn() {
                     *shared().quotes.lock().unwrap() = q;
                     *shared().last_ts.lock().unwrap() = crate::modules::files::now_unix();
                     shared().dirty.store(true, Ordering::Relaxed);
+                    BOOTSTRAPPED.store(true, Ordering::Relaxed);
                 }
             }
         }
@@ -402,24 +441,33 @@ mod tests {
 
     #[test]
     fn read_items_parses() {
-        // 名称带空格式的多种写法
+        // 新格式：代码 成本 数量 提醒 名称（名称可含空格）；旧格式：代码 名称 成本 数量
         let saved = crate::config::watchlist_path();
         let dir = saved.parent().unwrap();
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(
             &saved,
-            "# 测试\n600000 浦发银行 7.50 1000\n000001 5.00 500\n300750\n",
+            "# 测试\n600000 7.50 1000 3.00 浦发银行\n000001 5.00 500 0.00\n300750 20.00 100 2.50 宁德时代 X\n600519 贵州茅台 1600.00 10\n",
         )
         .unwrap();
         let items = read_items();
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 4);
+        // 新格式 + 名称
         assert_eq!(items[0].code, "600000");
         assert!((items[0].cost - 7.5).abs() < 1e-6);
         assert!((items[0].qty - 1000.0).abs() < 1e-6);
-        assert_eq!(items[1].cost, 5.0);
-        assert_eq!(items[1].qty, 500.0);
-        assert_eq!(items[2].cost, 0.0);
-        assert_eq!(items[2].qty, 0.0);
+        assert!((items[0].alert - 3.0).abs() < 1e-6);
+        assert_eq!(items[0].name, "浦发银行");
+        // 新格式 + 无名称
+        assert!((items[1].cost - 5.0).abs() < 1e-6);
+        assert!((items[1].qty - 500.0).abs() < 1e-6);
+        // 新格式 + 名称含空格
+        assert_eq!(items[2].name, "宁德时代 X");
+        assert!((items[2].alert - 2.5).abs() < 1e-6);
+        // 旧格式兼容
+        assert_eq!(items[3].name, "贵州茅台");
+        assert!((items[3].cost - 1600.0).abs() < 1e-6);
+        assert!((items[3].qty - 10.0).abs() < 1e-6);
         std::fs::remove_file(&saved).ok();
     }
 
@@ -436,7 +484,13 @@ mod tests {
             chg: 1.0,
             chg_pct: 14.28,
         }];
-        let items = vec![Item { code: "600000".into(), name: String::new(), cost: 6.0, qty: 100.0 }];
+        let items = vec![Item {
+            code: "600000".into(),
+            name: String::new(),
+            cost: 6.0,
+            qty: 100.0,
+            alert: 0.0,
+        }];
         assert!((today_pnl(&q, &items) - 100.0).abs() < 1e-6);
         assert!((float_pnl(&q, &items) - 200.0).abs() < 1e-6);
     }

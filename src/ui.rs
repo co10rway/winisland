@@ -114,7 +114,7 @@ fn push_hit_body_from(hits: &mut Vec<Hit>, id: HitId, x: f32, y: f32, w: f32, h:
 
 /// 列表页内容超出可视区的高度（滚轮可滚的最大距离）；不可滚动页返回 0
 pub fn panel_scroll_max(app: &App, kind: &str) -> f32 {
-    let row = s(27.0);
+    let row = if kind == "watch" { s(WATCH_ROW_H) } else { s(27.0) };
     let n = match kind {
         "schedule" => app.merged_schedule().len(),
         "todo" => app.store.todos.len(),
@@ -129,7 +129,7 @@ pub fn panel_scroll_max(app: &App, kind: &str) -> f32 {
     // 待办页顶部多一块「+ 新增待办」固定按钮区；盯盘页顶部有「+ 编辑自选持仓」按钮 + 盈亏卡
     let top_offset = match kind {
         "todo" => s(TODO_ADD_H) + s(6.0),
-        "watch" => s(TODO_ADD_H) + s(6.0) + s(WATCH_CARD_H) + s(4.0),
+        "watch" => s(WATCH_CARD_H) + s(8.0),
         _ => 0.0,
     };
     let content_end = s(BODY_TOP) + top_offset + n as f32 * row + s(4.0);
@@ -627,8 +627,12 @@ const HEADER_H: f32 = 48.0;
 const BODY_TOP: f32 = 76.0;
 /// 待办页「＋ 新增待办」按钮区高度（固定在标题下，列表从其下方滚动）
 const TODO_ADD_H: f32 = 32.0;
-/// 盯盘页「＋ 编辑自选持仓」按钮复用同一高度
-const WATCH_CARD_H: f32 = 58.0;
+/// 盯盘页标题右侧「＋ 编辑」小按钮高度（与标题同一水平行）
+const WATCH_BTN_H: f32 = 18.0;
+/// 盯盘页盈亏卡高度（压扁，把主视觉让给行情列表）
+const WATCH_CARD_H: f32 = 44.0;
+/// 盯盘页行情行高（放大以便看清）
+const WATCH_ROW_H: f32 = 34.0;
 
 /// 依据配置推导实际参与轮播的页面（顺序即展示顺序；模块关闭时自动跳过）
 pub fn effective_pages(cfg: &crate::config::Config) -> Vec<&'static str> {
@@ -1295,65 +1299,84 @@ fn page_watch(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit
         app,
         cv,
         w,
-        crate::config::panel_name("watch"),
-        Some(format!("{} 只持仓", holding.len())),
+        &format!("{} · {} 只持仓", crate::config::panel_name("watch"), holding.len()),
+        None,
         alpha,
     );
 
-    // ── 「＋ 编辑自选持仓」固定按钮（置于标题下，始终可见；样式同待办「＋ 新增待办」）──
-    let ay = s(BODY_TOP);
-    let ah = s(TODO_ADD_H);
+    // ── 标题行右侧「＋ 编辑」小按钮：与标题同一水平，紧凑胶囊 ──
+    let ebw = text_w("＋ 编辑", 9.5) + s(16.0);
+    let ebx = pad + iw - ebw;
+    let eby = s(53.0);
+    let ebh = s(WATCH_BTN_H);
     let ahp = app.anims.hover_p(&HitId::WatchEdit);
-    cv.rrect(pad, ay, iw, ah, s(9.0), mix(0x1E1E25, crate::theme::main(), ahp * 0.5), alpha * (0.85 + 0.15 * ahp));
-    cv.rrect_stroke(pad, ay, iw, ah, s(9.0), crate::theme::main(), alpha * (0.5 + 0.5 * ahp), s(1.0));
-    cv.text1(pad, ay, iw, ah, "＋ 编辑自选持仓", 12.0, W_SEMI, mix(TXT2, crate::theme::tint(), ahp), alpha);
-    push_hit(hits, HitId::WatchEdit, pad, ay, iw, ah);
+    cv.rrect(ebx, eby, ebw, ebh, s(6.0), mix(0x1E1E25, crate::theme::main(), ahp * 0.5), alpha * (0.85 + 0.15 * ahp));
+    cv.rrect_stroke(ebx, eby, ebw, ebh, s(6.0), crate::theme::main(), alpha * (0.5 + 0.5 * ahp), s(1.0));
+    cv.text1(ebx, eby, ebw, ebh, "＋ 编辑", 9.5, W_SEMI, mix(TXT2, crate::theme::tint(), ahp), alpha);
+    push_hit(hits, HitId::WatchEdit, ebx, eby, ebw, ebh);
 
     if items.is_empty() {
-        // 空状态引导：放在按钮下方，避免盖住按钮
-        let hy = s(BODY_TOP) + s(TODO_ADD_H) + s(6.0);
-        cv.text_ex(pad, hy, iw, s(24.0), "暂无自选，点上方「＋ 编辑自选持仓」添加第一条", 10.5, W_NORMAL, TXT3, alpha, 1, 1);
+        // 空状态引导：标题行下方即可，不再有独立按钮区
+        let hy = s(BODY_TOP);
+        cv.text_ex(pad, hy, iw, s(24.0), "暂无自选，点右上角「＋ 编辑」添加第一条", 10.5, W_NORMAL, TXT3, alpha, 1, 1);
         cv.text_ex(pad, hy + s(24.0), iw, s(18.0), "每行一条：代码 名称 成本价 数量（可只填代码）· 红涨绿跌", 8.5, W_NORMAL, TXT3, alpha, 1, 1);
         return;
     }
 
-    // ── 顶部盈亏卡 ──
-    let y = s(BODY_TOP) + s(TODO_ADD_H) + s(6.0);
+    // ── 顶部盈亏卡：两个口径左右分栏并列，各自标注基准，消除「对不上」的疑惑 ──
+    let y = s(BODY_TOP);
     let ch = s(WATCH_CARD_H);
-    cv.rrect(pad, y, iw, ch, s(12.0), ROW, alpha);
+    cv.rrect(pad, y, iw, ch, s(11.0), ROW, alpha);
     if !holding.is_empty() {
-        let pnl = crate::modules::stock::today_pnl(&quotes, &items);
-        let fc = pnl_color(pnl);
-        cv.text1(pad + s(14.0), y + s(9.0), iw - s(70.0), s(14.0), "今日盈亏", 9.5, W_NORMAL, TXT2, alpha);
-        cv.text1(pad + s(14.0), y + s(23.0), iw - s(70.0), s(29.0), &format!("¥{:+.2}", pnl), 20.0, W_BOLD, fc, alpha);
         let fp = crate::modules::stock::float_pnl(&quotes, &items);
-        cv.text_ex(pad, y + s(7.0), iw - s(14.0), s(13.0), &format!("持仓浮盈 {:+.2}", fp), 8.5, W_NORMAL, pnl_color(fp), alpha, 2, 1);
-        cv.text_ex(pad, y + s(21.0), iw - s(14.0), s(13.0), &format!("{} 只持仓 · 交易时段自动刷新", holding.len()), 8.5, W_NORMAL, TXT3, alpha, 2, 1);
+        let pnl = crate::modules::stock::today_pnl(&quotes, &items);
+        let half = iw * 0.5;
+        let left = pad + s(12.0);
+        let right = pad + half + s(2.0);
+        // 中间竖向分隔线
+        cv.line(pad + half, y + s(8.0), pad + half, y + ch - s(8.0), BORDER, alpha * 0.9, s(1.0));
+        // 左栏：持仓浮盈
+        cv.text1(left, y + s(4.0), half - s(18.0), s(12.0), "持仓浮盈", 9.5, W_NORMAL, TXT2, alpha);
+        cv.text1(left, y + s(16.0), half - s(18.0), s(25.0), &format!("¥{:+.2}", fp), 18.0, W_BOLD, pnl_color(fp), alpha);
+        // 右栏：今日盈亏
+        cv.text1(right, y + s(4.0), half - s(16.0), s(12.0), "今日盈亏", 9.5, W_NORMAL, TXT2, alpha);
+        cv.text1(right, y + s(16.0), half - s(16.0), s(25.0), &format!("¥{:+.2}", pnl), 18.0, W_BOLD, pnl_color(pnl), alpha);
     } else {
-        cv.text1(pad + s(14.0), y + s(10.0), iw - s(28.0), s(14.0), "今日盈亏", 9.5, W_NORMAL, TXT2, alpha);
-        cv.text1(pad + s(14.0), y + s(25.0), iw - s(28.0), s(26.0), "暂无持仓 · 仅监控自选", 15.0, W_SEMI, TXT, alpha);
-        cv.text_ex(pad, y + s(20.0), iw - s(14.0), s(14.0), "给条目填成本价与数量即可计入盈亏，点上方按钮编辑", 8.5, W_NORMAL, TXT3, alpha, 2, 1);
+        cv.text1(pad + s(14.0), y + s(9.0), iw - s(28.0), s(13.0), "盯盘盈亏", 9.5, W_NORMAL, TXT2, alpha);
+        cv.text1(pad + s(14.0), y + s(22.0), iw - s(28.0), s(23.0), "暂无持仓 · 仅监控自选", 14.0, W_SEMI, TXT, alpha);
+        cv.text_ex(pad, y + s(13.0), iw - s(28.0), s(14.0), "填成本价与数量后显示收益", 8.5, W_NORMAL, TXT3, alpha, 2, 1);
     }
 
-    // ── 行情列表（可滚动）──
-    let list_top = y + ch + s(4.0);
-    let row_h = s(27.0);
+    // ── 行情列表（可滚动）── 与卡片保持间距，避免首行被卡片圆角遮挡
+    let list_top = y + ch + s(8.0);
+    let row_h = s(WATCH_ROW_H);
     let sc = app.panel_scroll.min(panel_scroll_max(app, "watch"));
     let mut yy = list_top - sc;
     cv.push_clip(0.0, list_top - s(2.0), w, (body_clip_bottom() - list_top + s(2.0)).max(0.0));
 
-    for it in &items {
+    // 列宽：名称+代码 0.52 / 现价 0.23 / 涨跌幅 0.25
+    let name_w = iw * 0.52;
+    let price_x = pad + name_w;
+    let pct_x = pad + iw * 0.75;
+    for (idx, it) in items.iter().enumerate() {
         let q = crate::modules::stock::quote_for(&quotes, &it.code);
-        // 名称：优先用户填写，缺省用接口名称
+        // 行间细分割线，避免放大后各行粘连
+        if idx > 0 {
+            cv.line(pad, yy, pad + iw, yy, BORDER, alpha * 0.55, s(1.0));
+        }
+        // 名称：优先已识别名称，缺省用行情快照名称。名称与代码分两段绘制，
+        // 代码用较小字号紧跟其后，名称本身获得更宽空间，避免长名称被裁。
         let nm = if it.name.is_empty() { q.map(|x| x.name.as_str()).unwrap_or("") } else { it.name.as_str() };
-        cv.text1(pad, yy, iw * 0.52, row_h, &format!("{} {}", nm, it.code), 11.0, W_MED, TXT, alpha);
+        let name_text_w = name_w - s(50.0); // 给 6 位代码留出固定宽度
+        cv.text1(pad, yy + s(1.0), name_text_w, row_h - s(2.0), nm, 12.5, W_SEMI, TXT, alpha);
+        cv.text1(pad + name_text_w, yy + s(3.0), s(50.0), row_h - s(6.0), &it.code, 10.0, W_NORMAL, TXT3, alpha);
         // 现价
         let pc = q.map(|x| color_pct(x.chg_pct));
         let price = q.map(|x| format!("{:.2}", x.price)).unwrap_or_else(|| "--".into());
-        cv.text_ex(pad + iw * 0.52, yy, iw * 0.22, row_h, &price, 11.0, W_SEMI, pc.unwrap_or(TXT), alpha, 1, 1);
+        cv.text_ex(price_x, yy, iw * 0.23, row_h, &price, 14.0, W_BOLD, pc.unwrap_or(TXT), alpha, 1, 1);
         // 涨跌幅
         let pct = q.map(|x| format!("{:+.2}%", x.chg_pct)).unwrap_or_else(|| "-".into());
-        cv.text_ex(pad + iw * 0.78, yy, iw * 0.22, row_h, &pct, 10.5, W_SEMI, pc.unwrap_or(TXT3), alpha, 2, 1);
+        cv.text_ex(pct_x, yy, iw * 0.25, row_h, &pct, 12.5, W_SEMI, pc.unwrap_or(TXT3), alpha, 2, 1);
         yy += row_h;
     }
     cv.pop_clip();

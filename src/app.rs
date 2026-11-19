@@ -1192,6 +1192,9 @@ pub fn quit() {
     crate::modules::zones::shutdown();
     // 设置窗口可能开着：先同步藏掉（顺带保存当前页输入），退出后不残留窗口
     crate::settings::close_for_quit();
+    // 两个模态弹窗（编辑自选 / 新增待办）可能开着：主动关掉，避免退出后残留幽灵窗口
+    crate::modules::watch_edit::close_for_quit();
+    crate::modules::todo_add::close_for_quit();
     // 看门狗兜底：正常收尾（销毁窗口 → 存盘 → 退出消息循环）应在 1-2 秒内结束。
     // 若主线程在收尾阶段挂死（曾出现设置窗口开着时退出后卡住），3 秒后强制结束进程，
     // 不在屏幕上留"未响应"的幽灵窗口。数据已在 save_now 落盘。
@@ -1601,12 +1604,26 @@ fn tick_second() {
             }
         }
 
-        // 盯盘助手：行情刷新 → 重绘当前页；某只涨跌幅超过阈值 → 弹一次提醒（当天不重复）
+        // 盯盘助手：行情刷新 → 重绘当前页；某只涨跌幅超过【它自己设置的】阈值 → 弹一次提醒（当天不重复）
         if app.cfg.modules.stock && crate::modules::stock::take_dirty() {
             app.dirty = true;
-            if app.reminder.is_none() && app.cfg.stock.alert_pct > 0.0 {
-                if let Some(msg) = crate::modules::stock::next_alert(app.cfg.stock.alert_pct) {
+            if app.reminder.is_none() {
+                if let Some(msg) = crate::modules::stock::next_alert() {
                     raise_reminder(app, ToastKind::Stock, msg);
+                }
+            }
+        }
+
+        // 盯盘页自愈兜底：只要面板停在盯盘页，就把快照里尚缺的自选代码主动补拉。
+        // 这样数据不再依赖「启动时机 / 是否交易时段 / 主轮询是否已覆盖」——
+        // 之前收盘后（off_hours=false）主轮询不拉，必须点编辑触发按需查询才出数据，
+        // 正是缺了这层保证。request_lookup 自带快照判重 + 单代码去重，重复调用不会多发请求。
+        if app.cfg.modules.stock && app.panel_open {
+            let pages = ui::effective_pages(&app.cfg);
+            let idx = app.page.min(pages.len().saturating_sub(1));
+            if pages.get(idx).copied() == Some("watch") {
+                for it in crate::modules::stock::read_items() {
+                    crate::modules::stock::request_lookup(&it.code);
                 }
             }
         }
@@ -2295,6 +2312,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 不管从哪条路径退出（托盘 / 系统关机 / 任务管理器优雅关闭），
             // 都把设置窗口同步藏掉，避免残留
             crate::settings::close_for_quit();
+            // 两个模态弹窗同样主动关闭（这条路径覆盖系统关机等非托盘退出）
+            crate::modules::watch_edit::close_for_quit();
+            crate::modules::todo_add::close_for_quit();
             tray::remove(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
