@@ -301,6 +301,17 @@ pub struct Config {
     pub schedule_lead_minutes: u32,
     /// 外部日历订阅（ICS / webcal，钉钉、飞书等导出的链接）
     pub schedule_sub: ScheduleSub,
+    /// 胶囊模式（右键菜单切换）：
+    /// - "work"：工作模式 —— 右侧轮播今日已赚 / 已工作 / 进度 / 距下班 / 打字
+    /// - "stock"：盯盘模式 —— 左侧状态显示「盯盘中」，右侧轮播每只自选的股价与涨跌幅 + 今日盈亏
+    pub mode: String,
+}
+
+impl Config {
+    /// 是否处于盯盘模式（决定胶囊左侧状态徽标与右侧轮播内容）
+    pub fn stock_mode(&self) -> bool {
+        self.mode == "stock"
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -434,6 +445,7 @@ impl Default for Config {
             auto_collapse: true,
             schedule_lead_minutes: 5,
             schedule_sub: ScheduleSub::default(),
+            mode: "work".into(),
         }
     }
 }

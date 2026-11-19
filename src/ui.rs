@@ -26,8 +26,23 @@ pub const SLIVER_W: i32 = 132;
 pub const SLIVER_H: i32 = 10;
 const SLIVER_BG: u32 = 0x0C0C0E;
 
-/// 胶囊右侧轮播条目数（今日已赚 / 已工作 / 进度 / 距午休-下班 / 打字）
-pub const PILL_ITEMS: usize = 5;
+/// 工作模式下的胶囊右侧轮播条目数（今日已赚 / 已工作 / 进度 / 距午休-下班 / 打字）
+const WORK_PILL_ITEMS: usize = 5;
+
+/// 胶囊右侧轮播条目数：随模式与自选数量变化（盯盘模式 = 自选数 [+ 今日盈亏]），
+/// 轮播取模必须用这个函数，不能再用固定常量。
+/// 只在轮播推进时（约每 4 秒）调用一次，避免每帧读 watchlist 文件。
+pub fn pill_count(app: &App) -> usize {
+    if !app.cfg.stock_mode() {
+        return WORK_PILL_ITEMS;
+    }
+    let items = crate::modules::stock::read_items();
+    if items.is_empty() {
+        1 // 空自选时显示一条引导
+    } else {
+        items.len() + usize::from(items.iter().any(|i| i.qty > 0.0))
+    }
+}
 
 // ---- 调色板（对照设计稿）----
 const BG: u32 = 0x131317;
@@ -361,15 +376,20 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
     let time_str = clock::hhmmss(&st);
     let time_w = text_w(&time_str, 21.0) + s(3.0);
 
-    // 上班状态：按法定工作日 + 上午/午休/下午/下班时间判定
+    // 状态徽标：盯盘模式下固定显示「盯盘中」（与上班/午休状态无关），
+    // 否则按法定工作日 + 上午/午休/下午/下班时间判定
     let phs = if app.cfg.modules.salary { Some(workday::phase_now(&st, &app.cfg.salary)) } else { None };
-    let chip_label = phs.map(|p| p.label().to_string()).unwrap_or_default();
-    let chip_tw = text_w(&chip_label, 10.5);
+    let chip: Option<(String, u32)> = if app.cfg.stock_mode() {
+        Some(("盯盘中".to_string(), crate::theme::main()))
+    } else {
+        phs.map(|p| (p.label().to_string(), p.color()))
+    };
+    let chip_tw = chip.as_ref().map(|c| text_w(&c.0, 10.5)).unwrap_or(0.0);
     let chip_w = s(5.0) + s(4.0) + chip_tw + s(9.0);
 
     let gap = s(7.0);
     // 日期之后还要让出的宽度：间隔 + 状态徽标 + 间隔 + 时间
-    let tail = gap + if phs.is_some() { chip_w + gap } else { 0.0 } + time_w;
+    let tail = gap + if chip.is_some() { chip_w + gap } else { 0.0 } + time_w;
 
     if app.cfg.modules.clock {
         // 节日名放在日期下方（小字），与日期共用左边界、不再额外占水平空间
@@ -408,13 +428,13 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
         }
     }
 
-    // 上班状态徽标（日期之后）
-    if let Some(p) = phs {
+    // 状态徽标（日期之后）：工作模式为上班阶段，盯盘模式为「盯盘中」
+    if let Some((label, col)) = chip.as_ref() {
         if cx + chip_w + gap + time_w <= money_left {
-            let col = p.color();
+            let col = *col;
             cv.rrect(cx, cy - s(9.0), chip_w, s(18.0), s(9.0), col, alpha * 0.13);
             cv.circle(cx + s(6.5), cy, s(2.8), col, alpha * 0.95);
-            cv.text_ex(cx + s(12.0), cy - s(9.5), chip_tw + 2.0, s(19.0), &chip_label, 10.5, W_MED, col, alpha, 0, 1);
+            cv.text_ex(cx + s(12.0), cy - s(9.5), chip_tw + 2.0, s(19.0), label, 10.5, W_MED, col, alpha, 0, 1);
             cx += chip_w + gap;
         }
     }
@@ -477,7 +497,64 @@ impl PillValue {
 
 /// 胶囊右侧「打工人信息」轮播条目：(标签, 值)
 /// 时长精确到秒、每秒都在变；数值与单位分色分字号，进度用条展示。
+/// 胶囊右侧轮播条目（按当前模式选择内容）：
+/// - 工作模式：今日已赚 / 已工作 / 进度 / 距午休-下班 / 打字
+/// - 盯盘模式：每只自选的「股价 + 涨跌幅」，有持仓再追加「今日盈亏」
 fn pill_items(app: &App, now_f: f64, now_min: f64) -> Vec<(String, PillValue)> {
+    if app.cfg.stock_mode() {
+        pill_stock_items()
+    } else {
+        pill_work_items(app, now_f, now_min)
+    }
+}
+
+/// 盯盘模式条目：每只自选一条「名称｜股价 涨跌幅」，红涨绿跌。
+/// 有持仓时追加一条今日盈亏（`Σ(现价-昨收)×数量`）。
+fn pill_stock_items() -> Vec<(String, PillValue)> {
+    let items = crate::modules::stock::read_items();
+    if items.is_empty() {
+        return vec![
+            ("盯盘助手".to_string(), PillValue::Plain("暂无自选".to_string(), TXT3)),
+        ];
+    }
+    let quotes = crate::modules::stock::snapshot();
+    let mut out: Vec<(String, PillValue)> = Vec::with_capacity(items.len() + 1);
+    for it in &items {
+        let q = crate::modules::stock::quote_for(&quotes, &it.code);
+        // 名称优先取自选文件里的（已由行情补全），空则回落快照名称、再不行用代码
+        let name = if !it.name.is_empty() {
+            it.name.clone()
+        } else {
+            q.map(|x| x.name.clone()).unwrap_or_else(|| it.code.clone())
+        };
+        // 名称过长截断：右侧块宽有限（盯盘模式上限更紧，要给「盯盘中」徽标让位），
+        // 长名称会把股价挤出可视区，这里统一收到 4 字
+        let name = if name.chars().count() > 4 {
+            format!("{}…", name.chars().take(4).collect::<String>())
+        } else {
+            name
+        };
+        let (text, col) = match q {
+            Some(x) if x.price > 0.0 => {
+                (format!("{:.2} {:+.2}%", x.price, x.chg_pct), color_pct(x.chg_pct))
+            }
+            // 行情还没到（刚启动 / 收盘未拉到）时给占位，避免显示 0.00 误导
+            _ => ("--".to_string(), TXT3),
+        };
+        out.push((name, PillValue::Plain(text, col)));
+    }
+    if items.iter().any(|i| i.qty > 0.0) {
+        let p = crate::modules::stock::today_pnl(&quotes, &items);
+        out.push((
+            "今日盈亏".to_string(),
+            PillValue::Plain(format!("¥{:+.2}", p), pnl_color(p)),
+        ));
+    }
+    out
+}
+
+/// 工作模式条目：今日工作相关（已赚 / 已工作 / 进度 / 距午休-下班 / 打字）
+fn pill_work_items(app: &App, now_f: f64, now_min: f64) -> Vec<(String, PillValue)> {
     let light = crate::theme::light();
     vec![
         (
@@ -523,7 +600,10 @@ fn draw_pill_info(cv: &mut Canvas, app: &App, right: f32, y: f32, ph: f32, now_f
         // 值区宽 + 标签间距 + 标签实宽 + 余量；不要高估，否则会挤掉左侧日期
         block = block.max(val.width() + pill_label_gap() + text_w(label, 10.5) + s(4.0));
     }
-    let block = block.min(s(178.0));
+    // 上限按模式收紧：盯盘模式左侧多了「盯盘中」三字徽标（比两字的上班徽标宽约 10px），
+    // 右侧块给得太宽会把徽标挤掉（徽标放不下时整块跳过不画）。126 保证徽标 + 时间都留得下。
+    let cap = if app.cfg.stock_mode() { s(126.0) } else { s(178.0) };
+    let block = block.min(cap);
     let p = app.anims.rot.v.clamp(0.0, 1.0);
 
     // 裁剪区向右多留 10px：数值右对齐到 right+6（吃进胶囊内边距一部分），

@@ -957,7 +957,7 @@ fn preview_pill() {
     app.anims.pill.set(1.0);
     app.anims.pill_content.set(1.0);
     let (pw, ph) = (render::si(ui::PILL_W as f32), render::si(ui::PILL_H as f32));
-    for i in 0..ui::PILL_ITEMS {
+    for i in 0..ui::pill_count(&app).max(1) {
         app.rot_i = i;
         app.rot_prev = i;
         app.anims.rot.set(1.0);
@@ -1166,6 +1166,49 @@ pub fn tray_click() {
         drop(b);
         redraw();
     });
+}
+
+/// 切换胶囊模式（托盘右键菜单）：
+/// - `work`  工作模式：右侧轮播今日已赚 / 已工作 / 进度 / 距下班 / 打字
+/// - `stock` 盯盘模式：左侧状态显示「盯盘中」，右侧轮播每只自选的股价与涨跌幅 + 今日盈亏
+/// 两种模式共用同一套胶囊布局，只换状态徽标与轮播内容，所以切换只需重置轮播索引、
+/// 存盘并重绘；切入盯盘模式时顺带对自选补拉一次行情，切过去立刻有数。
+pub fn set_mode(mode: &str) {
+    let changed = APP.with(|a| {
+        let mut b = a.borrow_mut();
+        let Some(app) = b.as_mut() else { return false };
+        if app.cfg.mode == mode {
+            return false;
+        }
+        app.cfg.mode = mode.to_string();
+        // 选了盯盘模式却关着盯盘模块时自动开启：否则胶囊在播股价、面板却没有盯盘页，前后割裂
+        if mode == "stock" && !app.cfg.modules.stock {
+            app.cfg.modules.stock = true;
+        }
+        // 两种模式的轮播条目数不同（工作 5 条 / 盯盘 = 自选数 + 今日盈亏），
+        // 索引归零，避免取模后落到不存在的条目上
+        app.rot_i = 0;
+        app.rot_prev = 0;
+        app.rot_next = Instant::now() + Duration::from_millis(4200);
+        app.anims.rot.set(1.0);
+        true
+    });
+    if !changed {
+        return;
+    }
+    if let Some(cfg) = APP.with(|a| a.borrow().as_ref().map(|x| x.cfg.clone())) {
+        cfg.save();
+    }
+    // 切到盯盘模式：快照里没有的代码异步补拉一次（内部自带判重，不会重复发请求）
+    if mode == "stock" {
+        let snap = crate::modules::stock::snapshot();
+        for it in crate::modules::stock::read_items() {
+            if crate::modules::stock::quote_for(&snap, &it.code).is_none() {
+                crate::modules::stock::request_lookup(&it.code);
+            }
+        }
+    }
+    redraw();
 }
 
 pub fn toggle_hidden() {
@@ -1980,11 +2023,15 @@ fn step_anims(app: &mut App, dt: f32) {
     app.anims.rot.step(dt);
     app.anims.mini.step(dt);
 
-    // 胶囊右侧信息轮播：收起态每 4.2 秒上滑切换一条；展开时暂停并重置计时
-    if !app.expanded && app.cfg.modules.salary {
+    // 胶囊右侧信息轮播：收起态每 4.2 秒上滑切换一条；展开时暂停并重置计时。
+    // 条目数随模式变化（工作 5 条 / 盯盘 = 自选数 + 今日盈亏），取模用 pill_count；
+    // 盯盘模式与薪资模块无关，只要在盯盘模式就继续轮播。
+    let rotating = !app.expanded && (app.cfg.stock_mode() || app.cfg.modules.salary);
+    if rotating {
         if Instant::now() >= app.rot_next {
-            app.rot_prev = app.rot_i;
-            app.rot_i = (app.rot_i + 1) % ui::PILL_ITEMS;
+            let n = ui::pill_count(app).max(1);
+            app.rot_prev = app.rot_i % n;
+            app.rot_i = (app.rot_i + 1) % n;
             app.rot_next = Instant::now() + Duration::from_millis(4200);
             app.anims.rot_to();
         }

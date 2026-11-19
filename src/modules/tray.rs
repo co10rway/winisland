@@ -13,7 +13,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyMenu, GetCursorPos, PostMessageW,
-    SetForegroundWindow, TrackPopupMenu, HICON, ICONINFO, MF_SEPARATOR, MF_STRING,
+    SetForegroundWindow, TrackPopupMenu, HICON, ICONINFO, MF_CHECKED, MF_SEPARATOR, MF_STRING,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
 };
 
@@ -22,6 +22,8 @@ pub const TRAY_MSG: u32 = WM_APP + 1;
 const ID_SHOW: i32 = 1;
 const ID_SETTINGS: i32 = 2;
 const ID_QUIT: i32 = 3;
+const ID_MODE_WORK: i32 = 4;
+const ID_MODE_STOCK: i32 = 5;
 
 pub fn add(hwnd: HWND) {
     unsafe {
@@ -125,6 +127,12 @@ unsafe fn make_icon() -> HICON {
 
 unsafe fn show_menu(hwnd: HWND) {
     let Ok(menu) = CreatePopupMenu() else { return };
+    // 模式二选一：当前模式打勾，便于一眼看出胶囊现在处于哪种模式
+    let stock_mode = crate::config::Config::load().stock_mode();
+    let mark = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(menu, mark(!stock_mode), ID_MODE_WORK as usize, w!("工作模式"));
+    let _ = AppendMenuW(menu, mark(stock_mode), ID_MODE_STOCK as usize, w!("盯盘模式"));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
     let _ = AppendMenuW(menu, MF_STRING, ID_SHOW as usize, w!("显示 / 隐藏 灵动岛"));
     let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS as usize, w!("设置…"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -146,6 +154,8 @@ unsafe fn show_menu(hwnd: HWND) {
     match cmd.0 {
         ID_SHOW => crate::app::toggle_hidden(),
         ID_SETTINGS => crate::settings::open(),
+        ID_MODE_WORK => crate::app::set_mode("work"),
+        ID_MODE_STOCK => crate::app::set_mode("stock"),
         ID_QUIT => crate::app::quit(),
         _ => {}
     }
