@@ -1585,6 +1585,41 @@ fn draw_button(cv: &mut Canvas, x: f32, y: f32, w: f32, h: f32, label: &str, pri
     }
 }
 
+/// 应用主图标（与 exe / 托盘 / assets/icon.ico 同源：dynamic-island.svg）。
+/// 按 viewBox 256×256 的比例用 Canvas 图元分层复刻，参数为中心与边长。
+fn draw_logo(cv: &Canvas, cx: f32, cy: f32, size: f32) {
+    let x0 = cx - size / 2.0;
+    let y0 = cy - size / 2.0;
+    let k = size / 256.0;
+    let p = |v: f32| v * k; // SVG 坐标 → 实际偏移
+
+    // 1) 深色圆角底（SVG base 渐变 #202B48→#090D18，对角；此处用垂直近似）
+    cv.rrect_grad(x0 + p(8.0), y0 + p(8.0), p(240.0), p(240.0), p(56.0),
+                  0x202B48, 0x090D18, false, 1.0);
+    // 2) 内描边 白色 9%
+    cv.rrect_stroke(x0 + p(11.0), y0 + p(11.0), p(234.0), p(234.0), p(53.0),
+                    0xFFFFFF, 0.09, p(2.0));
+    // 3) 胶囊外发光（aurora @15%）
+    cv.rrect_grad(x0 + p(32.0), y0 + p(94.0), p(192.0), p(74.0), p(37.0),
+                  0x54F5F2, 0xB16BFF, true, 0.15);
+    // 4) 胶囊主体：三色 aurora（青→蓝→紫）；rrect_grad 仅两色，用青→紫近似，
+    //    中段线性插值自然呈蓝调，46px 下与 SVG 观感一致
+    cv.rrect_grad(x0 + p(32.0), y0 + p(88.0), p(192.0), p(72.0), p(36.0),
+                  0x54F5F2, 0xB16BFF, true, 1.0);
+    // 5) 内层挖空 #080C17
+    cv.rrect(x0 + p(38.0), y0 + p(94.0), p(180.0), p(60.0), p(30.0), 0x080C17, 1.0);
+    // 6) 青色呼吸点 #65FAEF
+    cv.circle(x0 + p(75.0), y0 + p(124.0), p(8.0), 0x65FAEF, 1.0);
+    // 7) 三根律动竖条（圆头，SVG stroke-width 8 / linecap round）
+    for (bx, by1, len, col) in [
+        (154.0, 119.0, 10.0, 0x6A9CFF),
+        (172.0, 113.0, 22.0, 0x9189FF),
+        (190.0, 118.0, 12.0, 0xBE8BFF),
+    ] {
+        cv.rrect(x0 + p(bx - 4.0), y0 + p(by1 - 4.0), p(8.0), p(len + 8.0), p(4.0), col, 1.0);
+    }
+}
+
 fn draw_hero(cv: &mut Canvas, x: f32, y: f32, w: f32, h: f32) {
     cv.rrect_grad(x, y, w, h, s(CARD_R), crate::theme::dark(), 0x15151A, true, 1.0);
     cv.rrect_stroke(x + 0.5, y + 0.5, w - 1.0, h - 1.0, s(CARD_R), crate::theme::light(), 0.9, s(1.0));
@@ -1592,9 +1627,7 @@ fn draw_hero(cv: &mut Canvas, x: f32, y: f32, w: f32, h: f32) {
     let bs = s(46.0);
     let bx = x + s(20.0);
     let by = y + (h - bs) / 2.0;
-    cv.rrect_grad(bx, by, bs, bs, s(13.0), crate::theme::light(), crate::theme::dark(), false, 1.0);
-    cv.rrect(bx + bs * 0.28, by + bs * 0.42, bs * 0.44, s(6.0), s(3.0), 0xFFFFFF, 0.95);
-    cv.circle(bx + bs * 0.78, by + bs * 0.44, s(2.4), 0xFFFFFF, 0.9);
+    draw_logo(cv, bx + bs / 2.0, by + bs / 2.0, bs);
 
     let tx = bx + bs + s(18.0);
     cv.text1(tx, y + s(22.0), w - (tx - x) - s(20.0), s(26.0), "WinIsland", 17.0, W_SEMI, TXT, 1.0);
