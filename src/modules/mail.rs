@@ -30,6 +30,9 @@ static FIRST_POLL: AtomicBool = AtomicBool::new(true);
 #[derive(Default, Clone)]
 pub struct MailShared {
     pub latest: Option<MailCode>,
+    /// 邮件线程每抓到一封「新验证码邮件」就 +1。主界面启动时对齐这个序号，
+    /// 只提示序号增量，避免拿启动时 Store 快照和后台线程比较 UID/时间产生竞态。
+    pub seq: u64,
     pub status: String, // "未配置" / "监听中" / "上次错误: ..."
 }
 
@@ -219,6 +222,7 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
         store.mail_code = Some(mc.clone());
         if let Ok(mut s) = shared.lock() {
             s.latest = Some(mc);
+            s.seq = s.seq.saturating_add(1);
         }
     } else if let Ok(mut s) = shared.lock() {
         // 没有新验证码时保留已有展示内容，不覆盖

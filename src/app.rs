@@ -160,10 +160,11 @@ pub struct App {
     /// 验证码尚未点击复制：一直展示，不自动消失（与喝水提醒一致，必须用户确认）
     pub code_pending: bool,
     pub last_mail_ts: i64,
-    /// 已弹过的验证码邮件 UID。优先用 UID 去重（服务器单调递增），
-    /// 内容指纹只作为老数据 uid=0 时的兜底。
+    /// 邮件线程新验证码序号水位：启动时对齐，只提示序号增量。
+    /// UID/时间/内容指纹都受启动快照与后台线程竞态影响，序号由后台独占递增最可靠。
+    pub last_mail_seq: u64,
+    /// 保留 UID/指纹仅作诊断与日志，不再用于是否弹出的判断。
     pub last_mail_uid: u32,
-    /// 已弹过的验证码指纹（发件人|验证码），兜底防重复。
     pub last_mail_key: Option<String>,
     /// 验证码「复制」按钮被点击的时刻：胶囊上短暂显示「已复制」反馈
     pub code_copied_at: Option<Instant>,
@@ -451,6 +452,12 @@ pub fn run() {
             .as_ref()
             .map(|m| format!("{}|{}", m.from, m.code));
         let last_mail_uid = store.mail_code.as_ref().map(|m| m.uid).unwrap_or(0);
+        // 启动时对齐邮件线程序号：启动前到达的验证码一律不弹，
+        // 之后只要 seq 增加就一定是有新邮件到达（邮件线程独占递增）。
+        let last_mail_seq = mail_shared
+            .lock()
+            .map(|s| s.seq)
+            .unwrap_or(0);
 
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
@@ -489,6 +496,7 @@ pub fn run() {
                 code_until: None,
                 code_pending: false,
                 last_mail_ts,
+                last_mail_seq,
                 last_mail_uid,
                 last_mail_key,
                 code_copied_at: None,
@@ -729,6 +737,7 @@ fn preview_app(demo: bool) -> App {
         code_until: None,
         code_pending: false,
         last_mail_ts: 0,
+        last_mail_seq: 0,
         last_mail_uid: 0,
         last_mail_key: None,
         code_copied_at: None,
@@ -1663,17 +1672,13 @@ fn tick_second() {
         if app.cfg.modules.mailcode {
             if let Ok(s) = app.mail_shared.lock() {
                 if let Some(mc) = &s.latest {
-                    let key = format!("{}|{}", mc.from, mc.code);
-                    // UID 优先：只有比上次弹过的邮件更新才算新验证码。
-                    // 老数据 uid=0 时退回「内容指纹 + 时间戳」判断。
-                    let fresh_by_uid = mc.uid > app.last_mail_uid;
-                    let fresh_by_key = mc.uid == 0
-                        && app.last_mail_key.as_deref() != Some(key.as_str())
-                        && mc.ts >= app.last_mail_ts;
-                    if fresh_by_uid || fresh_by_key {
+                    // 只认邮件线程独占递增的序号：启动前到达的不弹，
+                    // 启动后新到的验证码 seq 必定 +1，不会被快照竞态吞掉。
+                    if s.seq > app.last_mail_seq {
+                        app.last_mail_seq = s.seq;
                         app.last_mail_ts = mc.ts;
                         app.last_mail_uid = mc.uid.max(app.last_mail_uid);
-                        app.last_mail_key = Some(key);
+                        app.last_mail_key = Some(format!("{}|{}", mc.from, mc.code));
                         // 不点复制就一直展示；只有点复制才启动 5 秒倒计时。
                         app.code_pending = true;
                         app.code_until = None;
