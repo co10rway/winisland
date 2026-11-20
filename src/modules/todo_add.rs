@@ -174,6 +174,7 @@ unsafe fn ensure_class(hinst: HINSTANCE) {
         lpfnWndProc: Some(wndproc),
         hInstance: hinst.into(),
         lpszClassName: class_name,
+        hIcon: crate::modules::tray::app_icon(),
         hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
         ..Default::default()
     };

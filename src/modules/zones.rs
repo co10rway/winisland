@@ -389,6 +389,7 @@ fn register_class() {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst.into(),
             lpszClassName: CLASS,
+            hIcon: crate::modules::tray::app_icon(),
             hbrBackground: std::mem::transmute(GetStockObject(NULL_BRUSH)),
             style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             ..Default::default()
@@ -408,6 +409,7 @@ fn register_rename_class() {
             lpfnWndProc: Some(rename_wndproc),
             hInstance: hinst.into(),
             lpszClassName: RENAME_CLASS,
+            hIcon: crate::modules::tray::app_icon(),
             hbrBackground: CreateSolidBrush(COLORREF(rgb(30, 38, 36))),
             style: CS_HREDRAW | CS_VREDRAW,
             ..Default::default()

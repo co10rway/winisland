@@ -391,6 +391,7 @@ pub fn run() {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst.into(),
             lpszClassName: class_name,
+            hIcon: crate::modules::tray::app_icon(),
             style: CS_HREDRAW | CS_VREDRAW,
             ..Default::default()
         };
