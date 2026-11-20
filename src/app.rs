@@ -159,13 +159,8 @@ pub struct App {
     pub code_until: Option<Instant>,
     /// 验证码尚未点击复制：一直展示，不自动消失（与喝水提醒一致，必须用户确认）
     pub code_pending: bool,
-    pub last_mail_ts: i64,
-    /// 邮件线程新验证码序号水位：启动时对齐，只提示序号增量。
-    /// UID/时间/内容指纹都受启动快照与后台线程竞态影响，序号由后台独占递增最可靠。
+    /// 已处理的验证码序号：邮件线程每弹一封新验证码就 seq+1，主界面只认增量。
     pub last_mail_seq: u64,
-    /// 保留 UID/指纹仅作诊断与日志，不再用于是否弹出的判断。
-    pub last_mail_uid: u32,
-    pub last_mail_key: Option<String>,
     /// 验证码「复制」按钮被点击的时刻：胶囊上短暂显示「已复制」反馈
     pub code_copied_at: Option<Instant>,
     pub peak_wpm: u64,
@@ -443,18 +438,8 @@ pub fn run() {
         let mut store = Store::load();
         store.reset_day_if_needed(&clock::today_str(&st));
         let now_unix = files::now_unix();
-        // 上次残留的验证码不该在重启后弹一次：把「已提醒水位」直接对齐到它
-        let last_mail_ts = store.mail_code.as_ref().map(|m| m.ts).unwrap_or(0);
-        // 上次落盘的验证码也要算「已弹过」：否则重启后后台重新写入同一封旧邮件，
-        // 仅靠时间戳比较会再次弹出。
-        let last_mail_key = store
-            .mail_code
-            .as_ref()
-            .map(|m| format!("{}|{}", m.from, m.code));
-        let last_mail_uid = store.mail_code.as_ref().map(|m| m.uid).unwrap_or(0);
-        // 序号基线固定为 0：邮件线程在主界面构造前就已启动，若读取当时的 seq 当基线，
-        // 抢跑写入的新验证码会被当成旧码吞掉。「启动前旧邮件」已由邮件线程的
-        // UIDNEXT 启动基线挡住，能走到 seq 递增的一定是启动后新到的，必须弹。
+        // 序号基线固定 0：邮件线程只在「启动后新到的验证码」时才 seq+1，
+        // 启动前的旧邮件由邮件线程的时间基准挡住，不会走到这里。
         let last_mail_seq = 0u64;
 
         APP.with(|a| {
@@ -493,10 +478,7 @@ pub fn run() {
                 sed_ack_idle: 0,
                 code_until: None,
                 code_pending: false,
-                last_mail_ts,
                 last_mail_seq,
-                last_mail_uid,
-                last_mail_key,
                 code_copied_at: None,
                 peak_wpm: 0,
                 rot_i: 0,
@@ -734,10 +716,7 @@ fn preview_app(demo: bool) -> App {
         sed_ack_idle: 0,
         code_until: None,
         code_pending: false,
-        last_mail_ts: 0,
         last_mail_seq: 0,
-        last_mail_uid: 0,
-        last_mail_key: None,
         code_copied_at: None,
         peak_wpm: 0,
         rot_i: 0,
@@ -1680,21 +1659,16 @@ fn tick_second() {
                         None
                     }
                 });
-            if let Some((seq, mc)) = pending {
+            if let Some((seq, _mc)) = pending {
                 app.last_mail_seq = seq;
-                app.last_mail_ts = mc.ts;
-                app.last_mail_uid = mc.uid.max(app.last_mail_uid);
-                app.last_mail_key = Some(format!("{}|{}", mc.from, mc.code));
                 // 不点复制就一直展示；只有点复制才启动 5 秒倒计时。
                 app.code_pending = true;
                 app.code_until = None;
                 app.code_copied_at = None;
-                // 同步给邮件线程写进状态栏，便于确认主界面确实处理到了
+                // 同步给邮件线程写进状态栏
                 if let Ok(mut shared) = app.mail_shared.lock() {
                     shared.ui_seq = seq;
                 }
-                // 不标脏：邮件水位/验证码由后台线程独立落盘。主界面一标脏，
-                // 2 秒后的定时 save 就会用启动快照覆盖 UID 水位，旧邮件会反复弹。
             }
         }
 

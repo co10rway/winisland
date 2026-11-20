@@ -9,31 +9,36 @@
 //!    「验证码」四个字，第二次之后全被当成同一条跳过。
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::store::MailCode;
 
-/// 本进程是否还没完成首轮拉取。
-///
-/// 首轮的作用是「静默对齐水位」：把 `mail_last_uid` 推进到收件箱当前最新的 UID，
-/// 但不弹任何验证码。这样启动前邮箱里积压的旧验证码不会被翻出来；而此后新到达
-/// 的邮件 UID 一定更大，下一轮就能被识别并弹出。
-///
-/// 之所以不再用「INTERNALDATE 与本机启动时间比较」来判断新旧：那是两个不同时钟源
-/// （邮件服务器时间 vs 本机系统时间），只要两者有偏差，启动后新到的邮件时间戳就
-/// 可能 ≤ 本机启动时刻而被误判成旧邮件跳过，表现为「先开软件、后收邮件却收不到」。
-/// UID 是服务器单调递增的，用它做水位完全不依赖时钟，更可靠。
+/// 首轮拉取是否还没完成。首轮只做一件事：确定「服务器视角的启动时刻」基准。
 static FIRST_POLL: AtomicBool = AtomicBool::new(true);
+
+/// 「启动时刻」基准，取**邮件服务器时钟**（INTERNALDATE）。
+///
+/// 设计很简单：程序启动后第一轮拉取，取收件箱里最新一封邮件的 INTERNALDATE 作为
+/// 基准 T0；此后只要有邮件的 INTERNALDATE > T0，就认为它是「启动后新到的」，
+/// 提取其中的验证码弹出来。
+///
+/// 为什么基准取自服务器邮件而不是本机时间：INTERNALDATE 是服务器记录的到达时间，
+/// 拿它和本机启动时间比会有两端时钟偏差（旧版踩过坑，新邮件被误判成旧的收不到）。
+/// 基准和比较值都用 INTERNALDATE，同一个时钟源，偏差问题从根上不存在。
+///
+/// 另存基准邮件的 UID 作次级判断：INTERNALDATE 精度只到秒，同一秒内到达的新邮件
+/// date 会等于基准，靠 UID 更大来识别，避免漏掉。
+static BASE_TS: AtomicI64 = AtomicI64::new(0);
+static BASE_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Default, Clone)]
 pub struct MailShared {
     pub latest: Option<MailCode>,
-    /// 邮件线程每抓到一封「新验证码邮件」就 +1。主界面启动时对齐这个序号，
-    /// 只提示序号增量，避免拿启动时 Store 快照和后台线程比较 UID/时间产生竞态。
+    /// 邮件线程每抓到一封「新验证码邮件」就 +1。主界面只提示序号增量。
     pub seq: u64,
-    /// 主界面已处理的序号（主界面写入，供状态栏诊断：seq > ui_seq 就说明卡在 UI 弹窗）
+    /// 主界面已处理的序号（主界面写入，供状态栏诊断）
     pub ui_seq: u64,
     pub status: String, // "未配置" / "监听中" / "上次错误: ..."
 }
@@ -175,51 +180,65 @@ fn set_only_status(s: String) {
 fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, String> {
     let mut conn = connect(cfg)?;
     let folder = if cfg.folder.trim().is_empty() { "INBOX" } else { cfg.folder.trim() };
-    let (exists, uidnext) = conn.select(folder)?;
+    let (exists, _uidnext) = conn.select(folder)?;
 
-    let mut store = crate::store::Store::load();
+    // 按序号拉最近 30 封（绝不用 UID 范围查询——QQ 邮箱上会返回 0 封）
+    let msgs = conn.fetch_since(0, exists)?;
 
-    // 「启动前 vs 启动后」的分界线：SELECT 完成时，UID < uidnext 的邮件都已存在。
-    // 只在进程首轮成功拉取时记录这条基线到内存；之后每轮都用同一条基线，
-    // 因此邮件是在启动前还是启动后到达，与它是否恰好被首轮 FETCH 到无关。
-    // 这修掉了「首轮无条件静默」吞掉启动初期新邮件的老问题。
-    static BOOT_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // 首轮：取收件箱里「最新一封」邮件的 (INTERNALDATE, UID) 作为启动基准，不弹验证码。
+    // "最新"按 (date, uid) 字典序取最大。之后只有 (date, uid) 更大的才算启动后新到。
     let first = FIRST_POLL
         .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok();
-    if first && uidnext > 0 {
-        BOOT_UID.store(uidnext, Ordering::SeqCst);
+    if first {
+        let mut best: Option<(i64, u32)> = None;
+        for m in &msgs {
+            if m.date <= 0 {
+                continue;
+            }
+            let better = best
+                .map(|(d, u)| m.date > d || (m.date == d && m.uid > u))
+                .unwrap_or(true);
+            if better {
+                best = Some((m.date, m.uid));
+            }
+        }
+        if let Some((d, u)) = best {
+            BASE_TS.store(d, Ordering::SeqCst);
+            BASE_UID.store(u, Ordering::SeqCst);
+        }
     }
-    let boot_uid = BOOT_UID.load(Ordering::SeqCst);
+    let base_ts = BASE_TS.load(Ordering::SeqCst);
+    let base_uid = BASE_UID.load(Ordering::SeqCst);
 
-    // 服务器不返回 UIDNEXT 时的兜底：退回「首轮静默对齐」(old behavior)，
-    // 保证启动前积压的旧验证码不会被翻出来弹。
-    let silent_first = boot_uid == 0 && first;
-
-    // 实际过滤水位 = max(上次落盘水位, 启动基线 - 1)。
-    // 启动基线保证旧邮件不弹；磁盘水位保证跨轮不重复弹。
-    let last_uid = store.mail_last_uid.max(boot_uid.saturating_sub(1));
-    let msgs = conn.fetch_since(last_uid, exists)?;
-
-    let mut newest: Option<(u32, MailCode)> = None;
-    let mut max_uid = last_uid;
-    let mut fetched = 0usize;
+    // 找出「启动后新到」的验证码邮件：(date, uid) 晚于/大于基准。
+    let mut newest: Option<(i64, u32, MailCode)> = None;
+    let fetched = msgs.len();
     let mut skipped_old = 0usize;
     for m in &msgs {
-        fetched += 1;
-        max_uid = max_uid.max(m.uid);
-        if m.uid <= last_uid {
+        if first {
             skipped_old += 1;
             continue;
         }
-        // 仅当拿不到 UIDNEXT 时，首轮才静默跳过（兜底，避免弹启动前旧码）
-        if silent_first {
+        // date 解析失败的邮件跳过（无法判断是否新到）
+        if m.date <= 0 {
+            skipped_old += 1;
+            continue;
+        }
+        // 与基准比较：date 更大，或同秒但 UID 更大，才算新邮件
+        let is_after_base = m.date > base_ts || (m.date == base_ts && m.uid > base_uid);
+        if !is_after_base {
+            skipped_old += 1;
             continue;
         }
         if let Some(code) = extract_code(&m.subject, &m.body) {
-            let ok = newest.as_ref().map(|(u, _)| m.uid > *u).unwrap_or(true);
-            if ok {
+            let is_newer = newest
+                .as_ref()
+                .map(|(d, u, _)| m.date > *d || (m.date == *d && m.uid > *u))
+                .unwrap_or(true);
+            if is_newer {
                 newest = Some((
+                    m.date,
                     m.uid,
                     MailCode {
                         code,
@@ -232,10 +251,8 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
         }
     }
 
-    store.mail_last_uid = max_uid;
-    let newest_uid = newest.as_ref().map(|(u, _)| *u);
-    if let Some((_, mc)) = newest {
-        store.mail_code = Some(mc.clone());
+    let newest_uid = newest.as_ref().map(|(_, u, _)| *u);
+    if let Some((_, _, mc)) = newest {
         if let Ok(mut s) = shared.lock() {
             s.latest = Some(mc);
             s.seq = s.seq.saturating_add(1);
@@ -243,27 +260,40 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
     } else if let Ok(mut s) = shared.lock() {
         // 没有新验证码时保留已有展示内容，不覆盖
         if s.latest.is_none() {
-            s.latest = store.mail_code.clone();
+            // 用 store 里可能存在的历史值兜底（不含则空）
+            s.latest = crate::store::Store::load().mail_code.clone();
         }
     }
-    store.save();
 
-    // 诊断串：拉到几封 / 跳过几封旧 / 过滤水位 / 启动基线 / 本轮是否首轮 / 是否取到验证码
-    // seq/ui_seq 用来区分「邮件线程没抓到」(seq 不涨) 和「抓到但主界面没弹」(seq > ui_seq)
+    // 诊断串：拉到几封 / 跳过几封旧 / 基准时间 / seq / 最近一封主题和到达时间
     let (seq, ui_seq) = shared
         .lock()
         .map(|s| (s.seq, s.ui_seq))
         .unwrap_or((0, 0));
+    let recent = msgs
+        .last()
+        .map(|m| format!(" · 最近「{}」{}", truncate_subject(&m.subject, 10), m.date))
+        .unwrap_or_default();
     let diag = format!(
-        "拉到 {fetched} 封 · 旧 {skipped_old} · 水位 {max_uid} · 基线 {boot_uid} · seq {seq}/{ui_seq}{}{}",
-        if silent_first { " · 首轮静默(无UIDNEXT)" } else if first { " · 首轮对齐" } else { "" },
+        "拉到 {fetched} 封 · 旧 {skipped_old} · 基准 {base_ts} · seq {seq}/{ui_seq}{}{}{}",
+        if first { " · 首轮对齐" } else { "" },
         if let Some(u) = newest_uid {
             format!(" · 验证码 UID {u}")
         } else {
             String::new()
         },
+        recent,
     );
     Ok(diag)
+}
+
+/// 截断主题用于状态栏诊断（按字符，兼容中文）
+fn truncate_subject(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
 }
 
 fn is_ok(reply: &str) -> bool {
@@ -420,24 +450,18 @@ impl<S: Read + Write> ImapConn<S> {
         Ok((exists, uidnext))
     }
 
-    /// 拉取新邮件（首轮只取最近 10 封，避免一次拉满）。
-    /// 返回每条邮件的 UID、头部原文、正文片段。
+    /// 拉取最近若干封邮件（按序号，不用 UID 范围）。
     ///
-    /// 注意首轮必须用**序号**（`FETCH 41:50`）而不是 UID（`UID FETCH 41:50`）：
-    /// 后者取的是 UID 41~50 那几封，对一个有几千封信的邮箱来说是最老的那批，
-    /// 反而不是最近的。
-    fn fetch_since(&mut self, last_uid: u32, exists: u32) -> Result<Vec<MailMsg>, String> {
+    /// 关键教训：绝不能用 `UID FETCH {last_uid+1}:*` 来「只取新邮件」——
+    /// QQ 邮箱上这经常返回 0 封（状态栏「拉到 0 封」），因为 UID 与序号不是线性对应，
+    /// 且水位一旦偏高就永远拉不到新邮件。改为每轮都按**序号**拉最近 30 封，
+    /// 保证只要新邮件在收件箱里就一定被抓到，新旧判断交给调用方用 UID + INTERNALDATE 做。
+    fn fetch_since(&mut self, _last_uid: u32, exists: u32) -> Result<Vec<MailMsg>, String> {
         if exists == 0 {
             return Ok(Vec::new());
         }
-        let (word, range) = if last_uid == 0 {
-            (
-                "FETCH",
-                format!("{}:{}", exists.saturating_sub(9).max(1), exists),
-            )
-        } else {
-            ("UID FETCH", format!("{}:*", last_uid + 1))
-        };
+        let word = "FETCH";
+        let range = format!("{}:{}", exists.saturating_sub(29).max(1), exists);
         let tag = self.next_tag();
         let req = format!(
             "{} {} {} (UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODY.PEEK[TEXT]<0.4096>)\r\n",

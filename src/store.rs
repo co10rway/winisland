@@ -84,6 +84,7 @@ impl Store {
         serde_json::from_str::<Store>(&txt).ok()
     }
 
+    #[allow(dead_code)]
     pub fn save(&self) {
         let _g = STORE_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = crate::config::data_path();
