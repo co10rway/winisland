@@ -228,6 +228,7 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
     let mut new_cnt = 0usize;
     let mut code_hits = 0usize;
     let mut latest_new_subject: Option<String> = None;
+    let mut latest_candidates: Option<Vec<String>> = None;
     for m in &msgs {
         if first {
             skipped_old += 1;
@@ -248,6 +249,7 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
         latest_new_subject = Some(truncate_subject(&m.subject, 12));
         if let Some(code) = extract_code(&m.subject, &m.body) {
             code_hits += 1;
+            latest_candidates = None;
             let is_newer = newest
                 .as_ref()
                 .map(|(d, u, _)| m.date > *d || (m.date == *d && m.uid > *u))
@@ -264,6 +266,9 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
                     },
                 ));
             }
+        } else if latest_candidates.is_none() {
+            // 没解析出验证码：记下这封正文里的数字候选，供状态栏诊断
+            latest_candidates = Some(digit_candidates(&m.body));
         }
     }
 
@@ -298,7 +303,16 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
         let subj = latest_new_subject
             .map(|s| format!(" · 新邮件「{s}」"))
             .unwrap_or_default();
-        format!(" · 新 {new_cnt} 命中 {code_hits}{subj}")
+        // 命中 0 时附上正文里的数字候选，一眼看出是不是提取规则没覆盖到
+        let cand = if code_hits == 0 {
+            latest_candidates
+                .filter(|v| !v.is_empty())
+                .map(|v| format!(" · 候选[{}]", v.join(",")))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        format!(" · 新 {new_cnt} 命中 {code_hits}{subj}{cand}")
     };
     let diag = format!(
         "拉到 {fetched} 封 · 旧 {skipped_old} · 基准 {base_ts} · seq {seq}/{ui_seq}{}{}{}{}",
@@ -312,6 +326,35 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
         recent,
     );
     Ok(diag)
+}
+
+/// 收集文本里所有 4~8 位数字串（去重，最多 8 个），用于状态栏诊断：
+/// 若「命中 0」但候选里有 6 位数字，就能确认是提取规则问题而非邮件没正文。
+fn digit_candidates(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            let n = i - start;
+            if (4..=8).contains(&n) {
+                let v: String = chars[start..i].iter().collect();
+                if !out.contains(&v) {
+                    out.push(v);
+                }
+            }
+        } else {
+            i += 1;
+        }
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
 }
 
 /// 截断主题用于状态栏诊断（按字符，兼容中文）
@@ -796,28 +839,29 @@ fn q_decode(s: &str) -> Vec<u8> {
 /// 于是「拉到了邮件却解析不出验证码」。这里遍历所有段。
 fn decode_body(raw: &str) -> String {
     let lower = raw.to_lowercase();
-    let mut out = String::new();
+    // 收集所有「原始文本来源」：base64 解码段、quoted-printable、原文。
+    // 关键修复：对**每一个**来源都要做 HTML 剥离——旧实现只对未解码的 raw 剥离，
+    // 而 base64 解码后的 HTML（验证码数字常被拆进 <span> 里）从未被剥离，
+    // 于是「拉到邮件、时间判断也通过，就是解析不出验证码」。
+    let mut sources: Vec<String> = Vec::new();
 
     // 1) 遍历所有 base64 传输编码段
     let mut search = 0usize;
     while let Some(rel) = lower[search..].find("base64") {
         let pos = search + rel;
-        // 跳过这一行（Content-Transfer-Encoding: base64）到下一个换行
         let line_end = raw[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(raw.len());
         let chunk: String = raw[line_end..]
             .lines()
             .skip_while(|l| l.trim().is_empty())
             .take_while(|l| {
                 let t = l.trim();
-                // base64 数据行：非空、不是 MIME 边界、不含 MIME 头（冒号）
                 !t.is_empty() && !t.starts_with("--") && !t.contains(':')
             })
             .collect::<Vec<_>>()
             .join("");
         if chunk.len() >= 16 {
             if let Ok(bytes) = base64_decode(&chunk) {
-                out.push_str(&String::from_utf8_lossy(&bytes));
-                out.push('\n');
+                sources.push(String::from_utf8_lossy(&bytes).into_owned());
             }
         }
         search = line_end;
@@ -828,23 +872,32 @@ fn decode_body(raw: &str) -> String {
 
     // 2) quoted-printable
     if lower.contains("quoted-printable") {
-        out.push_str(&String::from_utf8_lossy(&q_decode(raw)));
-        out.push('\n');
+        sources.push(String::from_utf8_lossy(&q_decode(raw)).into_owned());
     }
 
-    // 3) 剥掉 HTML 标签：<b>123456</b> -> 123456，
-    //    很多验证码邮件把数字包在 <span>/<strong> 里，标签会挡住数字串识别。
-    out.push_str(&strip_html_tags(raw));
-    out.push('\n');
+    // 3) 原文
+    sources.push(raw.to_string());
 
-    // 4) 原文兜底
-    out.push_str(raw);
+    // 对每个来源生成三种视图，全部拼给 extract_code 逐个尝试：
+    //   a) 原文
+    //   b) 紧凑剥离 HTML（标签直接删掉）：<span>4</span><span>7</span> -> 47
+    //      验证码常被拆进多个标签，紧凑版才能拼回连续数字。
+    //   c) 空格剥离 HTML：<td>1</td><td>2</td> -> "1 2"（避免瞎拼出假数字）
+    let mut out = String::new();
+    for src in &sources {
+        out.push_str(src);
+        out.push('\n');
+        out.push_str(&strip_html(src, ""));
+        out.push('\n');
+        out.push_str(&strip_html(src, " "));
+        out.push('\n');
+    }
     out
 }
 
-/// 去掉 HTML 标签，保留文本内容；标签位置用空格替代，避免把
-/// `<td>1</td><td>2</td>` 拼成 "12" 这种假数字。
-fn strip_html_tags(s: &str) -> String {
+/// 去掉 HTML 标签，标签位置替换为 `sep`。
+/// sep="" 得到紧凑版（数字被标签分开时能拼回），sep=" " 得到保守版。
+fn strip_html(s: &str, sep: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
     for c in s.chars() {
@@ -852,7 +905,7 @@ fn strip_html_tags(s: &str) -> String {
             '<' => in_tag = true,
             '>' => {
                 in_tag = false;
-                out.push(' ');
+                out.push_str(sep);
             }
             _ if !in_tag => out.push(c),
             _ => {}
@@ -909,6 +962,7 @@ pub fn extract_code(subject: &str, body: &str) -> Option<String> {
             "验证您的",
             "验证你的",
             "验证您",
+            "验证",
             "您输入的",
             "你输入的",
             "code is",
@@ -943,7 +997,52 @@ pub fn extract_code(subject: &str, body: &str) -> Option<String> {
             }
         }
     }
+
+    // 兜底：主题或正文含明确验证码语义，但上面关键词后没直接跟数字时，
+    // 取正文中第一个孤立的 4~8 位数字串（前后不能紧挨其他数字/字母，避免订单号）。
+    // AKY 这类邮件若把「验证码 837261」写成「您的验证 837261 已发送」等变体即可命中。
+    let combined = format!("{subject}\n{body}").to_lowercase();
+    let looks_like_code = [
+        "验证码", "校验", "动态码", "确认码", "激活码", "认证码", "安全码",
+        "otp", "verify", "verification", "one-time", "passcode", "code",
+        "验证", "口令", "密码",
+    ]
+    .iter()
+    .any(|k| combined.contains(k));
+    if looks_like_code {
+        if let Some(code) = isolated_digit_run(body, 4, 8) {
+            return Some(code);
+        }
+    }
     None
+}
+
+/// 找第一个「孤立」数字串：长度在 [min,max]，且前后紧邻字符不是字母/数字
+/// （避免把订单号 "单号12345678" / 网址里的数字当成验证码）。
+fn isolated_digit_run(s: &str, min: usize, max: usize) -> Option<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            let n = i - start;
+            let prev_ok = start == 0 || !is_word_char(chars[start - 1]);
+            let next_ok = i == chars.len() || !is_word_char(chars[i]);
+            if (min..=max).contains(&n) && prev_ok && next_ok {
+                return Some(chars[start..i].iter().collect());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 fn first_digit_run(s: &str, min: usize, max: usize) -> Option<String> {
