@@ -78,15 +78,25 @@ pub fn spawn(shared: SharedMail) {
             std::thread::sleep(Duration::from_secs(5));
             continue;
         }
-        match poll_once(&cfg, &shared) {
-            Ok(diag) => {
+        // 必须兜住 panic：poll_once 里任何一处切片/解析崩溃都会让线程直接退出，
+        // 之后再也不轮询（表现为「诊断停在某个时间、收到邮件却不通知」）。
+        // 用 catch_unwind 把每轮包起来，出错只跳过这一轮，30 秒后照常重试。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            poll_once(&cfg, &shared)
+        }));
+        match result {
+            Ok(Ok(diag)) => {
                 let wait = cfg.poll_seconds.clamp(10, 600) as u64;
                 // 状态里带上拉取诊断，用户能直接看到监听是否在跑、拉到几封、卡在哪
                 set_status(&shared, format!("监听中 · 每 {wait} 秒 · {diag}"));
                 std::thread::sleep(Duration::from_secs(wait));
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 set_status(&shared, format!("连接失败：{e}（30 秒后重试）"));
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            Err(_) => {
+                set_status(&shared, "内部解析异常，本轮跳过（30 秒后重试）");
                 std::thread::sleep(Duration::from_secs(30));
             }
         }
@@ -215,6 +225,9 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
     let mut newest: Option<(i64, u32, MailCode)> = None;
     let fetched = msgs.len();
     let mut skipped_old = 0usize;
+    let mut new_cnt = 0usize;
+    let mut code_hits = 0usize;
+    let mut latest_new_subject: Option<String> = None;
     for m in &msgs {
         if first {
             skipped_old += 1;
@@ -231,7 +244,10 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
             skipped_old += 1;
             continue;
         }
+        new_cnt += 1;
+        latest_new_subject = Some(truncate_subject(&m.subject, 12));
         if let Some(code) = extract_code(&m.subject, &m.body) {
+            code_hits += 1;
             let is_newer = newest
                 .as_ref()
                 .map(|(d, u, _)| m.date > *d || (m.date == *d && m.uid > *u))
@@ -274,14 +290,25 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
         .last()
         .map(|m| format!(" · 最近「{}」{}", truncate_subject(&m.subject, 10), m.date))
         .unwrap_or_default();
+    // 新 {new_cnt} = 通过「晚于基准」判断的邮件数；命中 {code_hits} = 其中解析出验证码的封数。
+    // 三者组合可一眼定位：新=0→时间判断拦住；新>0命中=0→正文/关键词解析失败。
+    let new_info = if first {
+        String::new()
+    } else {
+        let subj = latest_new_subject
+            .map(|s| format!(" · 新邮件「{s}」"))
+            .unwrap_or_default();
+        format!(" · 新 {new_cnt} 命中 {code_hits}{subj}")
+    };
     let diag = format!(
-        "拉到 {fetched} 封 · 旧 {skipped_old} · 基准 {base_ts} · seq {seq}/{ui_seq}{}{}{}",
+        "拉到 {fetched} 封 · 旧 {skipped_old} · 基准 {base_ts} · seq {seq}/{ui_seq}{}{}{}{}",
         if first { " · 首轮对齐" } else { "" },
         if let Some(u) = newest_uid {
             format!(" · 验证码 UID {u}")
         } else {
             String::new()
         },
+        new_info,
         recent,
     );
     Ok(diag)
@@ -463,8 +490,10 @@ impl<S: Read + Write> ImapConn<S> {
         let word = "FETCH";
         let range = format!("{}:{}", exists.saturating_sub(29).max(1), exists);
         let tag = self.next_tag();
+        // 正文抓 16KB：QQ 邮箱验证码邮件多为 HTML，base64 编码后验证码常被推到 4KB 之后，
+        // 只取 4096 字节会把验证码整段截掉（AKY 邮件拉到了却解析不出码的根因之一）。
         let req = format!(
-            "{} {} {} (UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODY.PEEK[TEXT]<0.4096>)\r\n",
+            "{} {} {} (UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODY.PEEK[TEXT]<0.16384>)\r\n",
             tag, word, range
         );
         self.stream
@@ -761,18 +790,26 @@ fn q_decode(s: &str) -> Vec<u8> {
 }
 
 /// 正文可能被 base64 / quoted-printable 编码（中文邮件非常常见），
-/// 这里把「解码后的文本」和「原文」都拼在一起返回，交给 extract_code 逐个尝试
+/// 这里把「解码后的文本」和「原文」都拼在一起返回，交给 extract_code 逐个尝试。
+/// 关键：一封 multipart 邮件可能有**多个** base64 段（纯文本段 + HTML 段），
+/// 验证码常常只在其中一段里；旧实现只解第一个 "base64" 之后的块，
+/// 于是「拉到了邮件却解析不出验证码」。这里遍历所有段。
 fn decode_body(raw: &str) -> String {
     let lower = raw.to_lowercase();
     let mut out = String::new();
-    // 1) base64 段：从 "base64" 那一行之后开始取，跳过空行，直到 MIME 边界 / 下一个头部
-    if let Some(pos) = lower.find("base64") {
-        let start = raw[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(raw.len());
-        let chunk: String = raw[start..]
+
+    // 1) 遍历所有 base64 传输编码段
+    let mut search = 0usize;
+    while let Some(rel) = lower[search..].find("base64") {
+        let pos = search + rel;
+        // 跳过这一行（Content-Transfer-Encoding: base64）到下一个换行
+        let line_end = raw[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(raw.len());
+        let chunk: String = raw[line_end..]
             .lines()
             .skip_while(|l| l.trim().is_empty())
             .take_while(|l| {
                 let t = l.trim();
+                // base64 数据行：非空、不是 MIME 边界、不含 MIME 头（冒号）
                 !t.is_empty() && !t.starts_with("--") && !t.contains(':')
             })
             .collect::<Vec<_>>()
@@ -783,13 +820,44 @@ fn decode_body(raw: &str) -> String {
                 out.push('\n');
             }
         }
+        search = line_end;
+        if search >= raw.len() {
+            break;
+        }
     }
+
     // 2) quoted-printable
     if lower.contains("quoted-printable") {
         out.push_str(&String::from_utf8_lossy(&q_decode(raw)));
         out.push('\n');
     }
+
+    // 3) 剥掉 HTML 标签：<b>123456</b> -> 123456，
+    //    很多验证码邮件把数字包在 <span>/<strong> 里，标签会挡住数字串识别。
+    out.push_str(&strip_html_tags(raw));
+    out.push('\n');
+
+    // 4) 原文兜底
     out.push_str(raw);
+    out
+}
+
+/// 去掉 HTML 标签，保留文本内容；标签位置用空格替代，避免把
+/// `<td>1</td><td>2</td>` 拼成 "12" 这种假数字。
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
     out
 }
 
@@ -833,11 +901,26 @@ pub fn extract_code(subject: &str, body: &str) -> Option<String> {
             "动态码",
             "确认码",
             "激活码",
+            "认证码",
+            "安全码",
+            "动态密码",
+            "一次性密码",
+            "口令",
+            "验证您的",
+            "验证你的",
+            "验证您",
+            "您输入的",
+            "你输入的",
             "code is",
             "verification code",
             "your code",
+            "one-time code",
+            "otp",
+            "verify",
+            "passcode",
             "code:",
             "code：",
+            "code ",
         ] {
             if let Some(pos) = low.find(kw) {
                 let rest = &low[pos + kw.len()..];
@@ -849,9 +932,14 @@ pub fn extract_code(subject: &str, body: &str) -> Option<String> {
         // "123456 is your ..."（GitHub 风格）
         let head: String = low.chars().take(24).collect();
         if let Some(code) = first_digit_run(&head, 4, 8) {
-            let tail = head[code.len()..].trim_start();
-            if tail.starts_with("is your") || tail.starts_with("是您") {
-                return Some(code);
+            // 用 find 定位数字的真实字节位置，而不是拿 code.len() 当字节下标：
+            // head 开头若有中文（UTF-8 多字节），head[code.len()..] 会切在字符中间直接 panic，
+            // 导致整个邮件线程崩溃、之后再也不轮询（多版「拉到邮件却不通知」的隐藏元凶）。
+            if let Some(p) = head.find(&code) {
+                let tail = head[p + code.len()..].trim_start();
+                if tail.starts_with("is your") || tail.starts_with("是您") {
+                    return Some(code);
+                }
             }
         }
     }
