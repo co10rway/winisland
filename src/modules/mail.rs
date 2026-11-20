@@ -228,7 +228,6 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
     let mut new_cnt = 0usize;
     let mut code_hits = 0usize;
     let mut latest_new_subject: Option<String> = None;
-    let mut latest_candidates: Option<Vec<String>> = None;
     for m in &msgs {
         if first {
             skipped_old += 1;
@@ -249,7 +248,6 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
         latest_new_subject = Some(truncate_subject(&m.subject, 12));
         if let Some(code) = extract_code(&m.subject, &m.body) {
             code_hits += 1;
-            latest_candidates = None;
             let is_newer = newest
                 .as_ref()
                 .map(|(d, u, _)| m.date > *d || (m.date == *d && m.uid > *u))
@@ -266,9 +264,6 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
                     },
                 ));
             }
-        } else if latest_candidates.is_none() {
-            // 没解析出验证码：记下这封正文里的数字候选，供状态栏诊断
-            latest_candidates = Some(digit_candidates(&m.body));
         }
     }
 
@@ -303,16 +298,7 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
         let subj = latest_new_subject
             .map(|s| format!(" · 新邮件「{s}」"))
             .unwrap_or_default();
-        // 命中 0 时附上正文里的数字候选，一眼看出是不是提取规则没覆盖到
-        let cand = if code_hits == 0 {
-            latest_candidates
-                .filter(|v| !v.is_empty())
-                .map(|v| format!(" · 候选[{}]", v.join(",")))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        format!(" · 新 {new_cnt} 命中 {code_hits}{subj}{cand}")
+        format!(" · 新 {new_cnt} 命中 {code_hits}{subj}")
     };
     let diag = format!(
         "拉到 {fetched} 封 · 旧 {skipped_old} · 基准 {base_ts} · seq {seq}/{ui_seq}{}{}{}{}",
@@ -326,35 +312,6 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
         recent,
     );
     Ok(diag)
-}
-
-/// 收集文本里所有 4~8 位数字串（去重，最多 8 个），用于状态栏诊断：
-/// 若「命中 0」但候选里有 6 位数字，就能确认是提取规则问题而非邮件没正文。
-fn digit_candidates(s: &str) -> Vec<String> {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0usize;
-    while i < chars.len() {
-        if chars[i].is_ascii_digit() {
-            let start = i;
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                i += 1;
-            }
-            let n = i - start;
-            if (4..=8).contains(&n) {
-                let v: String = chars[start..i].iter().collect();
-                if !out.contains(&v) {
-                    out.push(v);
-                }
-            }
-        } else {
-            i += 1;
-        }
-        if out.len() >= 8 {
-            break;
-        }
-    }
-    out
 }
 
 /// 截断主题用于状态栏诊断（按字符，兼容中文）
@@ -939,188 +896,104 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
 
 // ── 验证码提取 ──
 
-// 验证码提取：借鉴业界成熟做法（Thunderbird Vericode / mailhook /
-// @onedaydevelopers/otp-detector / lumbox），核心是「候选 + 邻近关键词评分 + 置信不足不弹」。
-// 绝不用「全文找第一个数字」——那会把订单号 929292、CSS 颜色 #123456、年份当成验证码。
+// 验证码提取：只做最通用的明文格式匹配。
+//
+// 有意保持极简：验证码关键词后面紧跟一段 4~8 位数字，就取它。
+// 不做评分、不做负向词、不做全文兜底——现在很多验证码邮件为防自动抓取，
+// 会把数字拆进图片、混进零宽字符、插到 HTML 标签里，这类混淆没有通用解，
+// 解析不出来是预期内的（设置页已就此给出提示）。与其猜错，不如宁缺勿滥。
 
-/// 正向词：出现在数字附近会加分（验证码语义）
-const POS_KEYWORDS: &[&str] = &[
-    "验证码", "校验码", "动态码", "确认码", "激活码", "认证码", "安全码", "动态密码",
-    "一次性密码", "一次性验证码", "口令", "验证码为", "输入的验证", "请输入", "填写",
-    "输入以下", "验证", "校验", "认证",
-    "verification code", "one-time code", "one time code", "security code",
-    "login code", "sign-in code", "verification", "verify", "passcode", "one-time",
-    "otp", "is your", "enter this code", "use this code", "code", "pin",
-];
+/// 从主题/正文中提取验证码（本地匹配，绝不外传内容）。
+/// 规则：依次检查若干验证码语义关键词，取它后面紧跟的第一段 4~8 位数字。
+/// 全角数字归一化、零宽字符剔除；匹配不到就返回 None，不猜。
+pub fn extract_code(subject: &str, body: &str) -> Option<String> {
+    const KEYWORDS: &[&str] = &[
+        "验证码", "校验码", "动态码", "确认码", "激活码", "认证码", "安全码", "动态密码",
+        "一次性密码", "口令", "otp",
+        "verification code", "one-time code", "one time code", "security code",
+        "login code", "sign-in code", "passcode", "your code", "code is", "code:",
+    ];
 
-/// 负向词：紧邻数字出现会减分（订单/电话/地址等干扰数字）
-const NEG_KEYWORDS: &[&str] = &[
-    "订单", "订单号", "单号", "发票", "收据", "工单", "参考号", "流水号", "追踪号",
-    "电话", "手机", "手机号", "联系电话", "地址", "收货", "金额", "付款", "支付",
-    "余额", "账单", "会员号", "账户号", "order", "invoice", "ticket", "case", "ref",
-    "reference", "tracking", "phone", "tel", "address", "support", "amount", "price",
-    "payment", "usd", "cny", "customer",
-];
-
-/// 文本归一化：去零宽字符、全角数字转半角
-fn normalize_text(s: &str) -> String {
-    let mut out = String::new();
-    for c in s.chars() {
-        if matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}') {
+    for text in [subject, body] {
+        if text.is_empty() {
             continue;
         }
-        if ('\u{ff10}'..='\u{ff19}').contains(&c) {
-            out.push(char::from_u32(c as u32 - 0xff10 + '0' as u32).unwrap());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-#[derive(Clone)]
-struct CodeCandidate {
-    code: String,
-    start: usize, // 字符下标
-    end: usize,   // 字符下标（不含）
-}
-
-/// 生成所有 4~8 位数字候选（按字符处理，天然规避 UTF-8 切片 panic）；
-/// 支持 "482 913" / "482-913" 这种 3-3 分隔写法拼回一个 6 位码。
-fn code_candidates(chars: &[char]) -> Vec<CodeCandidate> {
-    let mut v = Vec::new();
-    let mut i = 0usize;
-    while i < chars.len() {
-        if chars[i].is_ascii_digit() {
-            let start = i;
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                i += 1;
-            }
-            let n = i - start;
-            let mut code: String = chars[start..i].iter().collect();
-            let mut end = i;
-            if n == 3 {
-                let mut j = i;
-                while j < chars.len()
-                    && (chars[j] == ' ' || chars[j] == '-' || chars[j] == '\u{00a0}')
-                {
-                    j += 1;
+        // 归一化：去零宽字符、全角数字转半角、统一小写；全程按字符处理，规避 UTF-8 切片 panic。
+        // 数字小写后仍是自身，直接从 low 取返回即可。
+        let low: Vec<char> = text
+            .chars()
+            .filter(|c| !matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}'))
+            .flat_map(|c| {
+                if ('\u{ff10}'..='\u{ff19}').contains(&c) {
+                    vec![char::from_u32(c as u32 - 0xff10 + '0' as u32).unwrap()]
+                } else {
+                    c.to_lowercase().collect()
                 }
-                let ds = j;
-                while j < chars.len() && chars[j].is_ascii_digit() {
-                    j += 1;
+            })
+            .collect();
+
+        for kw in KEYWORDS {
+            let kwc: Vec<char> = kw.chars().collect();
+            if kwc.is_empty() || kwc.len() > low.len() {
+                continue;
+            }
+            // 找关键词出现位置（按字符窗口比较），取其后紧跟的数字
+            for pos in 0..=low.len() - kwc.len() {
+                if low[pos..pos + kwc.len()] != kwc[..] {
+                    continue;
                 }
-                if j > ds && j - ds == 3 {
-                    code.extend(chars[ds..j].iter());
-                    end = j;
-                    i = j;
+                // 只跳过「紧跟」数字之间的分隔符：空白、标点、以及少量连接词（是/为/is 等）。
+                // 一旦遇到别的中文或字母词（如「订单号」）就停，避免把订单号当验证码。
+                let mut i = pos + kwc.len();
+                loop {
+                    if i >= low.len() || low[i].is_ascii_digit() {
+                        break;
+                    }
+                    let c = low[i];
+                    if c.is_whitespace() || is_code_punct(c) {
+                        i += 1;
+                        continue;
+                    }
+                    let mut skipped = false;
+                    for t in CONNECTORS {
+                        let tc: Vec<char> = t.chars().collect();
+                        if i + tc.len() <= low.len() && low[i..i + tc.len()] == tc[..] {
+                            i += tc.len();
+                            skipped = true;
+                            break;
+                        }
+                    }
+                    if !skipped {
+                        break;
+                    }
+                }
+                let start = i;
+                while i < low.len() && low[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if (4..=8).contains(&(i - start)) {
+                    return Some(low[start..i].iter().collect());
                 }
             }
-            if (4..=8).contains(&code.len()) {
-                v.push(CodeCandidate { code, start, end });
-            }
-        } else {
-            i += 1;
         }
     }
-    v
+    None
 }
 
-/// 给候选打分：距正向词越近分越高；紧邻负向词减分；
-/// CSS 颜色 / URL / 年份直接重罚。分数 < 3 视为不可信，不弹。
-fn score_candidate(chars: &[char], c: &CodeCandidate) -> i32 {
-    let mut s = 0i32;
-
-    let mut best_pos_dist: Option<usize> = None;
-    for k in POS_KEYWORDS {
-        let lo = c.start.saturating_sub(60);
-        let hi = (c.end + 30).min(chars.len());
-        let window: String = chars[lo..hi].iter().collect();
-        let lw = window.to_lowercase();
-        let kl = k.to_lowercase();
-        if let Some(p) = lw.find(&kl) {
-            let kw_start = lo + lw[..p].chars().count();
-            let kw_end = kw_start + kl.chars().count();
-            let dist = if kw_end <= c.start {
-                c.start - kw_end
-            } else if kw_start >= c.end {
-                kw_start - c.end
-            } else {
-                0
-            };
-            best_pos_dist = Some(best_pos_dist.map_or(dist, |bd| dist.min(bd)));
-        }
-    }
-    let very_close = matches!(best_pos_dist, Some(d) if d <= 6);
-    match best_pos_dist {
-        Some(d) if d <= 12 => s += 6,
-        Some(d) if d <= 30 => s += 4,
-        Some(d) if d <= 60 => s += 2,
-        _ => {}
-    }
-
-    // 负向词只在候选前方 12 字符内生效；紧贴正向词时惩罚减半
-    let nlo = c.start.saturating_sub(12);
-    let nwin: String = chars[nlo..c.start].iter().collect();
-    let nw = nwin.to_lowercase();
-    let neg_penalty = if very_close { 2 } else { 4 };
-    for k in NEG_KEYWORDS {
-        if nw.contains(&k.to_lowercase()) {
-            s -= neg_penalty;
-        }
-    }
-
-    if c.start > 0 && chars[c.start - 1] == '#' {
-        s -= 10; // CSS 颜色 #123456
-    }
-    let lo = c.start.saturating_sub(40);
-    let hi = (c.end + 40).min(chars.len());
-    let win: String = chars[lo..hi].iter().collect();
-    let w = win.to_lowercase();
-    if w.contains("http") || w.contains("www.") || w.contains(".com/") || w.contains(".cn/") {
-        s -= 6; // URL 里的数字
-    }
-    if c.code.len() == 4 {
-        if let Ok(y) = c.code.parse::<i32>() {
-            if (1900..=2099).contains(&y) {
-                s -= 4; // 年份
-            }
-        }
-    }
-    if c.code.len() == 6 {
-        s += 1; // 6 位最常见
-    }
-    s
+/// 关键词与数字之间允许出现的标点（冒号、逗号、括号、引号、连接号等）。
+fn is_code_punct(c: char) -> bool {
+    matches!(
+        c,
+        ':' | '：' | ',' | '，' | '.' | '。' | '(' | ')' | '（' | '）'
+            | '[' | ']' | '【' | '】' | '-' | '—' | '"' | '\'' | '「' | '」'
+            | '*' | '#'
+    )
 }
 
-/// 从主题/正文中提取验证码（本地启发式，绝不外传内容）。
-/// 主题权重更高（更简洁、干扰少）；所有候选取最高分，低于阈值则放弃——宁可不弹也不弹错。
-pub fn extract_code(subject: &str, body: &str) -> Option<String> {
-    let subject = normalize_text(subject);
-    let body = normalize_text(body);
-    let mut best: Option<(i32, i32, String)> = None; // (分数, 主题加权, 验证码)
-    for (text, subj_bonus) in [(subject.as_str(), 1i32), (body.as_str(), 0i32)] {
-        let chars: Vec<char> = text.chars().collect();
-        for c in code_candidates(&chars) {
-            let mut sc = score_candidate(&chars, &c);
-            if subj_bonus > 0 {
-                sc += subj_bonus;
-            }
-            let better = match &best {
-                None => true,
-                Some((bs, bb, _)) => sc > *bs || (sc == *bs && subj_bonus > *bb),
-            };
-            if better {
-                best = Some((sc, subj_bonus, c.code));
-            }
-        }
-    }
-    const THRESHOLD: i32 = 3;
-    match best {
-        Some((s, _, code)) if s >= THRESHOLD => Some(code),
-        _ => None,
-    }
-}
+/// 关键词与数字之间允许跳过的连接词（统一小写）。遇到列表外的词就停止扫描。
+const CONNECTORS: &[&str] = &[
+    "是", "为", "请输入", "输入", "您的", "你的", "你的", "is", "your", "the", "of", "code",
+];
 
 #[cfg(test)]
 mod tests {
@@ -1149,10 +1022,10 @@ mod tests {
     }
 
     #[test]
-    fn extracts_github_style_code() {
+    fn extracts_english_code() {
         assert_eq!(
-            extract_code("123456 is your GitHub launch code", ""),
-            Some("123456".into())
+            extract_code("Your verification code is 492837", ""),
+            Some("492837".into())
         );
     }
 
