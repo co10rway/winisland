@@ -62,13 +62,16 @@ pub struct Store {
 
 impl Store {
     pub fn load() -> Store {
+        Store::try_load().unwrap_or_default()
+    }
+
+    /// 与 `load()` 相同，但解析失败时返回 `None`，供「合并磁盘字段」场景区分
+    /// 「磁盘上没有邮件状态」和「文件正在被后台写入、暂时读坏了」——
+    /// 后者若当成空状态合并，会反而把 UID 水位清掉。
+    pub fn try_load() -> Option<Store> {
         let p = crate::config::data_path();
-        if let Ok(txt) = std::fs::read_to_string(&p) {
-            if let Ok(s) = serde_json::from_str::<Store>(&txt) {
-                return s;
-            }
-        }
-        Store::default()
+        let txt = std::fs::read_to_string(&p).ok()?;
+        serde_json::from_str::<Store>(&txt).ok()
     }
 
     pub fn save(&self) {
@@ -77,6 +80,28 @@ impl Store {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Ok(txt) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&p, txt);
+        }
+    }
+
+    /// 主界面保存 data.json 时用：保留邮件后台线程独立维护的字段。
+    ///
+    /// 主界面的 `Store` 是进程启动时的快照，而邮件监听线程会实时把 UID 水位、
+    /// 最新验证码写进同一个文件。若主界面直接 `save()`，就会把水位写回启动时的旧值，
+    /// 下一轮拉取会把同一封旧邮件重新判为新邮件 —— 表现就是「验证码一直是旧的」
+    /// 且「复制后反复提醒」。这里在写盘前把磁盘上的邮件字段合并进当前快照。
+    pub fn save_preserving_mail(&self) {
+        let p = crate::config::data_path();
+        let mut merged = self.clone();
+        if let Some(disk) = Store::try_load() {
+            merged.mail_code = disk.mail_code;
+            merged.seen_mail_ids = disk.seen_mail_ids;
+            merged.mail_last_uid = disk.mail_last_uid;
+        }
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(txt) = serde_json::to_string_pretty(&merged) {
             let _ = std::fs::write(&p, txt);
         }
     }

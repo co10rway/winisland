@@ -158,6 +158,10 @@ pub struct App {
     pub sed_ack_idle: u32, // 上次"起来走走"确认时的空闲秒数
     pub code_until: Option<Instant>,
     pub last_mail_ts: i64,
+    /// 已弹过的验证码指纹（发件人|验证码）。邮件后台只给主界面一个 `latest`，
+    /// 同一封旧邮件因水位被覆盖而被反复写入时，靠时间戳挡不住（每次都是新的拉取时间），
+    /// 必须用内容指纹去重，避免复制后又弹、一直弹旧码。
+    pub last_mail_key: Option<String>,
     /// 验证码「复制」按钮被点击的时刻：胶囊上短暂显示「已复制」反馈
     pub code_copied_at: Option<Instant>,
     pub peak_wpm: u64,
@@ -437,6 +441,12 @@ pub fn run() {
         let now_unix = files::now_unix();
         // 上次残留的验证码不该在重启后弹一次：把「已提醒水位」直接对齐到它
         let last_mail_ts = store.mail_code.as_ref().map(|m| m.ts).unwrap_or(0);
+        // 上次落盘的验证码也要算「已弹过」：否则重启后后台重新写入同一封旧邮件，
+        // 仅靠时间戳比较会再次弹出。
+        let last_mail_key = store
+            .mail_code
+            .as_ref()
+            .map(|m| format!("{}|{}", m.from, m.code));
 
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
@@ -474,6 +484,7 @@ pub fn run() {
                 sed_ack_idle: 0,
                 code_until: None,
                 last_mail_ts,
+                last_mail_key,
                 code_copied_at: None,
                 peak_wpm: 0,
                 rot_i: 0,
@@ -711,6 +722,7 @@ fn preview_app(demo: bool) -> App {
         sed_ack_idle: 0,
         code_until: None,
         last_mail_ts: 0,
+        last_mail_key: None,
         code_copied_at: None,
         peak_wpm: 0,
         rot_i: 0,
@@ -1046,7 +1058,7 @@ fn preview_anim() {
 pub fn save_now() {
     APP.with(|a| {
         if let Some(app) = a.borrow_mut().as_mut() {
-            app.store.save();
+            app.store.save_preserving_mail();
             app.cfg.save();
             app.dirty = false;
         }
@@ -1128,7 +1140,7 @@ pub fn remove_todo(index: usize) {
 impl App {
     /// 待办数据有变：立即落盘（不必等 2s 节流）+ 触痛重绘
     fn save_now_quiet(&mut self) {
-        self.store.save();
+        self.store.save_preserving_mail();
         self.last_save = Instant::now();
     }
 }
@@ -1643,10 +1655,15 @@ fn tick_second() {
         if app.cfg.modules.mailcode {
             if let Ok(s) = app.mail_shared.lock() {
                 if let Some(mc) = &s.latest {
-                    if mc.ts > app.last_mail_ts {
+                    let key = format!("{}|{}", mc.from, mc.code);
+                    let fresh = app.last_mail_key.as_deref() != Some(key.as_str())
+                        && mc.ts >= app.last_mail_ts;
+                    if fresh {
                         app.last_mail_ts = mc.ts;
+                        app.last_mail_key = Some(key);
                         app.code_until = Some(Instant::now() + Duration::from_secs(5));
-                        app.dirty = true;
+                        // 不标脏：邮件水位/验证码由后台线程独立落盘。主界面一标脏，
+                        // 2 秒后的定时 save 就会用启动快照覆盖 UID 水位，旧邮件会反复弹。
                     }
                 }
             }
@@ -1678,7 +1695,7 @@ fn tick_second() {
         // 提醒不做自动过期：必须用户点确认按钮才消失（见 click / HitId::ReminderAck）
         // 定时保存
         if app.dirty && app.last_save.elapsed() > Duration::from_secs(2) {
-            app.store.save();
+            app.store.save_preserving_mail();
             app.dirty = false;
             app.last_save = Instant::now();
         }
@@ -1885,7 +1902,7 @@ fn click(h: &HitId) {
 pub fn open_data_file() {
     APP.with(|a| {
         if let Some(app) = a.borrow_mut().as_mut() {
-            app.store.save();
+            app.store.save_preserving_mail();
             open_in_notepad(&crate::config::data_path().to_string_lossy());
         }
     });
@@ -1905,7 +1922,7 @@ pub fn open_config_file() {
 pub fn open_data_dir() {
     APP.with(|a| {
         if let Some(app) = a.borrow_mut().as_mut() {
-            app.store.save();
+            app.store.save_preserving_mail();
         }
     });
     open_path(&data_dir().to_string_lossy());
