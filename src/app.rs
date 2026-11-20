@@ -452,12 +452,10 @@ pub fn run() {
             .as_ref()
             .map(|m| format!("{}|{}", m.from, m.code));
         let last_mail_uid = store.mail_code.as_ref().map(|m| m.uid).unwrap_or(0);
-        // 启动时对齐邮件线程序号：启动前到达的验证码一律不弹，
-        // 之后只要 seq 增加就一定是有新邮件到达（邮件线程独占递增）。
-        let last_mail_seq = mail_shared
-            .lock()
-            .map(|s| s.seq)
-            .unwrap_or(0);
+        // 序号基线固定为 0：邮件线程在主界面构造前就已启动，若读取当时的 seq 当基线，
+        // 抢跑写入的新验证码会被当成旧码吞掉。「启动前旧邮件」已由邮件线程的
+        // UIDNEXT 启动基线挡住，能走到 seq 递增的一定是启动后新到的，必须弹。
+        let last_mail_seq = 0u64;
 
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
@@ -1668,25 +1666,35 @@ fn tick_second() {
             }
         }
 
-        // 邮箱验证码 -> 弹出胶囊展示 5 秒后自动消失
+        // 邮箱验证码 -> 弹出胶囊（不点复制常驻，点了才 5 秒消失）
         if app.cfg.modules.mailcode {
-            if let Ok(s) = app.mail_shared.lock() {
-                if let Some(mc) = &s.latest {
-                    // 只认邮件线程独占递增的序号：启动前到达的不弹，
-                    // 启动后新到的验证码 seq 必定 +1，不会被快照竞态吞掉。
+            // 先读到局部变量，锁立即释放，避免在锁内重复加锁 / 持锁改 App
+            let pending = app
+                .mail_shared
+                .lock()
+                .ok()
+                .and_then(|s| {
                     if s.seq > app.last_mail_seq {
-                        app.last_mail_seq = s.seq;
-                        app.last_mail_ts = mc.ts;
-                        app.last_mail_uid = mc.uid.max(app.last_mail_uid);
-                        app.last_mail_key = Some(format!("{}|{}", mc.from, mc.code));
-                        // 不点复制就一直展示；只有点复制才启动 5 秒倒计时。
-                        app.code_pending = true;
-                        app.code_until = None;
-                        app.code_copied_at = None;
-                        // 不标脏：邮件水位/验证码由后台线程独立落盘。主界面一标脏，
-                        // 2 秒后的定时 save 就会用启动快照覆盖 UID 水位，旧邮件会反复弹。
+                        s.latest.clone().map(|mc| (s.seq, mc))
+                    } else {
+                        None
                     }
+                });
+            if let Some((seq, mc)) = pending {
+                app.last_mail_seq = seq;
+                app.last_mail_ts = mc.ts;
+                app.last_mail_uid = mc.uid.max(app.last_mail_uid);
+                app.last_mail_key = Some(format!("{}|{}", mc.from, mc.code));
+                // 不点复制就一直展示；只有点复制才启动 5 秒倒计时。
+                app.code_pending = true;
+                app.code_until = None;
+                app.code_copied_at = None;
+                // 同步给邮件线程写进状态栏，便于确认主界面确实处理到了
+                if let Ok(mut shared) = app.mail_shared.lock() {
+                    shared.ui_seq = seq;
                 }
+                // 不标脏：邮件水位/验证码由后台线程独立落盘。主界面一标脏，
+                // 2 秒后的定时 save 就会用启动快照覆盖 UID 水位，旧邮件会反复弹。
             }
         }
 

@@ -33,6 +33,8 @@ pub struct MailShared {
     /// 邮件线程每抓到一封「新验证码邮件」就 +1。主界面启动时对齐这个序号，
     /// 只提示序号增量，避免拿启动时 Store 快照和后台线程比较 UID/时间产生竞态。
     pub seq: u64,
+    /// 主界面已处理的序号（主界面写入，供状态栏诊断：seq > ui_seq 就说明卡在 UI 弹窗）
+    pub ui_seq: u64,
     pub status: String, // "未配置" / "监听中" / "上次错误: ..."
 }
 
@@ -158,7 +160,7 @@ pub fn test_connection_async() {
             conn.select(folder)
         });
         match r {
-            Ok(n) => set_only_status(format!("连接成功 · 「{}」共 {} 封邮件", if m.folder.trim().is_empty() { "INBOX" } else { m.folder.trim() }, n)),
+            Ok((n, _)) => set_only_status(format!("连接成功 · 「{}」共 {} 封邮件", if m.folder.trim().is_empty() { "INBOX" } else { m.folder.trim() }, n)),
             Err(e) => set_only_status(format!("连接失败：{e}")),
         }
     });
@@ -173,18 +175,32 @@ fn set_only_status(s: String) {
 fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, String> {
     let mut conn = connect(cfg)?;
     let folder = if cfg.folder.trim().is_empty() { "INBOX" } else { cfg.folder.trim() };
-    let exists = conn.select(folder)?;
+    let (exists, uidnext) = conn.select(folder)?;
 
     let mut store = crate::store::Store::load();
-    let last_uid = store.mail_last_uid;
+
+    // 「启动前 vs 启动后」的分界线：SELECT 完成时，UID < uidnext 的邮件都已存在。
+    // 只在进程首轮成功拉取时记录这条基线到内存；之后每轮都用同一条基线，
+    // 因此邮件是在启动前还是启动后到达，与它是否恰好被首轮 FETCH 到无关。
+    // 这修掉了「首轮无条件静默」吞掉启动初期新邮件的老问题。
+    static BOOT_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let first = FIRST_POLL
+        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
+    if first && uidnext > 0 {
+        BOOT_UID.store(uidnext, Ordering::SeqCst);
+    }
+    let boot_uid = BOOT_UID.load(Ordering::SeqCst);
+
+    // 服务器不返回 UIDNEXT 时的兜底：退回「首轮静默对齐」(old behavior)，
+    // 保证启动前积压的旧验证码不会被翻出来弹。
+    let silent_first = boot_uid == 0 && first;
+
+    // 实际过滤水位 = max(上次落盘水位, 启动基线 - 1)。
+    // 启动基线保证旧邮件不弹；磁盘水位保证跨轮不重复弹。
+    let last_uid = store.mail_last_uid.max(boot_uid.saturating_sub(1));
     let msgs = conn.fetch_since(last_uid, exists)?;
 
-    // 首轮静默对齐：只在第一次成功拉取时把水位推进到当前最新 UID，不弹任何验证码。
-    // 这样启动前积压的旧验证码不会在启动时被翻出来；之后 UID 更大的才是新邮件。
-    // 用 compare_exchange 保证即使多线程也只有一轮是「首轮」。
-    let silent_first = FIRST_POLL.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok();
-
-    // 只认 UID 更大的（服务端在 UID 越界时会回最后一条，靠这里过滤）
     let mut newest: Option<(u32, MailCode)> = None;
     let mut max_uid = last_uid;
     let mut fetched = 0usize;
@@ -196,7 +212,7 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
             skipped_old += 1;
             continue;
         }
-        // 首轮只推进水位、不弹验证码（启动前积压的一律不提醒）
+        // 仅当拿不到 UIDNEXT 时，首轮才静默跳过（兜底，避免弹启动前旧码）
         if silent_first {
             continue;
         }
@@ -232,10 +248,15 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
     }
     store.save();
 
-    // 诊断串：拉到几封 / 跳过几封旧 / 水位 UID / 本轮是否首轮对齐 / 是否取到验证码
+    // 诊断串：拉到几封 / 跳过几封旧 / 过滤水位 / 启动基线 / 本轮是否首轮 / 是否取到验证码
+    // seq/ui_seq 用来区分「邮件线程没抓到」(seq 不涨) 和「抓到但主界面没弹」(seq > ui_seq)
+    let (seq, ui_seq) = shared
+        .lock()
+        .map(|s| (s.seq, s.ui_seq))
+        .unwrap_or((0, 0));
     let diag = format!(
-        "拉到 {fetched} 封 · 旧 {skipped_old} · 水位 {max_uid}{}{}",
-        if silent_first { " · 首轮对齐" } else { "" },
+        "拉到 {fetched} 封 · 旧 {skipped_old} · 水位 {max_uid} · 基线 {boot_uid} · seq {seq}/{ui_seq}{}{}",
+        if silent_first { " · 首轮静默(无UIDNEXT)" } else if first { " · 首轮对齐" } else { "" },
         if let Some(u) = newest_uid {
             format!(" · 验证码 UID {u}")
         } else {
@@ -366,22 +387,37 @@ impl<S: Read + Write> ImapConn<S> {
         }
     }
 
-    fn select(&mut self, folder: &str) -> Result<u32, String> {
+    /// 返回 (邮件总数 exists, 下一个将分配的 UID UIDNEXT)。
+    /// UIDNEXT 是判断「启动前 vs 启动后」的可靠依据：SELECT 完成时，
+    /// 所有 UID < UIDNEXT 的邮件都已存在（旧邮件），之后到达的邮件 UID >= UIDNEXT。
+    fn select(&mut self, folder: &str) -> Result<(u32, u32), String> {
         let resp = self.cmd(&format!("SELECT \"{}\"", imap_escape(folder)))?;
         if !is_ok(&resp) {
             return Err(format!("打不开邮箱文件夹「{folder}」：{}", first_tag_line(&resp)));
         }
+        let mut exists = 0u32;
+        let mut uidnext = 0u32;
         for line in resp.lines() {
             let t = line.trim();
             if let Some(rest) = t.strip_prefix("* ") {
                 if let Some(n_str) = rest.strip_suffix(" EXISTS") {
                     if let Ok(n) = n_str.trim().parse() {
-                        return Ok(n);
+                        exists = n;
+                    }
+                }
+                // * OK [UIDNEXT 12345] Predicted next UID
+                if let Some(p) = rest.find("UIDNEXT ") {
+                    let digits: String = rest[p + 8..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if let Ok(n) = digits.parse() {
+                        uidnext = n;
                     }
                 }
             }
         }
-        Ok(0)
+        Ok((exists, uidnext))
     }
 
     /// 拉取新邮件（首轮只取最近 10 封，避免一次拉满）。
