@@ -181,8 +181,10 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<(), Strin
             continue;
         }
         // 只同步本次启动之后到达的验证码邮件：到达时间必须晚于启动时刻。
-        // date=0（INTERNALDATE 解析失败）无法判定，按「旧邮件」跳过，绝不误同步。
-        if m.date <= boot {
+        // date>0 时严格按到达时间过滤；date=0 表示 INTERNALDATE 解析失败（服务端
+        // 格式差异等），此时不能一律跳过——否则会完全收不到验证码。退回按 UID
+        // 增量判断（上面的 m.uid <= last_uid 已过滤掉旧邮件），放行这封新邮件。
+        if m.date > 0 && m.date <= boot {
             continue;
         }
         if let Some(code) = extract_code(&m.subject, &m.body) {
@@ -488,19 +490,28 @@ fn parse_internal_date(line: &str) -> i64 {
     let after_q = &rest[q1 + 1..];
     let Some(q2) = after_q.find('"') else { return 0 };
     let s = &after_q[..q2];
-    // s: "20-Nov-2026 13:05:00 +0800"
+    // IMAP INTERNALDATE 标准格式（RFC 3501）："20-Nov-2026 13:05:00 +0800"
+    // 注意日期是一个整体 token，用连字符分隔（DD-Mon-YYYY），不是空格分隔的三个字段。
+    // 之前的版本误按空格拆分，"20-Nov-2026".parse::<i64>() 必然失败 → 恒返回 0，
+    // 导致所有验证码邮件都被当成「无有效到达时间」而跳过，收不到任何验证码。
     let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() < 4 {
+    if parts.len() < 3 {
         return 0;
     }
-    let day: i64 = match parts[0].parse() { Ok(v) => v, Err(_) => return 0 };
-    let mon = match parts[1].to_uppercase().as_str() {
+    // parts[0] = "20-Nov-2026"（也可能出现无前导零的 "1-Nov-2026"）
+    let dmy: Vec<&str> = parts[0].split('-').collect();
+    if dmy.len() != 3 {
+        return 0;
+    }
+    let day: i64 = match dmy[0].parse() { Ok(v) => v, Err(_) => return 0 };
+    let mon = match dmy[1].to_uppercase().as_str() {
         "JAN" => 1, "FEB" => 2, "MAR" => 3, "APR" => 4, "MAY" => 5, "JUN" => 6,
         "JUL" => 7, "AUG" => 8, "SEP" => 9, "OCT" => 10, "NOV" => 11, "DEC" => 12,
         _ => return 0,
     };
-    let year: i64 = match parts[2].parse() { Ok(v) => v, Err(_) => return 0 };
-    let hms: Vec<&str> = parts[3].split(':').collect();
+    let year: i64 = match dmy[2].parse() { Ok(v) => v, Err(_) => return 0 };
+    // parts[1] = "13:05:00"
+    let hms: Vec<&str> = parts[1].split(':').collect();
     if hms.len() != 3 {
         return 0;
     }
@@ -508,9 +519,9 @@ fn parse_internal_date(line: &str) -> i64 {
         (Ok(h), Ok(m), Ok(s)) => (h, m, s),
         _ => return 0,
     };
-    // 时区 ±HHMM
-    let tz_secs: i64 = if parts.len() >= 5 {
-        let t = parts[4];
+    // parts[2] = "+0800" 时区 ±HHMM
+    let tz_secs: i64 = if parts.len() >= 3 {
+        let t = parts[2];
         let sign = match t.as_bytes().first() { Some(b'+') => 1, Some(b'-') => -1, _ => 0 };
         let digits = &t[1..];
         if digits.len() >= 4 {
@@ -818,15 +829,33 @@ mod tests {
 
     #[test]
     fn parses_internal_date() {
-        // 2026-11-20 13:05:00 +0800 → UTC 05:05:00 → unix
+        // 标准 IMAP 格式：日期 token 是 "20-Nov-2026"（连字符），不是空格分隔
         let line = "* 45 FETCH (UID 123 INTERNALDATE \"20-Nov-2026 13:05:00 +0800\" BODY[HEADER] {10}";
         let ts = super::parse_internal_date(line);
-        assert!(ts > 0, "应解析出时间戳");
-        // 同上但 UTC+0：同一墙上时间，unix 应比 +0800 大 8 小时
+        assert_eq!(ts, 1795151100, "应正确解析 DD-Mon-YYYY +0800");
+        // 同一时刻的 UTC 表示，unix 时间戳必须相等
         let utc = super::parse_internal_date(
             "* 45 FETCH (UID 123 INTERNALDATE \"20-Nov-2026 05:05:00 +0000\" BODY[HEADER] {10}",
         );
         assert_eq!(ts, utc, "不同时区表示同一时刻应得到相同 unix 时间戳");
+        // 负时区 -0500 与等价 UTC 时刻
+        let neg = super::parse_internal_date(
+            "* 1 FETCH (UID 3 INTERNALDATE \"15-Jun-2026 23:30:00 -0500\" BODY[] {5}",
+        );
+        let utc2 = super::parse_internal_date(
+            "* 1 FETCH (UID 3 INTERNALDATE \"16-Jun-2026 04:30:00 +0000\" BODY[] {5}",
+        );
+        assert_eq!(neg, utc2, "负时区应正确换算");
+        // epoch 边界
+        assert_eq!(
+            super::parse_internal_date("* 1 FETCH (UID 1 INTERNALDATE \"1-Jan-1970 00:00:00 +0000\" BODY[] {5}"),
+            0
+        );
+        // 闰年
+        assert_eq!(
+            super::parse_internal_date("* 1 FETCH (UID 2 INTERNALDATE \"29-Feb-2000 00:00:00 +0000\" BODY[] {5}"),
+            951782400
+        );
         // 无 INTERNALDATE → 0
         assert_eq!(super::parse_internal_date("* 1 FETCH (UID 9 BODY[] {5}"), 0);
     }
