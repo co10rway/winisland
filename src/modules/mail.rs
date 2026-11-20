@@ -220,6 +220,14 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
     }
     let base_ts = BASE_TS.load(Ordering::SeqCst);
     let base_uid = BASE_UID.load(Ordering::SeqCst);
+    // 已弹过的验证码 UID：按 UID 硬去重。
+    // 没有它时，每轮轮询都会把「启动后新到的那封」重新判为新验证码并 seq+1，
+    // 主界面随即把 code_pending 改回 true —— 表现就是点了复制通知仍反复出现/不消失。
+    let notified_uid = shared
+        .lock()
+        .ok()
+        .and_then(|s| s.latest.as_ref().map(|mc| mc.uid))
+        .unwrap_or(0);
 
     // 找出「启动后新到」的验证码邮件：(date, uid) 晚于/大于基准。
     let mut newest: Option<(i64, u32, MailCode)> = None;
@@ -241,6 +249,11 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
         // 与基准比较：date 更大，或同秒但 UID 更大，才算新邮件
         let is_after_base = m.date > base_ts || (m.date == base_ts && m.uid > base_uid);
         if !is_after_base {
+            skipped_old += 1;
+            continue;
+        }
+        // 同一封验证码邮件只触发一次通知（点复制后不能被下一轮轮询重新弹起）
+        if m.uid <= notified_uid {
             skipped_old += 1;
             continue;
         }

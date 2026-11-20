@@ -2220,7 +2220,10 @@ fn anim_step() {
             || app.flash.as_ref().map_or(false, |f| f.alive())
             || app.code_pending
             || app.code_until.map_or(false, |t| now < t)
-            || app.code_copied_at.map_or(false, |t| now < t + Duration::from_millis(1500))
+            // 「已复制」反馈按 5 秒展示（ui.rs 同口径）。这里多留 200ms，
+            // 保证 5 秒到期后至少还有一帧重绘，把胶囊真正从画面上清掉；
+            // 旧值 1500ms 会在该重绘的那一刻提前停止重绘，导致通知残留在屏幕上。
+            || app.code_copied_at.map_or(false, |t| now < t + Duration::from_millis(5200))
             || icon::active(app);
         if !active && raw < 0.033 {
             return; // 本帧只推进能量/相位，不提交重绘
