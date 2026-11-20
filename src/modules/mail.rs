@@ -9,10 +9,18 @@
 //!    「验证码」四个字，第二次之后全被当成同一条跳过。
 
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::store::MailCode;
+
+/// 进程启动时刻（unix 秒）：只同步这之后到达的验证码邮件，
+/// 避免把启动前邮箱里积压的旧验证码也拉出来弹提醒。
+static START_TS: OnceLock<i64> = OnceLock::new();
+
+fn start_ts() -> i64 {
+    *START_TS.get_or_init(crate::modules::files::now_unix)
+}
 
 #[derive(Default, Clone)]
 pub struct MailShared {
@@ -51,7 +59,7 @@ pub fn spawn(shared: SharedMail) {
             continue;
         }
         if cfg.imap_host.trim().is_empty() || cfg.user.trim().is_empty() || cfg.password.is_empty() {
-            set_status(&shared, "未配置 · 请填写 IMAP 服务器 / 账号 / 授权码");
+            set_status(&shared, "未配置 · 请填写 IMAP 服务器 / 邮箱地址 / 授权码");
             std::thread::sleep(Duration::from_secs(5));
             continue;
         }
@@ -130,7 +138,7 @@ pub fn test_connection_async() {
         let cfg = crate::config::Config::load();
         let m = cfg.mail;
         if m.imap_host.trim().is_empty() || m.user.trim().is_empty() {
-            set_only_status("请先填写 IMAP 服务器与账号".to_string());
+            set_only_status("请先填写 IMAP 服务器与邮箱地址".to_string());
             return;
         }
         if m.password.is_empty() {
@@ -166,9 +174,15 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<(), Strin
     // 只认 UID 更大的（服务端在 UID 越界时会回最后一条，靠这里过滤）
     let mut newest: Option<(u32, MailCode)> = None;
     let mut max_uid = last_uid;
+    let boot = start_ts();
     for m in msgs {
         max_uid = max_uid.max(m.uid);
         if m.uid <= last_uid {
+            continue;
+        }
+        // 只同步本次启动之后到达的验证码邮件：到达时间必须晚于启动时刻。
+        // date=0（INTERNALDATE 解析失败）无法判定，按「旧邮件」跳过，绝不误同步。
+        if m.date <= boot {
             continue;
         }
         if let Some(code) = extract_code(&m.subject, &m.body) {
@@ -239,6 +253,8 @@ struct ImapConn<S: Read + Write> {
 
 struct MailMsg {
     uid: u32,
+    /// 邮件到达时间（IMAP INTERNALDATE，unix 秒）；0 表示解析失败
+    date: i64,
     from: String,
     subject: String,
     body: String,
@@ -356,7 +372,7 @@ impl<S: Read + Write> ImapConn<S> {
         };
         let tag = self.next_tag();
         let req = format!(
-            "{} {} {} (UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODY.PEEK[TEXT]<0.4096>)\r\n",
+            "{} {} {} (UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODY.PEEK[TEXT]<0.4096>)\r\n",
             tag, word, range
         );
         self.stream
@@ -368,6 +384,7 @@ impl<S: Read + Write> ImapConn<S> {
         let mut out: Vec<MailMsg> = Vec::new();
         let mut cur = MailMsg {
             uid: 0,
+            date: 0,
             from: String::new(),
             subject: String::new(),
             body: String::new(),
@@ -393,6 +410,7 @@ impl<S: Read + Write> ImapConn<S> {
                 }
                 cur = MailMsg {
                     uid: parse_uid(&line),
+                    date: parse_internal_date(&line),
                     from: String::new(),
                     subject: String::new(),
                     body: String::new(),
@@ -424,6 +442,7 @@ fn finish_msg(cur: &MailMsg, head: &[u8], body: &[u8]) -> MailMsg {
     let b = String::from_utf8_lossy(body).to_string();
     MailMsg {
         uid: cur.uid,
+        date: cur.date,
         from: header_field(&h, "from"),
         subject: decode_header(&header_field(&h, "subject")),
         body: decode_body(&b),
@@ -457,6 +476,60 @@ fn parse_uid(line: &str) -> u32 {
         }
     }
     0
+}
+
+/// 解析 IMAP FETCH 响应行上的 INTERNALDATE（服务器记录的到达时间）：
+/// `"20-Nov-2026 13:05:00 +0800"` → unix 秒。解析失败返回 0。
+/// 用服务器到达时间而非邮件头 Date（后者可被客户端伪造/时区混乱）。
+fn parse_internal_date(line: &str) -> i64 {
+    let Some(a) = line.find("INTERNALDATE") else { return 0 };
+    let rest = &line[a + "INTERNALDATE".len()..];
+    let Some(q1) = rest.find('"') else { return 0 };
+    let after_q = &rest[q1 + 1..];
+    let Some(q2) = after_q.find('"') else { return 0 };
+    let s = &after_q[..q2];
+    // s: "20-Nov-2026 13:05:00 +0800"
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 4 {
+        return 0;
+    }
+    let day: i64 = match parts[0].parse() { Ok(v) => v, Err(_) => return 0 };
+    let mon = match parts[1].to_uppercase().as_str() {
+        "JAN" => 1, "FEB" => 2, "MAR" => 3, "APR" => 4, "MAY" => 5, "JUN" => 6,
+        "JUL" => 7, "AUG" => 8, "SEP" => 9, "OCT" => 10, "NOV" => 11, "DEC" => 12,
+        _ => return 0,
+    };
+    let year: i64 = match parts[2].parse() { Ok(v) => v, Err(_) => return 0 };
+    let hms: Vec<&str> = parts[3].split(':').collect();
+    if hms.len() != 3 {
+        return 0;
+    }
+    let (hh, mm, ss): (i64, i64, i64) = match (hms[0].parse(), hms[1].parse(), hms[2].parse()) {
+        (Ok(h), Ok(m), Ok(s)) => (h, m, s),
+        _ => return 0,
+    };
+    // 时区 ±HHMM
+    let tz_secs: i64 = if parts.len() >= 5 {
+        let t = parts[4];
+        let sign = match t.as_bytes().first() { Some(b'+') => 1, Some(b'-') => -1, _ => 0 };
+        let digits = &t[1..];
+        if digits.len() >= 4 {
+            let th: i64 = digits[..2].parse().unwrap_or(0);
+            let tm: i64 = digits[2..4].parse().unwrap_or(0);
+            sign * (th * 3600 + tm * 60)
+        } else { 0 }
+    } else { 0 };
+
+    // 民用日期 → 距 epoch 的天数（Howard Hinnant 算法，无第三方依赖）
+    let y = if mon <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if mon > 2 { mon - 3 } else { mon + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+
+    days * 86400 + hh * 3600 + mm * 60 + ss - tz_secs
 }
 
 /// 从原始头部文本里取某个字段（支持折行续行）
@@ -741,5 +814,20 @@ mod tests {
     #[test]
     fn ignores_short_numbers() {
         assert_eq!(extract_code("你的订单已发货", "订单号 12，预计 3 天到达"), None);
+    }
+
+    #[test]
+    fn parses_internal_date() {
+        // 2026-11-20 13:05:00 +0800 → UTC 05:05:00 → unix
+        let line = "* 45 FETCH (UID 123 INTERNALDATE \"20-Nov-2026 13:05:00 +0800\" BODY[HEADER] {10}";
+        let ts = super::parse_internal_date(line);
+        assert!(ts > 0, "应解析出时间戳");
+        // 同上但 UTC+0：同一墙上时间，unix 应比 +0800 大 8 小时
+        let utc = super::parse_internal_date(
+            "* 45 FETCH (UID 123 INTERNALDATE \"20-Nov-2026 05:05:00 +0000\" BODY[HEADER] {10}",
+        );
+        assert_eq!(ts, utc, "不同时区表示同一时刻应得到相同 unix 时间戳");
+        // 无 INTERNALDATE → 0
+        assert_eq!(super::parse_internal_date("* 1 FETCH (UID 9 BODY[] {5}"), 0);
     }
 }

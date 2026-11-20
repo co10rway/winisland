@@ -158,6 +158,8 @@ pub struct App {
     pub sed_ack_idle: u32, // 上次"起来走走"确认时的空闲秒数
     pub code_until: Option<Instant>,
     pub last_mail_ts: i64,
+    /// 验证码「复制」按钮被点击的时刻：胶囊上短暂显示「已复制」反馈
+    pub code_copied_at: Option<Instant>,
     pub peak_wpm: u64,
     /// 胶囊右侧信息轮播：当前条目、上一条目（滑动中的旧内容）、下一次切换时间
     pub rot_i: usize,
@@ -472,6 +474,7 @@ pub fn run() {
                 sed_ack_idle: 0,
                 code_until: None,
                 last_mail_ts,
+                code_copied_at: None,
                 peak_wpm: 0,
                 rot_i: 0,
                 rot_prev: 0,
@@ -708,6 +711,7 @@ fn preview_app(demo: bool) -> App {
         sed_ack_idle: 0,
         code_until: None,
         last_mail_ts: 0,
+        code_copied_at: None,
         peak_wpm: 0,
         rot_i: 0,
         rot_prev: 0,
@@ -1635,13 +1639,13 @@ fn tick_second() {
             }
         }
 
-        // 邮箱验证码 -> 弹出胶囊展示 30 秒
+        // 邮箱验证码 -> 弹出胶囊展示 5 秒后自动消失
         if app.cfg.modules.mailcode {
             if let Ok(s) = app.mail_shared.lock() {
                 if let Some(mc) = &s.latest {
                     if mc.ts > app.last_mail_ts {
                         app.last_mail_ts = mc.ts;
-                        app.code_until = Some(Instant::now() + Duration::from_secs(30));
+                        app.code_until = Some(Instant::now() + Duration::from_secs(5));
                         app.dirty = true;
                     }
                 }
@@ -1863,6 +1867,8 @@ fn click(h: &HitId) {
             HitId::MailCopy => {
                 if let Some(mc) = app.mail_shared.lock().ok().and_then(|s| s.latest.clone()) {
                     clipboard::set_text(app.hwnd, &mc.code);
+                    // 胶囊上短暂显示「已复制」反馈（1.5 秒）
+                    app.code_copied_at = Some(Instant::now());
                 }
             }
         }
@@ -2188,6 +2194,8 @@ fn anim_step() {
 
         let active = app.anims.busy()
             || app.flash.as_ref().map_or(false, |f| f.alive())
+            || app.code_until.map_or(false, |t| now < t)
+            || app.code_copied_at.map_or(false, |t| now < t + Duration::from_millis(1500))
             || icon::active(app);
         if !active && raw < 0.033 {
             return; // 本帧只推进能量/相位，不提交重绘

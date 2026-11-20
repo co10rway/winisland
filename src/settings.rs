@@ -424,7 +424,7 @@ fn pages() -> Vec<Page> {
                 Row::toggle(0, "启用邮箱验证码", "需要先填好下面的 IMAP 参数"),
                 Row::field(1, "IMAP 服务器", "", 220.0).ph("imap.qq.com"),
                 Row::field(2, "端口", "", 100.0).int(),
-                Row::field(3, "账号", "", 220.0).ph("you@example.com"),
+                Row::field(3, "邮箱地址", "", 220.0).ph("you@example.com"),
                 Row::field(4, "密码 / 授权码", "QQ 邮箱请使用授权码而非登录密码", 220.0).pwd(),
                 Row::field(5, "文件夹", "", 160.0).ph("INBOX"),
                 Row::field(6, "轮询间隔", "最小 10 秒", 108.0).suffix("秒").int(),

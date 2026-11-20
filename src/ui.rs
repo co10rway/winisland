@@ -326,12 +326,21 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
                 if let Some(mc) = &shared.latest {
                     let from = if mc.from.len() > 18 { format!("{}…", &mc.from[..18]) } else { mc.from.clone() };
                     let msg = format!("验证码 {} · {}", mc.code, from);
-                    cv.text(x + 20.0, y, pw - 110.0, ph, &msg, 13.0, W_SEMI, TXT, alpha);
-                    let bw = s(48.0);
+                    cv.text(x + 20.0, y, pw - 118.0, ph, &msg, 13.0, W_SEMI, TXT, alpha);
+                    // 点击复制后 1.5 秒内在按钮处显示「已复制」反馈（绿底）
+                    let copied = app
+                        .code_copied_at
+                        .map_or(false, |t| Instant_now() < t + std::time::Duration::from_millis(1500));
+                    let bw = s(56.0);
                     let btn_x = x + pw - bw - 16.0;
                     let by = y + ph / 2.0 - s(12.0);
-                    cv.rrect(btn_x, by, bw, s(24.0), s(12.0), crate::theme::main(), alpha);
-                    cv.text_c(btn_x, by, bw, s(24.0), "复制", 11.0, W_SEMI, 0xFFFFFF, alpha);
+                    let (bg, fg, label) = if copied {
+                        (GREEN, 0xFFFFFF, "已复制")
+                    } else {
+                        (crate::theme::main(), 0xFFFFFF, "复制")
+                    };
+                    cv.rrect(btn_x, by, bw, s(24.0), s(12.0), bg, alpha);
+                    cv.text_c(btn_x, by, bw, s(24.0), label, 11.0, W_SEMI, fg, alpha);
                     push_hit(hits, HitId::MailCopy, btn_x, by, bw, s(24.0));
                     return;
                 }
