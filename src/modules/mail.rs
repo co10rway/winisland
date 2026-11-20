@@ -9,18 +9,23 @@
 //!    「验证码」四个字，第二次之后全被当成同一条跳过。
 
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::store::MailCode;
 
-/// 进程启动时刻（unix 秒）：只同步这之后到达的验证码邮件，
-/// 避免把启动前邮箱里积压的旧验证码也拉出来弹提醒。
-static START_TS: OnceLock<i64> = OnceLock::new();
-
-fn start_ts() -> i64 {
-    *START_TS.get_or_init(crate::modules::files::now_unix)
-}
+/// 本进程是否还没完成首轮拉取。
+///
+/// 首轮的作用是「静默对齐水位」：把 `mail_last_uid` 推进到收件箱当前最新的 UID，
+/// 但不弹任何验证码。这样启动前邮箱里积压的旧验证码不会被翻出来；而此后新到达
+/// 的邮件 UID 一定更大，下一轮就能被识别并弹出。
+///
+/// 之所以不再用「INTERNALDATE 与本机启动时间比较」来判断新旧：那是两个不同时钟源
+/// （邮件服务器时间 vs 本机系统时间），只要两者有偏差，启动后新到的邮件时间戳就
+/// 可能 ≤ 本机启动时刻而被误判成旧邮件跳过，表现为「先开软件、后收邮件却收不到」。
+/// UID 是服务器单调递增的，用它做水位完全不依赖时钟，更可靠。
+static FIRST_POLL: AtomicBool = AtomicBool::new(true);
 
 #[derive(Default, Clone)]
 pub struct MailShared {
@@ -64,10 +69,10 @@ pub fn spawn(shared: SharedMail) {
             continue;
         }
         match poll_once(&cfg, &shared) {
-            Ok(()) => {
+            Ok(diag) => {
                 let wait = cfg.poll_seconds.clamp(10, 600) as u64;
-                // 状态里带上轮询节奏，用户能确认它真的在跑
-                set_status(&shared, format!("监听中 · 每 {} 秒检查一次", wait));
+                // 状态里带上拉取诊断，用户能直接看到监听是否在跑、拉到几封、卡在哪
+                set_status(&shared, format!("监听中 · 每 {wait} 秒 · {diag}"));
                 std::thread::sleep(Duration::from_secs(wait));
             }
             Err(e) => {
@@ -162,7 +167,7 @@ fn set_only_status(s: String) {
     }
 }
 
-fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<(), String> {
+fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, String> {
     let mut conn = connect(cfg)?;
     let folder = if cfg.folder.trim().is_empty() { "INBOX" } else { cfg.folder.trim() };
     let exists = conn.select(folder)?;
@@ -171,20 +176,25 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<(), Strin
     let last_uid = store.mail_last_uid;
     let msgs = conn.fetch_since(last_uid, exists)?;
 
+    // 首轮静默对齐：只在第一次成功拉取时把水位推进到当前最新 UID，不弹任何验证码。
+    // 这样启动前积压的旧验证码不会在启动时被翻出来；之后 UID 更大的才是新邮件。
+    // 用 compare_exchange 保证即使多线程也只有一轮是「首轮」。
+    let silent_first = FIRST_POLL.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+
     // 只认 UID 更大的（服务端在 UID 越界时会回最后一条，靠这里过滤）
     let mut newest: Option<(u32, MailCode)> = None;
     let mut max_uid = last_uid;
-    let boot = start_ts();
-    for m in msgs {
+    let mut fetched = 0usize;
+    let mut skipped_old = 0usize;
+    for m in &msgs {
+        fetched += 1;
         max_uid = max_uid.max(m.uid);
         if m.uid <= last_uid {
+            skipped_old += 1;
             continue;
         }
-        // 只同步本次启动之后到达的验证码邮件：到达时间必须晚于启动时刻。
-        // date>0 时严格按到达时间过滤；date=0 表示 INTERNALDATE 解析失败（服务端
-        // 格式差异等），此时不能一律跳过——否则会完全收不到验证码。退回按 UID
-        // 增量判断（上面的 m.uid <= last_uid 已过滤掉旧邮件），放行这封新邮件。
-        if m.date > 0 && m.date <= boot {
+        // 首轮只推进水位、不弹验证码（启动前积压的一律不提醒）
+        if silent_first {
             continue;
         }
         if let Some(code) = extract_code(&m.subject, &m.body) {
@@ -203,6 +213,7 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<(), Strin
     }
 
     store.mail_last_uid = max_uid;
+    let got_code = newest.is_some();
     if let Some((_, mc)) = newest {
         store.mail_code = Some(mc.clone());
         if let Ok(mut s) = shared.lock() {
@@ -215,7 +226,14 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<(), Strin
         }
     }
     store.save();
-    Ok(())
+
+    // 诊断串：拉到几封 / 跳过几封旧 / 水位 UID / 本轮是否首轮对齐 / 是否取到验证码
+    let diag = format!(
+        "拉到 {fetched} 封 · 旧 {skipped_old} · 水位 {max_uid}{}{}",
+        if silent_first { " · 首轮对齐" } else { "" },
+        if got_code { " · 已取到验证码" } else { "" },
+    );
+    Ok(diag)
 }
 
 fn is_ok(reply: &str) -> bool {
@@ -255,7 +273,10 @@ struct ImapConn<S: Read + Write> {
 
 struct MailMsg {
     uid: u32,
-    /// 邮件到达时间（IMAP INTERNALDATE，unix 秒）；0 表示解析失败
+    /// 邮件到达时间（IMAP INTERNALDATE，unix 秒）；0 表示解析失败。
+    /// 仅作参考保留：新旧判断已改用 UID 水位（见 FIRST_POLL），不再依赖此时间，
+    /// 以免两端时钟偏差导致新邮件被误判为旧邮件。
+    #[allow(dead_code)]
     date: i64,
     from: String,
     subject: String,
