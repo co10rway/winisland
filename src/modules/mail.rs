@@ -760,6 +760,9 @@ fn decode_charset(raw: &[u8], charset: &str) -> String {
         .join(" ")
 }
 
+/// RFC 2047 头部 Q 编码字解码（`_` 代表空格）。
+/// 注意：这个规则**只适用于头部**，绝不能拿来解正文 quoted-printable——
+/// 正文里的下划线是普通字符（如 `verification_code`），转成空格会改变 URL 语义。
 fn q_decode(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -787,6 +790,82 @@ fn q_decode(s: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+/// MIME 正文的 quoted-printable 解码：只解 `=XX` 与软换行 `=`+CRLF/LF，
+/// 下划线原样保留（与 RFC 2047 头部 Q 编码不同）。
+fn qp_decode_body(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'=' {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        // 软换行：`=\r\n` / `=\n`，直接吞掉，不产生任何字符
+        if i + 2 < b.len() && b[i + 1] == b'\r' && b[i + 2] == b'\n' {
+            i += 3;
+            continue;
+        }
+        if i + 1 < b.len() && b[i + 1] == b'\n' {
+            i += 2;
+            continue;
+        }
+        // `=XX` 十六进制转义
+        if i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
+            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        // 不是合法转义：原样保留 `=`
+        out.push(b'=');
+        i += 1;
+    }
+    out
+}
+
+/// 只取出「明确声明 Content-Transfer-Encoding: quoted-printable」的 MIME 段正文。
+/// 整封邮件一起 QP 解码会毁掉未编码段里的 URL：
+/// `verification_code=398021` 中的 `=39` 会被当成字符 `9`，首位 `3` 被吞掉。
+fn quoted_printable_parts(raw: &str) -> Vec<String> {
+    let lines: Vec<&str> = raw.split_inclusive('\n').collect();
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let head = lines[i].to_ascii_lowercase();
+        if head.contains("content-transfer-encoding:") && head.contains("quoted-printable") {
+            // 段头结束于空行
+            let mut j = i + 1;
+            while j < lines.len() && !lines[j].trim().is_empty() {
+                j += 1;
+            }
+            if j < lines.len() {
+                j += 1;
+            }
+            let mut part = String::new();
+            while j < lines.len() {
+                let line = lines[j];
+                // MIME boundary 行以 `--` 开头（包括结束边界 `--...--`）
+                if line.starts_with("--") {
+                    break;
+                }
+                part.push_str(line);
+                j += 1;
+            }
+            if !part.is_empty() {
+                parts.push(part);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    parts
 }
 
 /// 正文可能被 base64 / quoted-printable 编码（中文邮件非常常见），
@@ -827,9 +906,11 @@ fn decode_body(raw: &str) -> String {
         }
     }
 
-    // 2) quoted-printable
-    if lower.contains("quoted-printable") {
-        sources.push(String::from_utf8_lossy(&q_decode(raw)).into_owned());
+    // 2) quoted-printable —— 必须按 MIME 段解码，不能整封一起解。
+    //    回归：X 的邮件里 text/plain 段含 `verification_code=398021`，
+    //    整封 QP 解码会把 `=39` 解成字符 '9'，验证码被截成 `98021`。
+    for part in quoted_printable_parts(raw) {
+        sources.push(String::from_utf8_lossy(&qp_decode_body(&part)).into_owned());
     }
 
     // 3) 原文
@@ -926,6 +1007,9 @@ pub fn extract_code(subject: &str, body: &str) -> Option<String> {
             .flat_map(|c| {
                 if ('\u{ff10}'..='\u{ff19}').contains(&c) {
                     vec![char::from_u32(c as u32 - 0xff10 + '0' as u32).unwrap()]
+                } else if c == '_' {
+                    // URL 里常见 `verification_code=398021`，下划线视为分隔符
+                    vec![' ']
                 } else {
                     c.to_lowercase().collect()
                 }
@@ -986,7 +1070,7 @@ fn is_code_punct(c: char) -> bool {
         c,
         ':' | '：' | ',' | '，' | '.' | '。' | '(' | ')' | '（' | '）'
             | '[' | ']' | '【' | '】' | '-' | '—' | '"' | '\'' | '「' | '」'
-            | '*' | '#'
+            | '*' | '#' | '='
     )
 }
 
@@ -1032,6 +1116,29 @@ mod tests {
     #[test]
     fn ignores_short_numbers() {
         assert_eq!(extract_code("你的订单已发货", "订单号 12，预计 3 天到达"), None);
+    }
+
+    #[test]
+    fn keeps_first_digit_in_url_even_with_qp_part_present() {
+        // 回归：X 的邮件同时含 text/plain(7bit) 和 text/html(quoted-printable)。
+        // 旧实现把整封邮件当 QP 解，`verification_code=398021` 的 `=39` 被解成 '9'，
+        // 首位丢失，弹出 `98021`。现在只解声明为 QP 的段，且下划线/等号都是合法分隔符。
+        let raw = "Content-Type: multipart/alternative; boundary=\"B\"\r\n\
+            \r\n--B\r\nContent-Type: text/plain; charset=UTF-8\r\n\
+            Content-Transfer-Encoding: 7bit\r\n\r\n\
+            You can use this code as a backup, just in case:\r\n\
+            https://x.com/i/jf/verify?session_token=&amp;verification_code=398021\r\n\
+            398021\r\n\r\n--B\r\nContent-Type: text/html; charset=UTF-8\r\n\
+            Content-Transfer-Encoding: quoted-printable\r\n\r\n\
+            <td>verification_code=3D398021</td>\r\n\r\n--B--\r\n";
+        let body = decode_body(raw);
+        assert_eq!(
+            extract_code("398021 is your X verification code", &body),
+            Some("398021".into()),
+            "解码后正文: {body}"
+        );
+        // 不能再出现吞掉首位的残缺码
+        assert_ne!(extract_code("", &body), Some("98021".into()));
     }
 
     #[test]
