@@ -436,7 +436,8 @@ mod tests {
         assert!((q.price - 7.78).abs() < 1e-6);
         assert!((q.prev_close - 7.70).abs() < 1e-6);
         assert!((q.chg - 0.08).abs() < 1e-6);
-        assert!((q.chg_pct - 1.04).abs() < 1e-6);
+        // 涨跌幅是现算的：腾讯原文里给的是四舍五入到两位的 1.04，这里对现算值做断言
+        assert!((q.chg_pct - (0.08 / 7.70 * 100.0)).abs() < 1e-6);
     }
 
     #[test]
