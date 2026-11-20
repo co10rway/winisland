@@ -320,17 +320,17 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
     }
 
     // 验证码态
-    if let Some(until) = app.code_until {
-        if Instant_now() < until {
+    if app.code_pending || app.code_until.map_or(false, |t| Instant_now() < t) {
+        {
             if let Ok(shared) = app.mail_shared.lock() {
                 if let Some(mc) = &shared.latest {
                     let from = if mc.from.len() > 18 { format!("{}…", &mc.from[..18]) } else { mc.from.clone() };
                     let msg = format!("验证码 {} · {}", mc.code, from);
                     cv.text(x + 20.0, y, pw - 118.0, ph, &msg, 13.0, W_SEMI, TXT, alpha);
-                    // 点击复制后 1.5 秒内在按钮处显示「已复制」反馈（绿底）
+                    // 点复制后 5 秒内按钮保持绿底「已复制」，与胶囊同时消失
                     let copied = app
                         .code_copied_at
-                        .map_or(false, |t| Instant_now() < t + std::time::Duration::from_millis(1500));
+                        .map_or(false, |t| Instant_now() < t + std::time::Duration::from_secs(5));
                     let bw = s(56.0);
                     let btn_x = x + pw - bw - 16.0;
                     let by = y + ph / 2.0 - s(12.0);
@@ -702,10 +702,8 @@ pub fn pill_mode_key(app: &App) -> u32 {
             crate::app::ToastKind::Stock => 6,
         };
     }
-    if let Some(until) = app.code_until {
-        if Instant_now() < until {
-            return 3;
-        }
+    if app.code_pending || app.code_until.map_or(false, |t| Instant_now() < t) {
+        return 3;
     }
     0
 }

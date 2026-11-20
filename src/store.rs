@@ -2,6 +2,11 @@
 //! 全部仅存于本机，绝不上传。
 
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
+
+/// 全进程 data.json 写锁。主界面定时保存与邮件线程写 UID 水位可能并发，
+/// 没有这把锁时「读磁盘→合并→写回」仍可能被邮件线程插队，导致水位被写旧。
+static STORE_IO_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ScheduleItem {
@@ -34,6 +39,11 @@ pub struct MailCode {
     pub code: String,
     pub from: String,
     pub ts: i64,
+    /// 这封验证码邮件的 IMAP UID。主界面用它做硬去重：
+    /// 只有 UID 比上次弹过的大才算新邮件，内容相同也不再重复弹。
+    /// 老版本 data.json 没有这个字段，serde 默认补 0。
+    #[serde(default)]
+    pub uid: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -75,6 +85,7 @@ impl Store {
     }
 
     pub fn save(&self) {
+        let _g = STORE_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = crate::config::data_path();
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -91,6 +102,7 @@ impl Store {
     /// 下一轮拉取会把同一封旧邮件重新判为新邮件 —— 表现就是「验证码一直是旧的」
     /// 且「复制后反复提醒」。这里在写盘前把磁盘上的邮件字段合并进当前快照。
     pub fn save_preserving_mail(&self) {
+        let _g = STORE_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = crate::config::data_path();
         let mut merged = self.clone();
         if let Some(disk) = Store::try_load() {

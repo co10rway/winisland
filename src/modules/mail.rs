@@ -206,6 +206,7 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
                         code,
                         from: clean_from(&m.from),
                         ts: crate::modules::files::now_unix(),
+                        uid: m.uid,
                     },
                 ));
             }
@@ -213,7 +214,7 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
     }
 
     store.mail_last_uid = max_uid;
-    let got_code = newest.is_some();
+    let newest_uid = newest.as_ref().map(|(u, _)| *u);
     if let Some((_, mc)) = newest {
         store.mail_code = Some(mc.clone());
         if let Ok(mut s) = shared.lock() {
@@ -231,7 +232,11 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
     let diag = format!(
         "拉到 {fetched} 封 · 旧 {skipped_old} · 水位 {max_uid}{}{}",
         if silent_first { " · 首轮对齐" } else { "" },
-        if got_code { " · 已取到验证码" } else { "" },
+        if let Some(u) = newest_uid {
+            format!(" · 验证码 UID {u}")
+        } else {
+            String::new()
+        },
     );
     Ok(diag)
 }

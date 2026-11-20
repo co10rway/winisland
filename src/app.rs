@@ -157,10 +157,13 @@ pub struct App {
     pub last_water_unix: i64,
     pub sed_ack_idle: u32, // 上次"起来走走"确认时的空闲秒数
     pub code_until: Option<Instant>,
+    /// 验证码尚未点击复制：一直展示，不自动消失（与喝水提醒一致，必须用户确认）
+    pub code_pending: bool,
     pub last_mail_ts: i64,
-    /// 已弹过的验证码指纹（发件人|验证码）。邮件后台只给主界面一个 `latest`，
-    /// 同一封旧邮件因水位被覆盖而被反复写入时，靠时间戳挡不住（每次都是新的拉取时间），
-    /// 必须用内容指纹去重，避免复制后又弹、一直弹旧码。
+    /// 已弹过的验证码邮件 UID。优先用 UID 去重（服务器单调递增），
+    /// 内容指纹只作为老数据 uid=0 时的兜底。
+    pub last_mail_uid: u32,
+    /// 已弹过的验证码指纹（发件人|验证码），兜底防重复。
     pub last_mail_key: Option<String>,
     /// 验证码「复制」按钮被点击的时刻：胶囊上短暂显示「已复制」反馈
     pub code_copied_at: Option<Instant>,
@@ -447,6 +450,7 @@ pub fn run() {
             .mail_code
             .as_ref()
             .map(|m| format!("{}|{}", m.from, m.code));
+        let last_mail_uid = store.mail_code.as_ref().map(|m| m.uid).unwrap_or(0);
 
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
@@ -483,7 +487,9 @@ pub fn run() {
                 last_water_unix: now_unix,
                 sed_ack_idle: 0,
                 code_until: None,
+                code_pending: false,
                 last_mail_ts,
+                last_mail_uid,
                 last_mail_key,
                 code_copied_at: None,
                 peak_wpm: 0,
@@ -721,7 +727,9 @@ fn preview_app(demo: bool) -> App {
         last_water_unix: 0,
         sed_ack_idle: 0,
         code_until: None,
+        code_pending: false,
         last_mail_ts: 0,
+        last_mail_uid: 0,
         last_mail_key: None,
         code_copied_at: None,
         peak_wpm: 0,
@@ -1656,12 +1664,20 @@ fn tick_second() {
             if let Ok(s) = app.mail_shared.lock() {
                 if let Some(mc) = &s.latest {
                     let key = format!("{}|{}", mc.from, mc.code);
-                    let fresh = app.last_mail_key.as_deref() != Some(key.as_str())
+                    // UID 优先：只有比上次弹过的邮件更新才算新验证码。
+                    // 老数据 uid=0 时退回「内容指纹 + 时间戳」判断。
+                    let fresh_by_uid = mc.uid > app.last_mail_uid;
+                    let fresh_by_key = mc.uid == 0
+                        && app.last_mail_key.as_deref() != Some(key.as_str())
                         && mc.ts >= app.last_mail_ts;
-                    if fresh {
+                    if fresh_by_uid || fresh_by_key {
                         app.last_mail_ts = mc.ts;
+                        app.last_mail_uid = mc.uid.max(app.last_mail_uid);
                         app.last_mail_key = Some(key);
-                        app.code_until = Some(Instant::now() + Duration::from_secs(5));
+                        // 不点复制就一直展示；只有点复制才启动 5 秒倒计时。
+                        app.code_pending = true;
+                        app.code_until = None;
+                        app.code_copied_at = None;
                         // 不标脏：邮件水位/验证码由后台线程独立落盘。主界面一标脏，
                         // 2 秒后的定时 save 就会用启动快照覆盖 UID 水位，旧邮件会反复弹。
                     }
@@ -1884,8 +1900,12 @@ fn click(h: &HitId) {
             HitId::MailCopy => {
                 if let Some(mc) = app.mail_shared.lock().ok().and_then(|s| s.latest.clone()) {
                     clipboard::set_text(app.hwnd, &mc.code);
-                    // 胶囊上短暂显示「已复制」反馈（1.5 秒）
-                    app.code_copied_at = Some(Instant::now());
+                    // 点了复制才开始 5 秒倒计时；这 5 秒里继续显示「已复制」反馈。
+                    // 不点则 code_pending 一直为 true，胶囊常驻（同喝水提醒）。
+                    let now = Instant::now();
+                    app.code_pending = false;
+                    app.code_copied_at = Some(now);
+                    app.code_until = Some(now + Duration::from_secs(5));
                 }
             }
         }
@@ -2211,6 +2231,7 @@ fn anim_step() {
 
         let active = app.anims.busy()
             || app.flash.as_ref().map_or(false, |f| f.alive())
+            || app.code_pending
             || app.code_until.map_or(false, |t| now < t)
             || app.code_copied_at.map_or(false, |t| now < t + Duration::from_millis(1500))
             || icon::active(app);
