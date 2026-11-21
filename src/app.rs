@@ -109,6 +109,8 @@ pub struct App {
     pub expanded: bool,
     /// 用户是否点开了下拉面板（只有它能撑开大面板；默认只显示主面板胶囊）
     pub panel_open: bool,
+    /// 面板是否被图钉锁定：锁定后忽略遮挡检测，面板始终展开
+    pub pinned: bool,
     /// 显示模式：正常 / 遮挡收起
     pub vis: Vis,
     /// 收起态下鼠标悬停在小黑条上，显示主面板胶囊
@@ -198,7 +200,7 @@ impl App {
     fn want_open(&self) -> bool {
         // 下拉面板只由「点胶囊 / 托盘」控制开关。提醒不再强行展开面板：
         // 提醒只是让胶囊常亮，用户想看详情自己点胶囊
-        self.panel_open
+        self.panel_open || self.pinned
     }
 
     /// 外部日程（ICS 订阅 / CalDAV），展示与临近提醒共用这一份。
@@ -451,6 +453,7 @@ pub fn run() {
                 sal: salary::SalaryCalc::new(&cfg.salary),
                 expanded: false,
                 panel_open: false,
+                pinned: false,
                 vis: Vis::Dock,
                 pill_hover: false,
                 hover_latch: false,
@@ -689,6 +692,7 @@ fn preview_app(demo: bool) -> App {
         sal,
         expanded: true,
         panel_open: true,
+        pinned: std::env::args().any(|a| a == "--pinned"), // 离屏预览可看锁定态图标
         vis: Vis::Dock,
         pill_hover: false,
         hover_latch: false,
@@ -1162,8 +1166,9 @@ pub fn tray_click() {
             }
         }
         // 托盘左键：在「主面板胶囊 ↔ 下拉面板」之间切换
-        if app.panel_open {
+        if app.panel_open || app.pinned {
             app.panel_open = false;
+            app.pinned = false;
         } else {
             app.panel_open = true;
             app.pill_hover = false;
@@ -1784,7 +1789,7 @@ fn click(h: &HitId) {
                 // （用户要求「点击后就不再显示」，点一下就该回到正常轮播）
                 if app.reminder.is_some() {
                     ack_reminder(app);
-                } else if app.panel_open {
+                } else if app.panel_open && !app.pinned {
                     app.panel_open = false;
                 } else {
                     app.panel_open = true;
@@ -1814,8 +1819,28 @@ fn click(h: &HitId) {
             HitId::Collapse => {
                 // 收起下拉面板，回到主面板胶囊（被遮挡时自然落回小黑条）
                 app.panel_open = false;
+                app.pinned = false;
                 app.leave_at = None;
                 app.todo_del_arm = None;
+                app.apply_vis();
+            }
+            HitId::Pin => {
+                // 图钉：锁定当前面板。锁定后 occ_check 不再收起；再点一次解除。
+                app.pinned = !app.pinned;
+                if app.pinned {
+                    app.panel_open = true;
+                    app.occluded = false;
+                    app.vis = Vis::Dock;
+                    app.pill_hover = false;
+                    app.leave_at = None;
+                } else {
+                    // 解除后立刻重判一次遮挡，避免残留锁定态
+                    app.occ_next = Instant::now();
+                }
+                app.flash = Some(Flash::new(
+                    if app.pinned { "已钉住面板 · 遮挡时不收起" } else { "已取消钉住" },
+                    1600,
+                ));
                 app.apply_vis();
             }
             HitId::TodoToggle(i) => {
@@ -2084,6 +2109,18 @@ fn occ_check(app: &mut App) {
     }
     app.occ_next = now + Duration::from_millis(350);
     if app.hidden {
+        return;
+    }
+    // 图钉锁定：面板固定展开，遮挡检测完全跳过（也不会被小黑条替代）
+    if app.pinned {
+        if !app.panel_open || app.occluded || app.vis != Vis::Dock || !app.expanded {
+            app.panel_open = true;
+            app.occluded = false;
+            app.vis = Vis::Dock;
+            app.pill_hover = false;
+            app.leave_at = None;
+            app.apply_vis();
+        }
         return;
     }
     // 提醒进行中：无论被什么窗口（含全屏应用）盖住，都不收成小黑条，

@@ -69,6 +69,8 @@ pub enum HitId {
     PagePrev,
     PageNext,
     Collapse,
+    /// 面板右上角图钉：锁定面板，遮挡时不再自动收起
+    Pin,
     /// 待办页「＋ 新增待办」按钮
     TodoAdd,
     /// 盯盘助手页「＋ 编辑自选持仓」按钮（弹程序内编辑窗口）
@@ -774,10 +776,23 @@ fn draw_panel(app: &App, cv: &mut Canvas, w: f32, h: f32, o: f32, bg_a: f32, ct:
         let bw = s(28.0);
         let bx = w - bw - pad;
         let by = header_h / 2.0 - bw / 2.0;
-        let chp = app.anims.hover_p(&HitId::Collapse);
-        cv.circle(bx + bw / 2.0, by + bw / 2.0, bw / 2.0, mix(ROW, 0x33333E, chp), ct);
-        cv.text_c(bx, by, bw, bw, "—", 12.0, W_MED, mix(TXT2, TXT, chp), ct);
-        push_hit(hits, HitId::Collapse, bx - s(4.0), by - s(4.0), bw + s(8.0), bw + s(8.0));
+        let chp = app.anims.hover_p(&HitId::Pin);
+        let cx = bx + bw / 2.0;
+        let cy = by + bw / 2.0;
+        // 图钉：锁定后用主题色实心圆，未锁定为描边；下方针脚 + 横线表示钉住
+        let pin_col = if app.pinned { crate::theme::main() } else { mix(TXT2, TXT, chp) };
+        let bg = if app.pinned { mix(ROW, crate::theme::main(), 0.28) } else { mix(ROW, 0x33333E, chp) };
+        cv.circle(cx, cy, bw / 2.0, bg, ct);
+        if app.pinned {
+            cv.circle(cx, cy - s(3.5), s(3.6), pin_col, ct);
+            cv.line(cx, cy - s(0.5), cx, cy + s(6.0), pin_col, ct, s(1.4));
+            cv.line(cx - s(4.5), cy + s(6.0), cx + s(4.5), cy + s(6.0), pin_col, ct, s(1.4));
+        } else {
+            cv.circle_stroke(cx, cy - s(3.5), s(3.6), pin_col, ct, s(1.2));
+            cv.line(cx, cy - s(0.5), cx, cy + s(6.0), pin_col, ct, s(1.2));
+            cv.line(cx - s(4.5), cy + s(6.0), cx + s(4.5), cy + s(6.0), pin_col, ct, s(1.2));
+        }
+        push_hit(hits, HitId::Pin, bx - s(4.0), by - s(4.0), bw + s(8.0), bw + s(8.0));
 
         // 头部其余区域（时间/日期）也可点击收起 —— 和胶囊同一位置，
         // 展开后点原处就能收回
