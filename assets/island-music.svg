@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="music-base" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop stop-color="#202B48"/>
+      <stop offset="1" stop-color="#090D18"/>
+    </linearGradient>
+    <linearGradient id="music-aurora" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop stop-color="#54F5F2"/>
+      <stop offset=".52" stop-color="#568BFF"/>
+      <stop offset="1" stop-color="#B16BFF"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="240" height="240" rx="56"
+        fill="url(#music-base)"/>
+  <rect x="11" y="11" width="234" height="234" rx="53"
+        fill="none" stroke="#FFFFFF" stroke-opacity=".09" stroke-width="2"/>
+  <rect x="32" y="94" width="192" height="74" rx="37"
+        fill="url(#music-aurora)" opacity=".15"/>
+  <rect x="32" y="88" width="192" height="72" rx="36"
+        fill="url(#music-aurora)"/>
+  <rect x="38" y="94" width="180" height="60" rx="30" fill="#080C17"/>
+
+  <circle id="music-indicator" cx="75" cy="124" r="8" fill="#65FAEF"/>
+  <g id="music-bars">
+    <rect id="bar-1" x="103" y="117" width="10" height="14" rx="5" fill="#54E6F2"/>
+    <rect id="bar-2" x="122.5" y="110" width="10" height="28" rx="5" fill="#5BB7FF"/>
+    <rect id="bar-3" x="142" y="103" width="10" height="42" rx="5" fill="#7B9AFF"/>
+    <rect id="bar-4" x="161.5" y="111" width="10" height="26" rx="5" fill="#9A84FF"/>
+    <rect id="bar-5" x="181" y="116" width="10" height="16" rx="5" fill="#BB7AFF"/>
+  </g>
+</svg>

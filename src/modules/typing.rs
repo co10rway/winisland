@@ -6,7 +6,9 @@ use std::sync::Mutex;
 
 pub static KEYS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BUCKET: AtomicU32 = AtomicU32::new(0);
-static LAST_KEY_TICK: AtomicU64 = AtomicU64::new(0);
+/// 上次按键时刻（秒计数）；u64::MAX = 从未按键（不能用 0 当哨兵：
+/// 启动后第一秒内按键时 TICK_NOW 也是 0，会被误判成「从未按键」）
+static LAST_KEY_TICK: AtomicU64 = AtomicU64::new(u64::MAX);
 static TICK_NOW: AtomicU64 = AtomicU64::new(0);
 
 /// 近 90 秒每秒按键数环形缓冲
@@ -56,7 +58,7 @@ pub fn recent_keys(n: usize) -> u32 {
 /// 最后一次按键距今多少秒；从未按键时返回 u64::MAX
 pub fn idle_secs_since_key() -> u64 {
     let last = LAST_KEY_TICK.load(Ordering::Relaxed);
-    if last == 0 {
+    if last == u64::MAX {
         return u64::MAX;
     }
     TICK_NOW.load(Ordering::Relaxed).saturating_sub(last)

@@ -195,9 +195,9 @@ impl Row {
     fn theme() -> Row {
         Row { kind: RowKind::Theme, slot: 0, label: "主题色", desc: "胶囊与面板的强调色", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
     }
-    /// 图标样式选择行
+    /// 图标样式选择行（目前唯一形态「灵动岛」，卡片内为三种状态的实时预览）
     fn icon_pick() -> Row {
-        Row { kind: RowKind::IconPick, slot: 0, label: "图标样式", desc: "点击切换，所有形态都随打字与声音律动", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
+        Row { kind: RowKind::IconPick, slot: 0, label: "动态图标", desc: "默认 / 键盘输入 / 播放声音 三态自动切换，随打字与音量律动", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
     }
     /// 声音响应开关行
     fn sound() -> Row {
@@ -1408,7 +1408,15 @@ fn draw_row(cv: &mut Canvas, row: &Row, page: usize, pl: &Placed, cx: f32, cw: f
                     if sel { 0.95 } else { 0.85 }, s(1.2),
                 );
                 // 卡片内实时预览图标：固定相位 + 中高能量，直观看到每种形态
-                let sig = crate::modules::icon::Signal { energy: 0.62, phase: 1.7 + i as f32 * 0.45 };
+                let sig = crate::modules::icon::Signal {
+                    energy: 0.62,
+                    phase: 1.7 + i as f32 * 0.45,
+                    state: crate::modules::icon::ST_DEFAULT,
+                    prev: crate::modules::icon::ST_DEFAULT,
+                    blend: 1.0,
+                    key_idx: 1,
+                    key_age: 0.0,
+                };
                 crate::modules::icon::draw_icon(cv, *id, bx + bw / 2.0, by + s(17.0), s(34.0), s(26.0), sig, ta);
                 cv.text_c(bx, by + s(31.0), bw, s(12.0), *label, 9.0,
                     if sel { W_SEMI } else { W_MED }, if sel { TXT } else { TXT2 }, ta);

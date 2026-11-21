@@ -170,9 +170,19 @@ pub struct App {
     pub rot_i: usize,
     pub rot_prev: usize,
     pub rot_next: Instant,
-    /// 胶囊图标：平滑后的综合能量（打字 + 声音）与持续累积的相位
+    /// 胶囊图标：平滑后的综合能量（打字 + 声音）与持续累积的相位；
+    /// 以及三态形态（默认/键盘/音乐）与切换进度（见 modules::icon）
     pub icon_energy: f32,
     pub icon_phase: f32,
+    pub icon_state: u8,
+    pub icon_state_prev: u8,
+    pub icon_blend: f32,
+    /// 声音形态保持计时（秒）：音量掉到 0 后仍维持音乐态一段时间，避免安静段闪烁
+    pub icon_sound_hold: f32,
+    /// 键盘态：当前被点亮的那颗按键（0..2）、距上次敲击的秒数、随机种子
+    pub icon_key_idx: u8,
+    pub icon_key_age: f32,
+    pub icon_key_seed: u32,
 
     pub dirty: bool,
     pub last_save: Instant,
@@ -342,6 +352,11 @@ pub fn run() {
             preview_icons();
             return;
         }
+        // --preview-keys：键盘态「随机选键」核对图（一次只亮一颗）
+        if std::env::args().any(|a| a == "--preview-keys") {
+            preview_keys();
+            return;
+        }
         // --preview-reminder：三种提醒各导一张面板图（UI 开发用）
         if std::env::args().any(|a| a == "--preview-reminder") {
             preview_reminder();
@@ -489,6 +504,13 @@ pub fn run() {
                 rot_next: Instant::now() + Duration::from_secs(5),
                 icon_energy: 0.0,
                 icon_phase: 0.0,
+                icon_state: crate::modules::icon::ST_DEFAULT,
+                icon_state_prev: crate::modules::icon::ST_DEFAULT,
+                icon_blend: 1.0,
+                icon_sound_hold: 0.0,
+                icon_key_idx: 0,
+                icon_key_age: 9.0,
+                icon_key_seed: 0x9E37_79B9,
                 dirty: false,
                 last_save: Instant::now(),
                 mail_shared,
@@ -728,6 +750,13 @@ fn preview_app(demo: bool) -> App {
         rot_next: Instant::now() + Duration::from_secs(5),
         icon_energy: 0.0,
         icon_phase: 0.0,
+        icon_state: crate::modules::icon::ST_DEFAULT,
+        icon_state_prev: crate::modules::icon::ST_DEFAULT,
+        icon_blend: 1.0,
+        icon_sound_hold: 0.0,
+        icon_key_idx: 0,
+        icon_key_age: 9.0,
+        icon_key_seed: 0x9E37_79B9,
         dirty: false,
         last_save: Instant::now(),
         mail_shared: std::sync::Arc::new(std::sync::Mutex::new(mail::MailShared::default())),
@@ -850,9 +879,22 @@ fn preview_wave() {
     let dt = 1.0 / 60.0;
     app.icon_energy = 0.0;
     app.icon_phase = 0.0;
-    for i in 0..16u64 {
-        // 第 3、4 帧各按一次键（模拟真实按键），之后完全停手
-        if i == 3 || i == 4 {
+    app.icon_state = crate::modules::icon::ST_DEFAULT;
+    app.icon_state_prev = crate::modules::icon::ST_DEFAULT;
+    app.icon_blend = 1.0;
+    app.icon_sound_hold = 0.0;
+    app.icon_key_idx = 0;
+    app.icon_key_age = 9.0;
+    app.icon_key_seed = 0x9E37_79B9;
+    for i in 0..24u64 {
+        // 模拟连续打字：间隔不均的几次敲击（第 3/5/8/11/15 帧），
+        // 用来核对「每次只亮一颗、且亮的是不同键」。
+        // 秒计数只在第 16、17 帧推进两次，模拟停手 2 秒后回到默认态
+        //（真实运行每秒一次；预览里每帧都推进会把手感打乱）。
+        if i == 16 || i == 17 {
+            typing::tick_second();
+        }
+        if matches!(i, 3 | 5 | 8 | 11 | 15) {
             typing::bump_key();
         }
         icon::advance(&mut app, dt);
@@ -987,7 +1029,8 @@ fn preview_pill() {
     }
 }
 
-/// --preview-icons [输出目录]：图标 × 3 档能量（空闲 / 中等 / 高）放大对照图
+/// --preview-icons [输出目录]：三态图标对照图
+/// 上排 = 大尺寸完整底板（70×70），下排 = 胶囊内真实小尺寸（32×24，徽章模式）
 fn preview_icons() {
     let out_dir = std::env::args().nth(2).unwrap_or_else(|| "preview-icons".to_string());
     let _ = std::fs::create_dir_all(&out_dir);
@@ -998,18 +1041,70 @@ fn preview_icons() {
             return;
         }
     };
-    let (w, h) = (render::si(270.0), render::si(100.0));
+    let (w, h) = (render::si(270.0), render::si(180.0));
     let energies = [0.05f32, 0.45, 0.95];
     let phases = [0.6f32, 1.9, 3.2];
     for (id, _) in crate::modules::icon::ICON_KINDS.iter() {
         let memdc = canvas.draw_to_mem(w, h, 0x17171C, |cv, cw, ch| {
             for k in 0..3 {
                 let cx = cw * (k as f32 + 0.5) / 3.0;
-                let sig = crate::modules::icon::Signal { energy: energies[k], phase: phases[k] };
-                crate::modules::icon::draw_icon(cv, id, cx, ch / 2.0, render::s(70.0), render::s(70.0), sig, 1.0);
+                // 三列分别展示三态：默认（低能量）/ 键盘（中能量）/ 音乐（高能量）
+                let st = match k {
+                    0 => crate::modules::icon::ST_DEFAULT,
+                    1 => crate::modules::icon::ST_TYPING,
+                    _ => crate::modules::icon::ST_MUSIC,
+                };
+                let sig = crate::modules::icon::Signal {
+                    energy: energies[k],
+                    phase: phases[k],
+                    state: st,
+                    prev: st,
+                    blend: 1.0,
+                    key_idx: 1,
+                    key_age: 0.05,
+                };
+                crate::modules::icon::draw_icon(cv, id, cx, ch * 0.33, render::s(70.0), render::s(70.0), sig, 1.0);
+                // 下排：与胶囊内一致的槽位尺寸，用来判断真实小尺寸下的清晰度
+                crate::modules::icon::draw_icon(cv, id, cx, ch * 0.82, render::s(34.0), render::s(26.0), sig, 1.0);
             }
         });
         unsafe { dump_bmp(memdc, w, h, &format!("{out_dir}/icon_{id}.bmp")); }
+    }
+}
+
+/// --preview-keys [输出目录]：键盘态「随机选键」核对图
+/// 上排：第 1/2/3 颗键分别被点亮（70×70 底板）
+/// 下排：胶囊内真实槽位 34×26，键已衰减 0.12s，确认只剩一颗在亮
+fn preview_keys() {
+    let out_dir = std::env::args().nth(2).unwrap_or_else(|| "preview-keys".to_string());
+    let _ = std::fs::create_dir_all(&out_dir);
+    let mut canvas = match Canvas::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[winisland] preview-keys: canvas 初始化失败: {e}");
+            return;
+        }
+    };
+    let (w, h) = (render::si(270.0), render::si(150.0));
+    for (id, _) in crate::modules::icon::ICON_KINDS.iter() {
+        let memdc = canvas.draw_to_mem(w, h, 0x17171C, |cv, cw, ch| {
+            for k in 0..3u8 {
+                let cx = cw * (k as f32 + 0.5) / 3.0;
+                let sig = crate::modules::icon::Signal {
+                    energy: 0.85,
+                    phase: 2.1,
+                    state: crate::modules::icon::ST_TYPING,
+                    prev: crate::modules::icon::ST_TYPING,
+                    blend: 1.0,
+                    key_idx: k,
+                    key_age: 0.0,
+                };
+                crate::modules::icon::draw_icon(cv, id, cx, ch * 0.28, render::s(70.0), render::s(70.0), sig, 1.0);
+                let aged = crate::modules::icon::Signal { key_age: 0.12, ..sig };
+                crate::modules::icon::draw_icon(cv, id, cx, ch * 0.74, render::s(34.0), render::s(26.0), aged, 1.0);
+            }
+        });
+        unsafe { dump_bmp(memdc, w, h, &format!("{out_dir}/keys_{id}.bmp")); }
     }
 }
 

@@ -351,6 +351,38 @@ impl Canvas {
         }
     }
 
+    /// 圆角矩形三段横向渐变填充（c1 → c2(52%) → c3），极光胶囊专用
+    pub fn rrect_grad3(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c1: u32, c2: u32, c3: u32, alpha: f32) {
+        unsafe {
+            let stops = [
+                D2DC::D2D1_GRADIENT_STOP { position: 0.0, color: col(c1, alpha) },
+                D2DC::D2D1_GRADIENT_STOP { position: 0.52, color: col(c2, alpha) },
+                D2DC::D2D1_GRADIENT_STOP { position: 1.0, color: col(c3, alpha) },
+            ];
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                startPoint: windows_numerics::Vector2 { X: x, Y: y },
+                endPoint: windows_numerics::Vector2 { X: x + w, Y: y },
+            };
+            let coll = match self
+                .dcrt
+                .CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+            {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let brush = match self.dcrt.CreateLinearGradientBrush(&props, None, &coll) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            let rr = D2D1_ROUNDED_RECT {
+                rect: D2DC::D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
+                radiusX: r,
+                radiusY: r,
+            };
+            self.dcrt.FillRoundedRectangle(&rr, &brush);
+        }
+    }
+
     /// 直线
     pub fn line(&self, x1: f32, y1: f32, x2: f32, y2: f32, c: u32, alpha: f32, width: f32) {
         let Some(brush) = self.solid(c, alpha) else { return };

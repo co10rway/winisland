@@ -370,13 +370,23 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
     };
 
     // 最左段：动态图标。相位永不停止（空闲缓慢呼吸），打字/声音时跳动更明显；
-    // 形态由设置里的 icon 决定，与「是否统计打字」解耦，始终显示。
+    // 形态自动切换：声音活跃 → 音乐态，最近有按键 → 键盘态，否则默认态。
+    // 槽位 34×26：小尺寸走「极光徽章」渲染（icon.rs），内容元素放大约 2 倍；
+    // 占宽 34+6=40 与旧版（26+10）持平，不会挤压后面的日期。
     {
-        let ww = s(26.0);
-        let gap = s(10.0);
+        let ww = s(34.0);
+        let gap = s(6.0);
         if cx + ww + gap < money_left {
-            let sig = crate::modules::icon::Signal { energy: app.icon_energy, phase: app.icon_phase };
-            crate::modules::icon::draw_icon(cv, &app.cfg.icon, cx + ww / 2.0, cy, ww, s(22.0), sig, alpha);
+            let sig = crate::modules::icon::Signal {
+                energy: app.icon_energy,
+                phase: app.icon_phase,
+                state: app.icon_state,
+                prev: app.icon_state_prev,
+                blend: app.icon_blend,
+                key_idx: app.icon_key_idx,
+                key_age: app.icon_key_age,
+            };
+            crate::modules::icon::draw_icon(cv, &app.cfg.icon, cx + ww / 2.0, cy, ww, s(26.0), sig, alpha);
             cx += ww + gap;
         }
     }
