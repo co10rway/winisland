@@ -1515,8 +1515,8 @@ fn color_pct(pct: f64) -> u32 {
 // ---- 底部分页圆点：默认小圆点，悬停时该点变成对应页面图标 ----
 
 /// 底部一排页点：默认仍是小圆点，当前页主题色实心；鼠标悬停到某点时，该点渐变成
-/// 对应页面的图标，左右邻居按波浪放大（仍是圆点）。点一下直接跳到对应页。
-/// 单页时只保留隐私声明。
+/// 对应页面的图标（带高亮底圈 + 页面名标签），左右邻居被推开并放大成波浪。
+/// 点一下直接跳到对应页。单页时只保留隐私声明。
 fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, pages: &[&str], alpha: f32, hits: &mut Vec<Hit>) {
     let n = pages.len();
     let cy = h - s(28.0);
@@ -1530,7 +1530,9 @@ fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, pages: &[&
     let total = gap * (n as f32 - 1.0);
     let x0 = (w - total) / 2.0;
     let base_r = s(2.6);
-    let amp = s(3.6);
+    let amp = s(5.0);
+    let icon_size = s(26.0);
+    let ring_r = icon_size / 2.0 + s(5.0);
 
     // 波浪中心 = 悬停进度最高的点；进出都由弹簧进度驱动，平滑回落
     let (mut center, mut cp) = (None, 0.0f32);
@@ -1543,7 +1545,7 @@ fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, pages: &[&
     }
 
     for i in 0..n {
-        let x = x0 + gap * i as f32;
+        let base_x = x0 + gap * i as f32;
         let p = match center {
             Some(c) if cp > 0.004 => {
                 let d = (i as i32 - c as i32).abs();
@@ -1554,18 +1556,45 @@ fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, pages: &[&
         // 只有正悬停的那个点变图标；邻居保持圆点波浪放大
         let icon_p = if center == Some(i) { cp } else { 0.0 };
 
+        // Dock 让位：邻居按距离向外推开，给放大的图标腾出空间
+        let mut x = base_x;
+        if let Some(c) = center {
+            if cp > 0.004 && i != c {
+                let d = (i as i32 - c as i32).abs();
+                let push = match d { 1 => s(10.0), 2 => s(5.0), 3 => s(2.0), _ => 0.0 };
+                x += (i as f32 - c as f32).signum() * push * cp;
+            }
+        }
+
         let r = base_r + amp * p;
         let col = if i == idx { crate::theme::main() } else { mix(TXT3, TXT, p) };
         if icon_p < 0.999 {
             cv.circle(x, cy, r, col, alpha * (1.0 - icon_p));
         }
         if icon_p > 0.01 {
-            let icon_col = if i == idx { crate::theme::main() } else { TXT };
-            draw_page_icon(cv, pages[i], x, cy, s(18.0) * icon_p, icon_col, alpha * icon_p);
+            let accent = if i == idx { crate::theme::main() } else { TXT };
+            cv.circle(x, cy, ring_r * icon_p, mix(ROW, accent, 0.18), alpha * icon_p);
+            cv.circle_stroke(x, cy, ring_r * icon_p, accent, alpha * 0.55 * icon_p, s(1.0));
+            draw_page_icon(cv, pages[i], x, cy, icon_size * icon_p, accent, alpha * icon_p);
         }
 
-        // 每个点的命中区：贴合间距，避免相邻点误触
-        push_hit(hits, HitId::PageDot(i), x - gap / 2.0, cy - s(12.0), gap, s(24.0));
+        // 命中区固定在原位、贴合间距：hover 状态稳定，不会因推开/放大而抖动
+        push_hit(hits, HitId::PageDot(i), base_x - gap / 2.0, cy - s(12.0), gap, s(24.0));
+    }
+
+    // 页面名标签：悬停点的正上方，随弹簧进度渐显
+    if let Some(c) = center {
+        if cp > 0.05 {
+            let label = crate::config::panel_name(pages[c]);
+            let fs = 10.5;
+            let tw = text_w(label, fs);
+            let bw = tw + s(14.0);
+            let bh = s(20.0);
+            let bx = (x0 + gap * c as f32 - bw / 2.0).clamp(s(4.0), w - bw - s(4.0));
+            let by = cy - ring_r - s(5.0) - bh;
+            cv.rrect(bx, by, bw, bh, s(6.0), mix(ROW, 0x000000, 0.3), alpha * cp);
+            cv.text1(bx + s(7.0), by, tw, bh, label, fs, W_NORMAL, TXT, alpha * cp);
+        }
     }
 
     // 页码淡字贴在右侧（箭头已移除）
@@ -1580,7 +1609,7 @@ fn draw_page_icon(cv: &mut Canvas, kind: &str, cx: f32, cy: f32, size: f32, col:
     let t = cy - size / 2.0;
     let px = |x: f32| l + x * k;
     let py = |y: f32| t + y * k;
-    let sw = s(1.3);
+    let sw = (s(1.3) * (size / s(18.0))).clamp(s(1.3), s(2.2));
     match kind {
         "overview" => {
             for &(x, y) in &[(3.0f32, 3.0f32), (14.0, 3.0), (3.0, 14.0), (14.0, 14.0)] {
