@@ -268,13 +268,12 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
                     let by = y + ph / 2.0 - s(12.0);
                     cv.rrect(btn_x, by, bw, s(24.0), s(12.0), ROW2, alpha);
                     cv.rrect_stroke(btn_x + 0.5, by + 0.5, bw - 1.0, s(23.0), s(12.0), ORANGE, alpha * 0.8, 1.0);
-                    cv.text_c(btn_x, by, bw, s(24.0), "喝好了", 11.0, W_MED, ORANGE, alpha);
+                    cv.text_c(btn_x, by, bw, s(24.0), "喝一杯", 11.0, W_MED, ORANGE, alpha);
                     push_hit(hits, HitId::WaterOk, btn_x, by, bw, s(24.0));
                     return;
                 }
                 crate::app::ToastKind::Sedentary => {
-                    let mins = crate::app::now_sed_secs(app.last_sed_unix).max(60) as f64 / 60.0;
-                    let msg = format!("已久坐 {} 小时 {} 分", mins as u64, ((mins.fract()) * 60.0) as u64);
+                    let msg = crate::app::sed_reminder_msg(app.cfg.health.sedentary_minutes);
                     let bx = x + 22.0;
                     cv.circle(bx, y + ph / 2.0, s(6.0), ORANGE, alpha);
                     cv.text_ex(bx + 12.0, y, pw - 130.0, ph, &msg, 13.0, W_SEMI, TXT, alpha, 0, 1);
@@ -877,8 +876,7 @@ fn draw_reminder_bar(
             format!("该喝水了 · 今日 {}/{} 杯", cups.min(goal), goal)
         }
         ToastKind::Sedentary => {
-            let mins = crate::app::now_sed_secs(app.last_sed_unix).max(60) as f64 / 60.0;
-            format!("已久坐 {} 小时 {} 分", mins as u64, (mins.fract() * 60.0) as u64)
+            crate::app::sed_reminder_msg(app.cfg.health.sedentary_minutes)
         }
         ToastKind::Schedule => {
             if r.msg.is_empty() {

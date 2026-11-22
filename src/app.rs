@@ -51,7 +51,7 @@ impl ToastKind {
     /// 确认按钮文案：喝水记一杯、久坐起来走走、日程知道就行
     pub fn ack_label(self) -> &'static str {
         match self {
-            ToastKind::Water => "喝好了",
+            ToastKind::Water => "喝一杯",
             ToastKind::Sedentary => "起来走走",
             ToastKind::Schedule => "知道了",
             ToastKind::Stock => "知道了",
@@ -1646,6 +1646,12 @@ fn raise_reminder(app: &mut App, kind: ToastKind, msg: String) {
 /// 连续打字或完全不输入都会照常累计。
 pub fn now_sed_secs(last_sed_unix: i64) -> u32 {
     files::now_unix().saturating_sub(last_sed_unix).max(0) as u32
+}
+
+/// 久坐提醒文案：直接显示用户设置的久坐阈值，而不是不断上涨的累计时长。
+/// 这样提醒里的分钟数和设置页「久坐阈值」始终对得上。
+pub fn sed_reminder_msg(sedentary_minutes: u32) -> String {
+    format!("久坐 {} 分钟到了 · 该起来走走了", sedentary_minutes)
 }
 
 fn ack_reminder(app: &mut App) {
