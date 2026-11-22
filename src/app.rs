@@ -1896,17 +1896,10 @@ fn click(h: &HitId) {
                 app.leave_at = None;
                 app.apply_vis();
             }
-            // 底部左右箭头翻页：到边界即停，不再循环
-            HitId::PagePrev => {
-                if app.page > 0 {
-                    let p = app.page - 1;
-                    go_page(app, p);
-                }
-            }
-            HitId::PageNext => {
-                if app.page + 1 < n {
-                    let p = app.page + 1;
-                    go_page(app, p);
+            // 底部分页圆点：点哪个跳哪个（点当前页无动作）
+            HitId::PageDot(p) => {
+                if *p < n {
+                    go_page(app, *p);
                 }
             }
             HitId::Collapse => {

@@ -65,9 +65,8 @@ const RED: u32 = 0xF4554F;
 #[derive(Clone, PartialEq)]
 pub enum HitId {
     Pill,
-    /// 底部左右翻页箭头
-    PagePrev,
-    PageNext,
+    /// 底部分页圆点：悬停放大，点击直接跳到对应页
+    PageDot(usize),
     Collapse,
     /// 面板右上角图钉：锁定面板，遮挡时不再自动收起
     Pin,
@@ -1513,85 +1512,54 @@ fn color_pct(pct: f64) -> u32 {
     }
 }
 
-// ---- 底部翻页条：左箭头 · 页码圆点 · 右箭头 ----
+// ---- 底部分页圆点：Mac Dock 式悬停放大 + 点击直接跳页 ----
 
-const PAGER_BTN: f32 = 22.0;
-
-/// 底部一行：左侧 <、中间页点指示、右侧 >；首尾页箭头自动禁用（不再靠点击整块翻页）
+/// 底部一排页点：当前页主题色实心常亮；鼠标悬停的点连同左右邻居一起放大（波浪感），
+/// 点一下直接跳到对应页。单页时只保留隐私声明。
 fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, n: usize, alpha: f32, hits: &mut Vec<Hit>) {
-    let cy = h - s(30.0);
+    let cy = h - s(28.0);
 
     if n <= 1 {
-        // 单页时至少保留隐私声明
         cv.text_ex(0.0, cy - s(10.0), w, s(20.0), "零收集 · 零上传 · 零通讯", 8.5, W_NORMAL, TXT3, alpha * 0.85, 1, 1);
         return;
     }
 
-    let bs = s(PAGER_BTN);
-    let by = cy - bs / 2.0;
-    let lx = s(14.0);
-    let rx = w - s(14.0) - bs;
-
-    let can_prev = idx > 0;
-    let can_next = idx + 1 < n;
-
-    pager_btn(cv, lx, by, bs, true, can_prev, app.anims.hover_p(&HitId::PagePrev), alpha);
-    if can_prev {
-        push_hit(hits, HitId::PagePrev, lx - s(3.0), by - s(5.0), bs + s(6.0), bs + s(10.0));
-    }
-
-    pager_btn(cv, rx, by, bs, false, can_next, app.anims.hover_p(&HitId::PageNext), alpha);
-    if can_next {
-        push_hit(hits, HitId::PageNext, rx - s(3.0), by - s(5.0), bs + s(6.0), bs + s(10.0));
-    }
-
-    // 页点：纯指示，不再可点
-    let gap = s(8.0);
+    let gap = s(16.0);
     let total = gap * (n as f32 - 1.0);
     let x0 = (w - total) / 2.0;
+    let base_r = s(2.6);
+    let amp = s(3.6);
+
+    // 波浪中心 = 悬停进度最高的点；进出都由弹簧进度驱动，平滑回落
+    let (mut center, mut cp) = (None, 0.0f32);
     for i in 0..n {
-        cv.circle(x0 + gap * i as f32, cy, s(1.8), TXT3, alpha * 0.75);
+        let v = app.anims.hover_p(&HitId::PageDot(i));
+        if v > cp {
+            cp = v;
+            center = Some(i);
+        }
     }
 
-    // 当前页指示条跟着翻页进度滑动（而不是瞬移），与页面位移同步
-    let p = app.anims.page.v.clamp(0.0, 1.0);
-    let from = app.anims.page_from.min(n - 1) as f32;
-    let pos = if p < 0.999 { from + (idx as f32 - from) * p } else { idx as f32 };
-    let px = x0 + gap * pos;
-    cv.rrect(px - s(3.5), cy - s(2.2), s(7.0), s(4.4), s(2.2), crate::theme::main(), alpha);
+    for i in 0..n {
+        let p = match center {
+            Some(c) if cp > 0.004 => {
+                let d = (i as i32 - c as i32).abs();
+                let falloff = match d { 0 => 1.0, 1 => 0.55, 2 => 0.2, _ => 0.0 };
+                cp * falloff
+            }
+            _ => 0.0,
+        };
+        let x = x0 + gap * i as f32;
+        let r = base_r + amp * p;
+        let col = if i == idx { crate::theme::main() } else { mix(TXT3, TXT, p) };
+        cv.circle(x, cy, r, col, alpha);
+        // 每个点的命中区：贴合间距，避免相邻点误触
+        push_hit(hits, HitId::PageDot(i), x - gap / 2.0, cy - s(12.0), gap, s(24.0));
+    }
 
-    // 页码贴在右箭头左侧
+    // 页码淡字贴在右侧（箭头已移除）
     let pg = format!("{}/{}", idx + 1, n);
-    let pw = text_w(&pg, 8.5);
-    cv.text_ex(rx - s(10.0) - pw, cy - s(10.0), pw + s(2.0), s(20.0), &pg, 8.5, W_NORMAL, TXT3, alpha * 0.9, 2, 1);
-}
-
-/// 翻页小按钮：圆形，悬停进度平滑提亮，禁用时只留极暗底 + 低对比箭头
-fn pager_btn(cv: &mut Canvas, x: f32, y: f32, sz: f32, left: bool, enabled: bool, hover: f32, alpha: f32) {
-    let r = sz / 2.0;
-    let h = hover.clamp(0.0, 1.0);
-    if !enabled {
-        // 禁用：仅留一层极淡底，箭头降到 55% 对比，看得出位置但明确不可点
-        cv.rrect(x, y, sz, sz, r, 0x1D1D24, alpha * 0.85);
-    } else {
-        cv.rrect(x, y, sz, sz, r, mix(ROW, ROW2, h), alpha);
-        cv.rrect_stroke(x + 0.5, y + 0.5, sz - 1.0, sz - 1.0, r, mix(BORDER, 0x3A3A45, h), alpha, s(1.0));
-    }
-
-    let c = if !enabled { TXT3 } else { mix(0xC2C2CC, TXT, h) };
-    let a = if enabled { alpha } else { alpha * 0.55 };
-
-    let mx = x + sz / 2.0;
-    let my = y + sz / 2.0;
-    let d = s(3.6);
-    let dx = s(1.9);
-    if left {
-        cv.line(mx + dx, my - d, mx - dx, my, c, a, s(1.4));
-        cv.line(mx - dx, my, mx + dx, my + d, c, a, s(1.4));
-    } else {
-        cv.line(mx - dx, my - d, mx + dx, my, c, a, s(1.4));
-        cv.line(mx + dx, my, mx - dx, my + d, c, a, s(1.4));
-    }
+    cv.text_ex(w - s(34.0), cy - s(10.0), s(28.0), s(20.0), &pg, 8.5, W_NORMAL, TXT3, alpha * 0.8, 2, 1);
 }
 
 
