@@ -30,16 +30,6 @@ pub const ST_DEFAULT: u8 = 0;
 pub const ST_TYPING: u8 = 1;
 pub const ST_MUSIC: u8 = 2;
 
-/// 未知 id（历史版本的全部旧 id）回落到唯一形态
-pub fn index(id: &str) -> usize {
-    let _ = id;
-    0
-}
-
-pub fn name(_id: &str) -> &'static str {
-    ICON_KINDS[0].1
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Signal {
     /// 综合活跃能量 0..1（打字 + 声音，已平滑）

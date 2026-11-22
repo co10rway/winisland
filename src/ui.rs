@@ -65,7 +65,7 @@ const RED: u32 = 0xF4554F;
 #[derive(Clone, PartialEq)]
 pub enum HitId {
     Pill,
-    /// 底部分页圆点：悬停放大，点击直接跳到对应页
+    /// 底部分页图标：悬停放大，点击直接跳到对应页
     PageDot(usize),
     Collapse,
     /// 面板右上角图钉：锁定面板，遮挡时不再自动收起
@@ -843,7 +843,7 @@ fn draw_panel(app: &App, cv: &mut Canvas, w: f32, h: f32, o: f32, bg_a: f32, ct:
 
     // 底部翻页条：不参与滑动
     cv.offset(0.0, dy);
-    draw_pager(app, cv, w, h, idx, pages.len(), ct, hits);
+    draw_pager(app, cv, w, h, idx, &pages, ct, hits);
     cv.offset(0.0, 0.0);
     0.0
 }
@@ -1512,11 +1512,12 @@ fn color_pct(pct: f64) -> u32 {
     }
 }
 
-// ---- 底部分页圆点：Mac Dock 式悬停放大 + 点击直接跳页 ----
+// ---- 底部分页图标：Mac Dock 式悬停放大 + 点击直接跳页 ----
 
-/// 底部一排页点：当前页主题色实心常亮；鼠标悬停的点连同左右邻居一起放大（波浪感），
+/// 底部一排页面图标：当前页主题色高亮；鼠标悬停的图标连同左右邻居一起放大（波浪感），
 /// 点一下直接跳到对应页。单页时只保留隐私声明。
-fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, n: usize, alpha: f32, hits: &mut Vec<Hit>) {
+fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, pages: &[&str], alpha: f32, hits: &mut Vec<Hit>) {
+    let n = pages.len();
     let cy = h - s(28.0);
 
     if n <= 1 {
@@ -1524,13 +1525,17 @@ fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, n: usize, 
         return;
     }
 
-    let gap = s(16.0);
-    let total = gap * (n as f32 - 1.0);
+    let slot = s(28.0);
+    let gap = s(12.0);
+    let total = n as f32 * slot + (n as f32 - 1.0) * gap;
     let x0 = (w - total) / 2.0;
-    let base_r = s(2.6);
-    let amp = s(3.6);
 
-    // 波浪中心 = 悬停进度最高的点；进出都由弹簧进度驱动，平滑回落
+    // 半透明 Dock 托盘，把图标与页码区隔开
+    let pad = s(16.0);
+    cv.rrect(x0 - pad, cy - s(15.0), total + pad * 2.0, s(30.0), s(12.0), mix(BG, 0xFFFFFF, 0.045), alpha);
+    cv.rrect_stroke(x0 - pad + s(0.5), cy - s(14.5), total + pad * 2.0 - s(1.0), s(29.0), s(12.0), BORDER, alpha * 0.7, s(1.0));
+
+    // 波浪中心 = 悬停进度最高的图标；进出都由弹簧进度驱动，平滑回落
     let (mut center, mut cp) = (None, 0.0f32);
     for i in 0..n {
         let v = app.anims.hover_p(&HitId::PageDot(i));
@@ -1544,22 +1549,109 @@ fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, n: usize, 
         let p = match center {
             Some(c) if cp > 0.004 => {
                 let d = (i as i32 - c as i32).abs();
-                let falloff = match d { 0 => 1.0, 1 => 0.55, 2 => 0.2, _ => 0.0 };
-                cp * falloff
+                cp * match d { 0 => 1.0, 1 => 0.55, 2 => 0.2, _ => 0.0 }
             }
             _ => 0.0,
         };
-        let x = x0 + gap * i as f32;
-        let r = base_r + amp * p;
-        let col = if i == idx { crate::theme::main() } else { mix(TXT3, TXT, p) };
-        cv.circle(x, cy, r, col, alpha);
-        // 每个点的命中区：贴合间距，避免相邻点误触
-        push_hit(hits, HitId::PageDot(i), x - gap / 2.0, cy - s(12.0), gap, s(24.0));
+        let cx = x0 + slot / 2.0 + i as f32 * (slot + gap);
+        let sel = i == idx;
+
+        // 选中底：主题色淡底；悬停时其他图标浮出浅灰底
+        if sel {
+            cv.rrect(cx - s(12.5), cy - s(12.5), s(25.0), s(25.0), s(8.0), mix(ROW, crate::theme::main(), 0.16), alpha);
+        } else if p > 0.01 {
+            cv.rrect(cx - s(12.5), cy - s(12.5), s(25.0), s(25.0), s(8.0), mix(ROW, 0x33333E, p), alpha);
+        }
+
+        let col = if sel { crate::theme::main() } else { mix(TXT3, TXT, p.max(0.15)) };
+        draw_page_icon(cv, pages[i], cx, cy, s(18.0) * (1.0 + 0.30 * p), col, alpha);
+
+        // 命中区贴合槽位，避免相邻图标误触
+        push_hit(hits, HitId::PageDot(i), cx - (slot + gap) / 2.0, cy - s(14.0), slot + gap, s(28.0));
+    }
+
+    // 悬停标签：图标上方浮出页面名
+    if let Some(c) = center {
+        if cp > 0.08 {
+            let label = crate::config::panel_name(pages[c]);
+            let tw = text_w(label, 9.5);
+            let bw = tw + s(14.0);
+            let bx = (x0 + slot / 2.0 + c as f32 * (slot + gap) - bw / 2.0).clamp(s(4.0), w - bw - s(4.0));
+            let by = cy - s(15.0) - s(22.0) - s(5.0);
+            cv.rrect(bx, by, bw, s(22.0), s(7.0), mix(ROW, 0x000000, 0.25), alpha);
+            cv.text1(bx + s(7.0), by, tw, s(22.0), label, 9.5, W_NORMAL, TXT, alpha * cp.min(1.0));
+        }
     }
 
     // 页码淡字贴在右侧（箭头已移除）
     let pg = format!("{}/{}", idx + 1, n);
     cv.text_ex(w - s(34.0), cy - s(10.0), s(28.0), s(20.0), &pg, 8.5, W_NORMAL, TXT3, alpha * 0.8, 2, 1);
+}
+
+/// 8 个页面图标：统一线性笔画，坐标按 24×24 网格缩放到实际图标尺寸
+fn draw_page_icon(cv: &mut Canvas, kind: &str, cx: f32, cy: f32, size: f32, col: u32, alpha: f32) {
+    let k = size / 24.0;
+    let l = cx - size / 2.0;
+    let t = cy - size / 2.0;
+    let px = |x: f32| l + x * k;
+    let py = |y: f32| t + y * k;
+    let sw = s(1.3);
+    match kind {
+        "overview" => {
+            for &(x, y) in &[(3.0f32, 3.0f32), (14.0, 3.0), (3.0, 14.0), (14.0, 14.0)] {
+                cv.rrect_stroke(px(x), py(y), 7.0 * k, 7.0 * k, 1.6 * k, col, alpha, sw);
+            }
+        }
+        "schedule" => {
+            cv.rrect_stroke(px(3.0), py(5.0), 18.0 * k, 16.0 * k, 2.5 * k, col, alpha, sw);
+            cv.line(px(7.0), py(3.0), px(7.0), py(7.0), col, alpha, sw);
+            cv.line(px(17.0), py(3.0), px(17.0), py(7.0), col, alpha, sw);
+            cv.line(px(3.0), py(10.0), px(21.0), py(10.0), col, alpha, sw);
+            cv.line(px(8.0), py(14.0), px(11.0), py(14.0), col, alpha, sw);
+            cv.line(px(8.0), py(17.0), px(14.0), py(17.0), col, alpha, sw);
+        }
+        "todo" => {
+            cv.line(px(4.0), py(7.0), px(5.6), py(8.6), col, alpha, sw);
+            cv.line(px(5.6), py(8.6), px(8.5), py(5.7), col, alpha, sw);
+            cv.line(px(4.0), py(16.0), px(5.6), py(17.6), col, alpha, sw);
+            cv.line(px(5.6), py(17.6), px(8.5), py(14.7), col, alpha, sw);
+            cv.line(px(12.0), py(7.0), px(20.0), py(7.0), col, alpha, sw);
+            cv.line(px(12.0), py(16.0), px(20.0), py(16.0), col, alpha, sw);
+        }
+        "files" => {
+            cv.rrect_stroke(px(3.0), py(8.0), 18.0 * k, 12.0 * k, 2.0 * k, col, alpha, sw);
+            cv.line(px(3.0), py(12.0), px(21.0), py(12.0), col, alpha, sw);
+            cv.line(px(7.0), py(8.0), px(8.5), py(5.8), col, alpha, sw);
+            cv.line(px(8.5), py(5.8), px(11.0), py(5.8), col, alpha, sw);
+        }
+        "clips" => {
+            cv.rrect_stroke(px(5.0), py(4.0), 14.0 * k, 17.0 * k, 2.0 * k, col, alpha, sw);
+            cv.rrect_stroke(px(9.0), py(2.0), 6.0 * k, 4.5 * k, 1.2 * k, col, alpha, sw);
+            cv.line(px(9.0), py(11.0), px(15.0), py(11.0), col, alpha, sw);
+            cv.line(px(9.0), py(15.0), px(15.0), py(15.0), col, alpha, sw);
+        }
+        "health" => {
+            cv.circle_stroke(px(12.0), py(13.5), 5.5 * k, col, alpha, sw);
+            cv.line(px(8.6), py(9.6), px(12.0), py(3.0), col, alpha, sw);
+            cv.line(px(12.0), py(3.0), px(15.4), py(9.6), col, alpha, sw);
+        }
+        "salary" => {
+            cv.circle_stroke(px(12.0), py(12.0), 9.0 * k, col, alpha, sw);
+            cv.line(px(8.5), py(8.0), px(12.0), py(12.0), col, alpha, sw);
+            cv.line(px(12.0), py(12.0), px(15.5), py(8.0), col, alpha, sw);
+            cv.line(px(12.0), py(12.0), px(12.0), py(17.5), col, alpha, sw);
+            cv.line(px(9.0), py(13.5), px(15.0), py(13.5), col, alpha, sw);
+            cv.line(px(9.0), py(16.0), px(15.0), py(16.0), col, alpha, sw);
+        }
+        "watch" => {
+            cv.line(px(3.0), py(17.0), px(8.0), py(12.0), col, alpha, sw);
+            cv.line(px(8.0), py(12.0), px(12.0), py(15.0), col, alpha, sw);
+            cv.line(px(12.0), py(15.0), px(20.0), py(6.0), col, alpha, sw);
+            cv.line(px(16.0), py(6.0), px(20.0), py(6.0), col, alpha, sw);
+            cv.line(px(20.0), py(6.0), px(20.0), py(10.0), col, alpha, sw);
+        }
+        _ => cv.circle(px(12.0), py(12.0), 3.0 * k, col, alpha),
+    }
 }
 
 

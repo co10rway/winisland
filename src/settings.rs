@@ -78,7 +78,7 @@ const NAV_ON: u32 = 0x1E1E27;
 // ───────────────────────── 导航表 ─────────────────────────
 // (页码, 分组, 导航文字) —— 页码与配置页一一对应，不随展示顺序变化
 const GROUPS: [&str; 4] = ["外观", "效率", "关怀", "其他"];
-const NAV: [(usize, usize, &str); 13] = [
+const NAV: [(usize, usize, &str); 12] = [
     (0, 0, "通用"),
     (11, 0, "面板页面"),
     (2, 1, "打工鼓励器"),
@@ -87,7 +87,6 @@ const NAV: [(usize, usize, &str); 13] = [
     (5, 1, "文件中转站"),
     (6, 1, "剪贴板中转"),
     (7, 1, "桌面分区"),
-    (9, 1, "灵动图标"),
     (12, 1, "盯盘助手"),
     (1, 2, "健康提醒"),
     (8, 2, "邮箱验证码"),
@@ -119,10 +118,6 @@ enum RowKind {
     PageRow,
     /// 主题色：一排可点色块
     Theme,
-    /// 灵动图标：一排带实时预览的可点图标卡片
-    IconPick,
-    /// 声音响应开关（不对应某个功能模块，单独命中）
-    Sound,
     /// 工作日：一排「一二三四五六日」可点方块
     Weekday,
     /// 时间选择器：点击弹出时/分选择面板（不创建原生 EDIT）
@@ -194,14 +189,6 @@ impl Row {
     /// 主题色选择行：右侧一排色块
     fn theme() -> Row {
         Row { kind: RowKind::Theme, slot: 0, label: "主题色", desc: "胶囊与面板的强调色", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
-    }
-    /// 图标样式选择行（目前唯一形态「灵动岛」，卡片内为三种状态的实时预览）
-    fn icon_pick() -> Row {
-        Row { kind: RowKind::IconPick, slot: 0, label: "动态图标", desc: "默认 / 键盘输入 / 播放声音 三态自动切换，随打字与音量律动", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
-    }
-    /// 声音响应开关行
-    fn sound() -> Row {
-        Row { kind: RowKind::Sound, slot: 0, label: "响应系统声音", desc: "播放音乐 / 视频时图标跳动更明显", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
     }
     /// 工作日选择行：哪天算上班
     fn weekday() -> Row {
@@ -281,8 +268,6 @@ fn layout(page: &Page) -> Layout {
                             | RowKind::Action
                             | RowKind::PageRow
                             | RowKind::Theme
-                            | RowKind::IconPick
-                            | RowKind::Sound
                             | RowKind::Weekday
                     )
                 {
@@ -312,6 +297,7 @@ fn pages() -> Vec<Page> {
                 Row::toggle(0, "开机自启", "登录 Windows 后静默启动灵动岛"),
                 Row::caption("显示"),
                 Row::toggle(1, "被遮挡时自动收起", "面板区域被其它窗口压住时收成顶部横条，鼠标移上去再展开，移开自动收回"),
+                Row::toggle(2, "打字统计", "统计 WPM 与今日输入字数，关闭后胶囊改显时间"),
                 Row::caption("外观"),
                 Row::theme(),
                 Row::note("灵动岛固定在屏幕顶部居中：没有窗口压住面板区域时显示面板，被压住时收成横条。金额符号固定为 ¥。"),
@@ -433,17 +419,6 @@ fn pages() -> Vec<Page> {
                 Row::note("只识别「验证码后面紧跟 4~8 位数字」这种通用明文格式。若一直收不到，可能是该网站为防抓取对验证码做了混淆（数字嵌在图片里、插入特殊字符等），这类邮件无法自动解析，属于正常限制，请到邮箱中手动查看。"),
             ],
         },
-        // 9 灵动图标
-        Page {
-            title: "灵动图标",
-            desc: "胶囊最左侧图标持续律动，打字或播放声音时跳动更明显",
-            rows: vec![
-                Row::toggle(0, "响应打字", "按最近几秒的按键节奏加大跳动幅度"),
-                Row::icon_pick(),
-                Row::sound(),
-                Row::note("只统计按键次数与系统输出音量峰值，不记录键值、窗口标题、音频内容，也不上传。"),
-            ],
-        },
         // 10 关于
         Page {
             title: "关于 WinIsland",
@@ -494,10 +469,8 @@ enum HitId {
     Toggle(usize, i32),
     Btn(usize, i32),
     Theme(usize),
-    Icon(usize),
     /// 工作日（0=周一 … 6=周日）
     Weekday(usize),
-    Sound,
     /// 底部「保存并应用」按钮：保存所有页配置 + 刷新面板数据
     Sync,
     /// 时间选择器字段（点击弹出面板）
@@ -613,7 +586,6 @@ fn page_on(page: usize) -> bool {
     match page {
         1..=8 => module_enabled(page),
         12 => module_enabled(12),
-        // 图标页含「样式 / 声音」等与打字开关无关的通用配置，始终常亮
         _ => true,
     }
 }
@@ -1202,7 +1174,7 @@ fn draw_page(cv: &mut Canvas, page: &Page, idx: usize, hover: HitId, hits: &mut 
         let row = &page.rows[pl.row];
         let is_card_row = matches!(
             row.kind,
-            RowKind::Toggle | RowKind::Field | RowKind::Time | RowKind::Action | RowKind::PageRow | RowKind::Theme | RowKind::IconPick | RowKind::Sound | RowKind::Weekday
+            RowKind::Toggle | RowKind::Field | RowKind::Time | RowKind::Action | RowKind::PageRow | RowKind::Theme | RowKind::Weekday
         );
         if is_card_row {
             if let Some(py) = prev {
@@ -1374,68 +1346,6 @@ fn draw_row(cv: &mut Canvas, row: &Row, page: usize, pl: &Placed, cx: f32, cw: f
                 push_hit(hits, HitId::Theme(i), bx - s(4.0), by - s(4.0), d + s(8.0), d + s(8.0));
                 bx += d + gap;
             }
-        }
-        RowKind::IconPick => {
-            let kinds = crate::modules::icon::ICON_KINDS;
-            let n = kinds.len();
-            let bw = s(72.0);
-            let bh = s(44.0);
-            let gap = s(8.0);
-            let total = n as f32 * bw + (n as f32 - 1.0) * gap;
-            let text_w = (inner_w - total - s(16.0)).max(s(120.0));
-            cv.text1(inner_l, ly, text_w, s(19.0), row.label, 13.0, W_MED, TXT, ta);
-            if has_desc {
-                cv.text1(inner_l, dy, text_w, s(16.0), row.desc, 11.0, W_NORMAL, TXT3, ta);
-            }
-
-            let mut bx = cx + cw - s(18.0) - total;
-            let by = ry + (rh - bh) / 2.0;
-            let cur = crate::app::with_cfg(|c| crate::modules::icon::index(&c.icon));
-            for (i, (id, label)) in kinds.iter().enumerate() {
-                let sel = i == cur;
-                let hov = hover == HitId::Icon(i);
-                let base = if sel {
-                    crate::anim::mix(CARD, crate::theme::main(), 0.20)
-                } else if hov {
-                    0x23232B
-                } else {
-                    0x1B1B22
-                };
-                cv.rrect(bx, by, bw, bh, s(9.0), base, ta);
-                cv.rrect_stroke(
-                    bx + 0.5, by + 0.5, bw - 1.0, bh - 1.0, s(9.0),
-                    if sel { crate::theme::main() } else if hov { 0x3C3C4A } else { CARD_BD },
-                    if sel { 0.95 } else { 0.85 }, s(1.2),
-                );
-                // 卡片内实时预览图标：固定相位 + 中高能量，直观看到每种形态
-                let sig = crate::modules::icon::Signal {
-                    energy: 0.62,
-                    phase: 1.7 + i as f32 * 0.45,
-                    state: crate::modules::icon::ST_DEFAULT,
-                    prev: crate::modules::icon::ST_DEFAULT,
-                    blend: 1.0,
-                    key_idx: 1,
-                    key_age: 0.0,
-                };
-                crate::modules::icon::draw_icon(cv, *id, bx + bw / 2.0, by + s(17.0), s(34.0), s(26.0), sig, ta);
-                cv.text_c(bx, by + s(31.0), bw, s(12.0), *label, 9.0,
-                    if sel { W_SEMI } else { W_MED }, if sel { TXT } else { TXT2 }, ta);
-                push_hit(hits, HitId::Icon(i), bx, by, bw, bh);
-                bx += bw + gap;
-            }
-        }
-        RowKind::Sound => {
-            cv.text1(inner_l, ly, inner_w - s(64.0), s(19.0), row.label, 13.0, W_MED, TXT, ta);
-            if has_desc {
-                cv.text1(inner_l, dy, inner_w - s(64.0), s(16.0), row.desc, 11.0, W_NORMAL, TXT3, ta);
-            }
-            let on = crate::app::with_cfg(|c| c.sound_react);
-            let sw = s(44.0);
-            let sh = s(26.0);
-            let sx = cx + cw - s(18.0) - sw;
-            let sy = ry + (rh - sh) / 2.0;
-            draw_switch(cv, sx, sy, sw, sh, on, hover == HitId::Sound, ta);
-            push_hit(hits, HitId::Sound, sx - s(6.0), sy - s(6.0), sw + s(12.0), sh + s(12.0));
         }
         RowKind::Weekday => {
             let w = crate::app::with_cfg(|c| c.salary.weekdays_view());
@@ -2027,6 +1937,14 @@ fn on_click(hwnd: HWND, id: HitId) {
                 crate::app::save_now();
                 crate::app::redraw();
                 flash(if on { "已开启遮挡自动收起" } else { "已改为常驻面板" });
+            } else if page == 0 && slot == 2 {
+                let on = crate::app::with_cfg(|c| {
+                    c.modules.typing = !c.modules.typing;
+                    c.modules.typing
+                });
+                crate::app::save_now();
+                crate::app::redraw();
+                flash(if on { "已开启打字统计" } else { "已关闭打字统计" });
             } else if page == 3 && matches!(slot, 10 | 20 | 30) {
                 // 三个来源各自的启用开关
                 let on = crate::app::with_cfg(|c| {
@@ -2122,25 +2040,6 @@ fn on_click(hwnd: HWND, id: HitId) {
             crate::app::save_now();
             crate::app::redraw(); // 岛立即换色
             flash("主题已更新");
-            invalidate(hwnd);
-        }
-        HitId::Icon(i) => {
-            if let Some((id, _)) = crate::modules::icon::ICON_KINDS.get(i) {
-                crate::app::with_cfg(|c| c.icon = (*id).to_string());
-                crate::app::save_now();
-                crate::app::redraw(); // 岛立即换图标
-                flash(&format!("图标已切换为「{}」", crate::modules::icon::name(*id)));
-                invalidate(hwnd);
-            }
-        }
-        HitId::Sound => {
-            let on = crate::app::with_cfg(|c| {
-                c.sound_react = !c.sound_react;
-                c.sound_react
-            });
-            crate::app::save_now();
-            crate::app::redraw();
-            flash(if on { "已开启声音响应" } else { "已关闭声音响应" });
             invalidate(hwnd);
         }
         HitId::Sync => {
