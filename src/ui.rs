@@ -273,7 +273,7 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
                     return;
                 }
                 crate::app::ToastKind::Sedentary => {
-                    let mins = crate::app::now_idle_secs().max(60) as f64 / 60.0;
+                    let mins = crate::app::now_sed_secs(app.last_sed_unix).max(60) as f64 / 60.0;
                     let msg = format!("已久坐 {} 小时 {} 分", mins as u64, ((mins.fract()) * 60.0) as u64);
                     let bx = x + 22.0;
                     cv.circle(bx, y + ph / 2.0, s(6.0), ORANGE, alpha);
@@ -877,7 +877,7 @@ fn draw_reminder_bar(
             format!("该喝水了 · 今日 {}/{} 杯", cups.min(goal), goal)
         }
         ToastKind::Sedentary => {
-            let mins = crate::app::now_idle_secs().max(60) as f64 / 60.0;
+            let mins = crate::app::now_sed_secs(app.last_sed_unix).max(60) as f64 / 60.0;
             format!("已久坐 {} 小时 {} 分", mins as u64, (mins.fract() * 60.0) as u64)
         }
         ToastKind::Schedule => {
@@ -1046,7 +1046,7 @@ fn page_overview(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<
 
     let goal = app.cfg.health.water_goal_cups.max(1);
     let cups = app.store.water_cups;
-    let idle_min = crate::app::now_idle_secs() / 60;
+    let idle_min = crate::app::now_sed_secs(app.last_sed_unix) / 60;
     let sal = app.sal.earned_today_f(clock::secs_of_day_f(&st));
     let money = format!("¥{}", crate::modules::salary::fmt_money(sal));
 
@@ -1335,7 +1335,7 @@ fn page_health(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hi
     let half = (iw - gap) / 2.0;
     let y2 = s(142.0);
     let h2 = s(50.0);
-    let idle_min = crate::app::now_idle_secs() / 60;
+    let idle_min = crate::app::now_sed_secs(app.last_sed_unix) / 60;
     let warn = idle_min >= app.cfg.health.sedentary_minutes;
 
     cv.rrect(pad, y2, half, h2, s(12.0), ROW, alpha);

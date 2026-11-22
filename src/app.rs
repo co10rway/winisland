@@ -5,13 +5,12 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::DataExchange::AddClipboardFormatListener;
 use windows::Win32::Graphics::Gdi::ValidateRect;
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, TrackMouseEvent, LASTINPUTINFO, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::Shell::{ShellExecuteW, DragAcceptFiles};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::UI::HiDpi::*;
@@ -157,7 +156,9 @@ pub struct App {
     /// 直到用户点击胶囊（或提醒条按钮）才清除
     pub reminder: Option<Toast>,
     pub last_water_unix: i64,
-    pub sed_ack_idle: u32, // 上次"起来走走"确认时的空闲秒数
+    /// 上次"起来走走"确认的时间戳（Unix 秒）。与喝水一样按真实时间流逝判定，
+    /// 连续打字或完全不动都会累计，不再依赖系统输入空闲时间。
+    pub last_sed_unix: i64,
     pub code_until: Option<Instant>,
     /// 验证码尚未点击复制：一直展示，不自动消失（与喝水提醒一致，必须用户确认）
     pub code_pending: bool,
@@ -493,7 +494,7 @@ pub fn run() {
                 drag_hover: false,
                 reminder: None,
                 last_water_unix: now_unix,
-                sed_ack_idle: 0,
+                last_sed_unix: now_unix,
                 code_until: None,
                 code_pending: false,
                 last_mail_seq,
@@ -739,7 +740,7 @@ fn preview_app(demo: bool) -> App {
         drag_hover: false,
         reminder: None,
         last_water_unix: 0,
-        sed_ack_idle: 0,
+        last_sed_unix: files::now_unix(),
         code_until: None,
         code_pending: false,
         last_mail_seq: 0,
@@ -1531,20 +1532,6 @@ unsafe extern "system" fn hook_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) 
     CallNextHookEx(None, ncode, wparam, lparam)
 }
 
-// ───────── 全局鼠标钩子：检测"用户正在拖动文件" ─────────
-// 只做轻量手势判定，绝不在此调用 OleGetClipboard / 访问 APP：
-pub fn now_idle_secs() -> u32 {
-    unsafe {
-        let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
-        if GetLastInputInfo(&mut li).as_bool() {
-            let tick = GetTickCount();
-            tick.saturating_sub(li.dwTime) / 1000
-        } else {
-            0
-        }
-    }
-}
-
 /// 外部（OLE 拖放回调，运行在主线程消息循环）推入文件。
 /// 容量上限由设置里的 filehub_cap 决定；满额时拒绝新文件并提示，不淘汰已有条目。
 pub fn push_file_external(path: String) {
@@ -1655,6 +1642,12 @@ fn raise_reminder(app: &mut App, kind: ToastKind, msg: String) {
 }
 
 /// 用户点击胶囊 / 提醒条按钮：清掉提醒并做完对应的记账，然后恢复正常轮播
+/// 当前久坐秒数：与喝水一样按时间戳间隔计算，只看真实时间流逝，
+/// 连续打字或完全不输入都会照常累计。
+pub fn now_sed_secs(last_sed_unix: i64) -> u32 {
+    files::now_unix().saturating_sub(last_sed_unix).max(0) as u32
+}
+
 fn ack_reminder(app: &mut App) {
     let Some(r) = app.reminder.take() else { return };
     match r.kind {
@@ -1664,7 +1657,7 @@ fn ack_reminder(app: &mut App) {
             app.dirty = true;
         }
         ToastKind::Sedentary => {
-            app.sed_ack_idle = now_idle_secs();
+            app.last_sed_unix = files::now_unix();
         }
         ToastKind::Schedule => {}
         ToastKind::Stock => {}
@@ -1698,10 +1691,9 @@ fn tick_second() {
 
         // 健康提醒
         if app.cfg.modules.health {
-            let idle = now_idle_secs();
             let now_unix = files::now_unix();
             if app.reminder.is_none() {
-                if idle >= app.cfg.health.sedentary_minutes * 60 && idle.saturating_sub(app.sed_ack_idle) >= app.cfg.health.sedentary_minutes * 60 {
+                if (now_unix - app.last_sed_unix) >= (app.cfg.health.sedentary_minutes as i64) * 60 {
                     raise_reminder(app, ToastKind::Sedentary, String::new());
                 } else if (now_unix - app.last_water_unix) >= (app.cfg.health.water_interval_minutes as i64) * 60 {
                     // 先记下这次提醒的时间，避免用户点了确认又立刻重新弹
@@ -1999,7 +1991,7 @@ fn click(h: &HitId) {
                 app.dirty = true;
             }
             HitId::SedWalk => {
-                app.sed_ack_idle = now_idle_secs();
+                app.last_sed_unix = files::now_unix();
                 app.reminder = None;
             }
             // 面板顶部提醒条的确认按钮：唯一能让提醒消失的入口
