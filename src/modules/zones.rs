@@ -39,11 +39,14 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    DragAcceptFiles, DragFinish, DragQueryFileW, IContextMenu, IShellFolder, SHBindToParent,
-    SHChangeNotifyDeregister, SHChangeNotifyEntry, SHChangeNotifyRegister,
-    SHGetSpecialFolderLocation, SHGetFileInfoW, SHParseDisplayName, ShellExecuteW,
+    DragAcceptFiles, DragFinish, DragQueryFileW, IContextMenu, IShellFolder, ILCombine,
+    SHBindToParent, SHChangeNotifyDeregister, SHChangeNotifyEntry, SHChangeNotifyRegister,
+    SHGetDesktopFolder, SHGetNameFromIDList, SHGetSpecialFolderLocation, SHGetFileInfoW,
+    SHParseDisplayName, ShellExecuteExW, ShellExecuteW,
     CMINVOKECOMMANDINFO, CMF_NORMAL, CSIDL_DESKTOP, HDROP, SHCNE_ALLEVENTS, SHCNRF_InterruptLevel,
-    SHCNRF_ShellLevel, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
+    SHCNRF_ShellLevel, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_PIDL,
+    SEE_MASK_IDLIST, SHELLEXECUTEINFOW, SHCONTF_FOLDERS, SHCONTF_NONFOLDERS, SIGDN_FILESYSPATH,
+    SIGDN_NORMALDISPLAY,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -131,6 +134,32 @@ struct ItemDrag {
 struct DeskItem {
     name: String,
     path: PathBuf,
+    /// Shell 虚拟项（此电脑/回收站/网络等）的 PIDL 字节副本；物理文件为 None。
+    /// 虚拟项磁盘上没有真实路径，path 只是用于去重/分类的伪路径，
+    /// 图标/打开/右键菜单都按 pidl 走 Shell API。
+    pidl: Option<Vec<u8>>,
+}
+
+/// 计算一个（可能多段的）绝对 PIDL 的总字节长度，用于复制保存。
+/// PIDL 由若干 SHITEMID 首尾相接，每段前 2 字节是 cb（含自身），cb=0 为终止符。
+unsafe fn pidl_len(pidl: *const ITEMIDLIST) -> usize {
+    let mut p = pidl as *const u8;
+    let mut total = 0usize;
+    loop {
+        let cb = u16::from_ne_bytes(std::ptr::read_unaligned(p as *const [u8; 2])) as usize;
+        if cb == 0 {
+            // 终止 SHITEMID 占 2 字节
+            return total + 2;
+        }
+        total += cb;
+        p = p.add(cb);
+    }
+}
+
+/// 把 PIDL 复制成可长期持有的字节（枚举器返回的 PIDL 在下次 Next 前失效）。
+unsafe fn clone_pidl(pidl: *const ITEMIDLIST) -> Vec<u8> {
+    let n = pidl_len(pidl);
+    std::slice::from_raw_parts(pidl as *const u8, n).to_vec()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -182,6 +211,47 @@ fn title_alpha() -> u32 {
 /// 转 NUL 结尾 UTF-16（所有 LPCWSTR 参数必须 NUL 结尾，否则读越界乱码）
 fn wide_nul(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 读取 Shell 返回的 NUL 结尾 UTF-16 字符串（调用方负责 CoTaskMemFree）
+unsafe fn pwstr_string(p: windows::core::PWSTR) -> String {
+    if p.0.is_null() {
+        return String::new();
+    }
+    let mut n = 0usize;
+    while *p.0.add(n) != 0 {
+        n += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(p.0, n))
+}
+
+/// 把分区的 owner 设为桌面图标宿主 SHELLDLL_DefView。
+///
+/// Win+D 不是最小化窗口，而是把桌面窗口提到 z 序最前；分区这种无 owner 的
+/// 顶层窗口就被盖住。Windows 规则是「owned 窗口永远位于 owner 之上」，
+/// 所以把 owner 设成 DefView 后，桌面被提到前面时分区会随之上来，
+/// 无需任何轮询、置顶切换或反复重绘（那会把桌面刷得不停闪）。
+/// 分区仍不是 topmost，普通窗口正常压在它上面。
+unsafe fn own_by_desktop(hw: HWND) {
+    let (_, def) = shell();
+    if !def.0.is_null() {
+        let _ = SetWindowLongPtrW(hw, GWLP_HWNDPARENT, def.0 as isize);
+    }
+}
+
+/// 拖拽坐标统一取系统光标位置。
+///
+/// 不能用 lParam 的 client 坐标 + ClientToScreen 反推：捕获鼠标、窗口被
+/// MoveWindow 挪动、以及多显示器不同 DPI 时，反推出来的屏幕坐标会和真实
+/// 光标有偏差，表现就是「鼠标在这里，拖动的文件/浮窗却偏在别处」。
+/// GetCursorPos 是唯一的权威屏幕坐标源。
+unsafe fn cursor_screen() -> POINT {
+    let mut p = POINT::default();
+    if GetCursorPos(&mut p).is_err() {
+        // 极端情况退回 lParam 无法在此函数内处理，返回 0 让调用方忽略本次移动
+        p = POINT { x: 0, y: 0 };
+    }
+    p
 }
 
 /// 找桌面图标宿主（def = SHELLDLL_DefView）及其父层（layer）
@@ -462,10 +532,80 @@ fn desktop_items() -> Vec<DeskItem> {
                     continue;
                 }
                 let p = e.path();
-                out.push(DeskItem { name, path: p });
+                out.push(DeskItem { name, path: p, pidl: None });
             }
         }
     }
+
+    // Shell 桌面命名空间虚拟项：此电脑 / 回收站 / 网络 / 控制面板等，
+    // 磁盘上没有真实文件，只能通过 IShellFolder::EnumObjects 枚举。
+    // 物理项已在上面收录，这里只补名字去重的、确实不在物理集合里的虚拟项。
+    unsafe {
+        // 桌面绝对 PIDL：EnumObjects 返回的是相对桌面的子 PIDL，
+        // 而 SHGetFileInfoW(SHGFI_PIDL)/ShellExecuteEx/SHBindToParent 都要绝对 PIDL，
+        // 所以这里一次合成绝对 PIDL 保存，下游统一按绝对 PIDL 处理。
+        let desktop_abs = SHGetSpecialFolderLocation(None, CSIDL_DESKTOP as i32).ok();
+        if let Ok(desktop) = SHGetDesktopFolder() {
+            let mut enum_idl: Option<windows::Win32::UI::Shell::IEnumIDList> = None;
+            let hr = desktop.EnumObjects(
+                HWND::default(),
+                (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0) as u32,
+                &mut enum_idl,
+            );
+            if hr.is_ok() {
+                if let Some(en) = enum_idl {
+                    loop {
+                        let mut one: [*mut ITEMIDLIST; 1] = [std::ptr::null_mut()];
+                        let mut got = 0u32;
+                        if en.Next(&mut one, Some(&mut got)).is_err() || got == 0 {
+                            break;
+                        }
+                        let child = one[0];
+                        if child.is_null() {
+                            break;
+                        }
+                        // 跳过物理项：能拿到真实文件系统路径的说明是普通文件/快捷方式，
+                        // 已由上面的 read_dir 收录。Shell 的显示名可能去掉 .lnk 扩展名，
+                        // 与文件名不一致会导致去重失效、图标重复，故按「有无真实路径」区分。
+                        let is_physical = match SHGetNameFromIDList(child, SIGDN_FILESYSPATH) {
+                            Ok(p) => {
+                                let s = pwstr_string(p);
+                                CoTaskMemFree(Some(p.0 as *const c_void));
+                                !s.is_empty()
+                            }
+                            Err(_) => false,
+                        };
+                        if !is_physical {
+                            // 虚拟项：显示名（本地化）此电脑 / 回收站 / …
+                            if let Ok(namep) = SHGetNameFromIDList(child, SIGDN_NORMALDISPLAY) {
+                                let name = pwstr_string(namep);
+                                CoTaskMemFree(Some(namep.0 as *const c_void));
+                                if !name.is_empty() && seen.insert(name.clone()) {
+                                    // 合成绝对 PIDL 并复制保存
+                                    let abs = match desktop_abs {
+                                        Some(d) => ILCombine(Some(d), Some(child)),
+                                        None => std::ptr::null_mut(),
+                                    };
+                                    if !abs.is_null() {
+                                        let bytes = clone_pidl(abs);
+                                        CoTaskMemFree(Some(abs as *const c_void));
+                                        // 伪路径仅用于去重/分类显示，不指向真实文件
+                                        let pseudo = PathBuf::from(format!("shell://{}", name));
+                                        out.push(DeskItem { name, path: pseudo, pidl: Some(bytes) });
+                                    }
+                                }
+                            }
+                        }
+                        CoTaskMemFree(Some(child as *const c_void));
+                    }
+                }
+            }
+            if let Some(d) = desktop_abs {
+                CoTaskMemFree(Some(d as *const c_void));
+            }
+        }
+    }
+
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     out
 }
@@ -479,34 +619,40 @@ fn refresh_items() {
     SIGN.with(|s| *s.borrow_mut() = sig);
 }
 
-fn path_of(name: &str) -> Option<PathBuf> {
-    ITEMS.with(|v| {
-        v.borrow()
-            .iter()
-            .find(|i| i.name == name)
-            .map(|i| i.path.clone())
-    })
-}
-
 /// 取某桌面项的 HICON（懒加载并缓存）。返回 0 表示失败。
+/// 虚拟项用保存的 PIDL + SHGFI_PIDL 取图标；物理文件走路径。
 fn icon_of(name: &str) -> isize {
     if let Some(v) = ICONS.with(|m| m.borrow().get(name).copied()) {
         return v;
     }
-    let path = match path_of(name) {
-        Some(p) => p,
-        None => return 0,
-    };
-    let wide = wide_nul(&path.to_string_lossy());
+    let item = ITEMS.with(|v| {
+        v.borrow()
+            .iter()
+            .find(|i| i.name == name)
+            .cloned()
+    });
+    let Some(item) = item else { return 0 };
     let mut fi = SHFILEINFOW::default();
     let ok = unsafe {
-        SHGetFileInfoW(
-            PCWSTR(wide.as_ptr()),
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            Some(&mut fi),
-            std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_LARGEICON,
-        )
+        if let Some(pidl) = &item.pidl {
+            // 虚拟项：pszPath 传 PIDL 指针，必须带 SHGFI_PIDL
+            SHGetFileInfoW(
+                PCWSTR(pidl.as_ptr() as *const u16),
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                Some(&mut fi),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_ICON | SHGFI_LARGEICON | SHGFI_PIDL,
+            )
+        } else {
+            let wide = wide_nul(&item.path.to_string_lossy());
+            SHGetFileInfoW(
+                PCWSTR(wide.as_ptr()),
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                Some(&mut fi),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_ICON | SHGFI_LARGEICON,
+            )
+        }
     };
     let h = if ok != 0 { fi.hIcon.0 as isize } else { 0 };
     ICONS.with(|m| m.borrow_mut().insert(name.to_string(), h));
@@ -514,10 +660,38 @@ fn icon_of(name: &str) -> isize {
 }
 
 fn open_item(name: &str) {
-    if let Some(p) = path_of(name) {
-        let wide = wide_nul(&p.to_string_lossy());
-        unsafe {
-            ShellExecuteW(
+    let item = ITEMS.with(|v| {
+        v.borrow()
+            .iter()
+            .find(|i| i.name == name)
+            .cloned()
+    });
+    let Some(item) = item else { return };
+    unsafe {
+        if let Some(abs_bytes) = &item.pidl {
+            // 虚拟项：直接把保存的绝对 PIDL 交给 ShellExecuteEx 的 lpIDList
+            let mut abs = abs_bytes.clone();
+            let mut sei = SHELLEXECUTEINFOW {
+                cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+                fMask: SEE_MASK_IDLIST,
+                hwnd: HWND::default(),
+                lpVerb: w!("open"),
+                lpFile: PCWSTR::null(),
+                lpParameters: PCWSTR::null(),
+                lpDirectory: PCWSTR::null(),
+                nShow: SW_SHOWNORMAL.0,
+                hInstApp: std::mem::zeroed(),
+                lpIDList: abs.as_mut_ptr() as *mut c_void,
+                lpClass: PCWSTR::null(),
+                hkeyClass: std::mem::zeroed(),
+                dwHotKey: 0,
+                Anonymous: std::mem::zeroed(),
+                hProcess: std::mem::zeroed(),
+            };
+            let _ = ShellExecuteExW(&mut sei);
+        } else {
+            let wide = wide_nul(&item.path.to_string_lossy());
+            let _ = ShellExecuteW(
                 None,
                 w!("open"),
                 PCWSTR(wide.as_ptr()),
@@ -556,18 +730,11 @@ fn create_zone(z: &crate::config::ZoneConf, idx: usize) -> Option<HWND> {
             return None;
         }
         SetWindowLongPtrW(hw, GWLP_USERDATA, idx as isize);
+        // 挂到桌面 DefView 名下：显示桌面时随桌面一起浮上来，无需轮询
+        own_by_desktop(hw);
         DragAcceptFiles(hw, true);
         // layered 窗口必须提交过位图才可见，先渲染一次
         render(hw, idx);
-        let _ = SetWindowPos(
-            hw,
-            Some(HWND_BOTTOM),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
         let _ = ShowWindow(
             hw,
             if z.visible {
@@ -643,6 +810,15 @@ pub fn sync() {
             let want_h = if z.collapsed { TITLE_H } else { z.h.max(MIN_H) };
             match v[i] {
                 Some(hw) => unsafe {
+                    // Explorer 重启会重建桌面层，旧句柄随之失效；这里补建，
+                    // 否则 sync() 只会往死句柄上 SetWindowPos，分区永远回不来。
+                    if !IsWindow(Some(hw)).as_bool() {
+                        v[i] = None;
+                        if z.visible {
+                            v[i] = create_zone(z, i);
+                        }
+                        continue;
+                    }
                     if z.visible {
                         let _ = SetWindowPos(
                             hw,
@@ -697,6 +873,42 @@ pub fn sync() {
     prewarm_context_menu();
 }
 
+/// 低频兜底：只在「配置要显示、窗口却真没了/被最小化」时动一下。
+///
+/// 「显示桌面」本身已由 owner=DefView 在窗口创建时解决（owned 窗口永远在
+/// owner 之上），这里**不做** z 序比较、置顶切换和周期性重绘——上一版那种
+/// 250ms 看门狗会让桌面不停刷新，体验很差。这里只处理 Explorer 重启导致
+/// 句柄失效（owner 被销毁时系统会自动销毁 owned 窗口）等真正异常。
+fn restore_hidden_zones() {
+    let wants: Vec<bool> = crate::app::with_cfg(|c| {
+        c.zones.iter().map(|z| z.visible).collect()
+    });
+    let mut dead = false;
+    WIN.with(|ws| {
+        let v = ws.borrow();
+        for (i, hw) in v.iter().enumerate() {
+            let Some(hw) = *hw else { continue };
+            if !wants.get(i).copied().unwrap_or(false) {
+                continue; // 用户主动隐藏的分区，保持隐藏
+            }
+            unsafe {
+                if !IsWindow(Some(hw)).as_bool() {
+                    dead = true;
+                    continue;
+                }
+                if IsIconic(hw).as_bool() || !IsWindowVisible(hw).as_bool() {
+                    // SW_RESTORE 同时解除最小化；不激活，避免抢走当前窗口焦点
+                    let _ = ShowWindow(hw, SW_RESTORE);
+                    render(hw, i);
+                }
+            }
+        }
+    });
+    if dead {
+        sync();
+    }
+}
+
 /// 重新枚举桌面项并同步（设置页 / 右键「刷新」）
 pub fn refresh() {
     refresh_items();
@@ -747,6 +959,10 @@ fn teardown() {
 
 /// 某个桌面项的分类（按扩展名，文件夹单独一类）
 fn item_cat(it: &DeskItem) -> &'static str {
+    // 系统虚拟项（此电脑/回收站等）归「应用」
+    if it.pidl.is_some() {
+        return "应用";
+    }
     let ext = it
         .path
         .extension()
@@ -873,12 +1089,7 @@ fn seed_if_needed() {
     .into_iter()
     .collect();
     for it in &items {
-        let ext = it
-            .path
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        let cat = classify(&ext, it.path.is_dir());
+        let cat = item_cat(it); // 虚拟项归「应用」，物理项按扩展名
         if let Some(g) = groups.iter_mut().find(|(n, _)| *n == cat) {
             g.1.push(it.name.clone());
         }
@@ -1127,16 +1338,23 @@ fn icon_at(hwnd: HWND, screen_pt: POINT) -> Option<usize> {
     }
     let (w, h) = client_size(hwnd);
     let cols = ((w - 2 * PAD) / CELL_W).max(1);
-    let (first, rows_vis, _max_first) = scroll_info(idx, w, h);
-    for i in first..count {
-        let k = (i - first) as i32;
-        if k >= cols * rows_vis as i32 {
-            break;
+    // 必须和 render() 的排布逐行一致。scroll_info 的 first 是「行号」，
+    // 滚动后第一个可见项的索引是 first*cols，不是 first。
+    // 旧代码从 first 开始且把 (i-first) 当成列/行，滚动后点第 1 列图标
+    // 会命中一个完全看不见的项 —— 表现就是「鼠标在这里，拖的却是别的文件」。
+    let (first, _rows_vis, _max_first) = scroll_info(idx, w, h);
+    for i in first * cols as usize..count {
+        let row_all = i as i32 / cols;
+        if row_all < first as i32 {
+            continue;
         }
-        let col = k % cols;
-        let row = k / cols;
+        let col = i as i32 % cols;
+        let row = row_all - first as i32;
         let cx = PAD + col * CELL_W;
         let cy = TITLE_H + PAD + row * CELL_H;
+        if cy + CELL_H > h + 4 {
+            break;
+        }
         if pt.x >= cx && pt.x < cx + CELL_W && pt.y >= cy && pt.y < cy + CELL_H {
             return Some(i);
         }
@@ -1327,39 +1545,43 @@ fn popup_menu(hwnd: HWND, idx: usize) {
 /// 各种云盘同步）的菜单项也能原样出现，和资源管理器里右键完全一致。
 /// 成功返回 true；失败（解析路径失败等）返回 false，调用方回退到围栏菜单。
 fn file_menu(hwnd: HWND, name: &str) -> bool {
-    let Some(path) = path_of(name) else {
-        return false;
-    };
-    let wide = wide_nul(&path.to_string_lossy());
+    let item = ITEMS.with(|v| {
+        v.borrow().iter().find(|i| i.name == name).cloned()
+    });
+    let Some(item) = item else { return false };
     unsafe {
-        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
-        if SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None).is_err()
-            || pidl.is_null()
-        {
-            return false;
-        }
-        let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
-        let folder = match SHBindToParent::<IShellFolder>(pidl, Some(&mut child)) {
-            Ok(f) => f,
-            Err(_) => {
-                CoTaskMemFree(Some(pidl as *const c_void));
+        // 虚拟项已有绝对 PIDL；物理项从路径解析绝对 PIDL。
+        // 两者都交给 SHBindToParent 拆出 child + 父文件夹，走同一条 IContextMenu 链路。
+        let owned_abs: Vec<u8> = if let Some(bytes) = &item.pidl {
+            bytes.clone()
+        } else {
+            let wide = wide_nul(&item.path.to_string_lossy());
+            let mut abs: *mut ITEMIDLIST = std::ptr::null_mut();
+            if SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut abs, 0, None).is_err()
+                || abs.is_null()
+            {
                 return false;
             }
+            let copied = clone_pidl(abs);
+            CoTaskMemFree(Some(abs as *const c_void));
+            copied
         };
+
+        let abs_ptr = owned_abs.as_ptr() as *const ITEMIDLIST;
+        let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
+        let folder = match SHBindToParent::<IShellFolder>(abs_ptr as *mut ITEMIDLIST, Some(&mut child)) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        // child 指向 owned_abs 内部，owned_abs 需活到函数末尾
         let apidl: [*const ITEMIDLIST; 1] = [child as *const ITEMIDLIST];
         let cm = match folder.GetUIObjectOf::<IContextMenu>(hwnd, &apidl, None) {
             Ok(c) => c,
-            Err(_) => {
-                CoTaskMemFree(Some(pidl as *const c_void));
-                return false;
-            }
+            Err(_) => return false,
         };
         let menu = match CreatePopupMenu() {
             Ok(m) => m,
-            Err(_) => {
-                CoTaskMemFree(Some(pidl as *const c_void));
-                return false;
-            }
+            Err(_) => return false,
         };
         let hr = cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL);
         let mut invoked = false;
@@ -1397,7 +1619,6 @@ fn file_menu(hwnd: HWND, name: &str) -> bool {
             }
         }
         let _ = DestroyMenu(menu);
-        CoTaskMemFree(Some(pidl as *const c_void));
         // 菜单里可能做了重命名 / 删除 / 移动，刷新一次
         if invoked {
             refresh();
@@ -1734,10 +1955,20 @@ fn render_ghost(name: &str, at: POINT) {
         }
         let size = SIZE { cx: w, cy: h };
         let src = POINT { x: 0, y: 0 };
-        let dst = POINT {
-            x: at.x + 10,
-            y: at.y + 10,
-        };
+        // 位置与内容分开提交：SetWindowPos 负责跟光标，UpdateLayeredWindow
+        // 只换位图（pptDst=null）。之前把位置塞进 pptDst，窗口尚未显示时
+        // 这条位置更新在部分系统版本上不生效，浮窗就停在初始 (0,0) 或
+        // 旧位置，看起来跟鼠标完全不对齐。
+        let _ = ShowWindow(hw, SW_SHOWNOACTIVATE);
+        let _ = SetWindowPos(
+            hw,
+            None,
+            at.x - (w - 40) / 2 - 20, // 图标绘制于 (30,10) 40x40，中心压在光标
+            at.y - 10 - 20,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         let bf = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
@@ -1747,7 +1978,7 @@ fn render_ghost(name: &str, at: POINT) {
         let _ = UpdateLayeredWindow(
             hw,
             Some(screen),
-            Some(&dst),
+            None,
             Some(&size),
             Some(surf.mdc),
             Some(&src),
@@ -1756,7 +1987,6 @@ fn render_ghost(name: &str, at: POINT) {
             ULW_ALPHA,
         );
         let _ = ReleaseDC(None, screen);
-        let _ = ShowWindow(hw, SW_SHOWNOACTIVATE);
     }
 }
 
@@ -1837,11 +2067,14 @@ unsafe extern "system" fn wheel_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 let (w, h) = client_size(hw);
                 let (_f, _v, max_first) = scroll_info(idx, w, h);
                 if max_first > 0 {
+                    // WM_MOUSEWHEEL 的 lParam 必须带屏幕光标坐标；传 0 会让
+                    // 依赖它的命中测试永远落到屏幕左上角。
+                    let xy = (((ms.pt.y as u32 & 0xffff) << 16) | (ms.pt.x as u32 & 0xffff)) as isize;
                     let _ = PostMessageW(
                         Some(hw),
                         WM_MOUSEWHEEL,
                         WPARAM(((ms.mouseData >> 16) as usize) << 16),
-                        LPARAM(0),
+                        LPARAM(xy),
                     );
                     return LRESULT(1);
                 }
@@ -1939,7 +2172,13 @@ fn prewarm_context_menu() {
         return;
     }
     // 注意：ITEMS 是 thread_local，新线程里读到的是空的，必须在当前线程取出路径
-    let Some(first) = ITEMS.with(|v| v.borrow().first().cloned()) else {
+    // 预热要拿真实路径解析 PIDL，优先取物理文件项（跳过虚拟项）
+    let Some(first) = ITEMS.with(|v| {
+        v.borrow()
+            .iter()
+            .find(|i| i.pidl.is_none())
+            .cloned()
+    }) else {
         return;
     };
     std::thread::spawn(move || unsafe {
@@ -1992,12 +2231,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_SIZE => {
+            // 分区属于桌面：任何原因被最小化都立刻恢复，不等看门狗
+            if wparam.0 as u32 == SIZE_MINIMIZED {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
             // 尺寸变化 → 整张位图重建（缩放时每帧走这里，保证边框始终贴合）
             let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             if idx >= 0 {
                 render(hwnd, idx as usize);
             }
             LRESULT(0)
+        }
+        WM_SYSCOMMAND => {
+            // 拦截系统「最小化」：Win+M / Shell 的 MinimizeAll 会发这条消息，
+            // 分区是桌面组件，不该跟普通窗口一起缩进任务栏。
+            if (wparam.0 & 0xFFF0) == SC_MINIMIZE as usize {
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_SETCURSOR => {
             let (w, h) = client_size(hwnd);
@@ -2024,11 +2275,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
             let idx = idx as usize;
-            let cx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
-            let cy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
-            let local = POINT { x: cx, y: cy };
-            let mut sp = local;
-            let _ = ClientToScreen(hwnd, &mut sp);
+            let sp = cursor_screen();
+            let mut local = sp;
+            let _ = ScreenToClient(hwnd, &mut local);
             let (w, h) = client_size(hwnd);
 
             // 折叠箭头
@@ -2074,10 +2323,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if idx < 0 {
                 return LRESULT(0);
             }
-            let cx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
-            let cy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
-            let mut sp = POINT { x: cx, y: cy };
-            let _ = ClientToScreen(hwnd, &mut sp);
+            let sp = cursor_screen();
             let idx = idx as usize;
             if let Some(i) = icon_at(hwnd, sp) {
                 let name =
@@ -2091,10 +2337,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSEMOVE => {
             // 面板内图标拖拽中：跟随浮窗 + 落点分区高亮
             if IDRAG.with(|d| d.borrow().is_some()) {
-                let cx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
-                let cy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
-                let mut sp = POINT { x: cx, y: cy };
-                let _ = ClientToScreen(hwnd, &mut sp);
+                let sp = cursor_screen();
                 let (name, from, moved) = IDRAG.with(|d| {
                     let mut b = d.borrow_mut();
                     match b.as_mut() {
@@ -2136,10 +2379,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
             if DRAG.with(|d| d.borrow().is_some()) {
-                let cx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
-                let cy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
-                let mut sp = POINT { x: cx, y: cy };
-                let _ = ClientToScreen(hwnd, &mut sp);
+                let sp = cursor_screen();
                 let (st, sr, mode) = DRAG.with(|d| {
                     let b = d.borrow();
                     let s = b.as_ref().unwrap();
@@ -2228,7 +2468,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONUP => {
             // 面板内图标拖拽收尾：落到其它分区 → 移动归属
-            let idrag = IDRAG.with(|d| d.borrow_mut().take());
+            let mut idrag = IDRAG.with(|d| d.borrow_mut().take());
+            if let Some(s) = idrag.as_mut() {
+                // 落点必须用「松手瞬间」的光标位置，不能沿用最后一次 MOUSEMOVE：
+                // 快速拖动时最后一条 MOUSEMOVE 可能离松手点有几十像素，
+                // 导致图标落到相邻分区，看起来像鼠标和实际落点对不上。
+                let p = cursor_screen();
+                if p.x != 0 || p.y != 0 {
+                    s.last = p;
+                }
+            }
             if let Some(s) = idrag {
                 let _ = ReleaseCapture();
                 hide_ghost();
@@ -2284,10 +2533,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             if idx >= 0 {
                 let idx = idx as usize;
-                let cx = ((lparam.0 as u32) & 0xffff) as i16 as i32;
-                let cy = (((lparam.0 as u32) >> 16) & 0xffff) as i16 as i32;
-                let mut sp = POINT { x: cx, y: cy };
-                let _ = ClientToScreen(hwnd, &mut sp);
+                let sp = cursor_screen();
                 // 右键点在具体图标上 → 该项的系统菜单；空白处 → 围栏菜单
                 if let Some(i) = icon_at(hwnd, sp) {
                     let name = crate::app::with_cfg(|c| {
@@ -2439,6 +2685,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
             }
+            // 「显示桌面」(Win+D) 会把顶层窗口最小化/隐藏。分区是顶层窗口，
+            // 因此一起消失。每个兜底 tick 检查并恢复「配置要显示却被系统隐藏」的分区。
+            restore_hidden_zones();
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
