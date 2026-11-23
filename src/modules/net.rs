@@ -4,8 +4,25 @@
 //! 只连用户配置的那一个地址，不发 cookie、不采集本机信息。
 
 use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// 连接建立（DNS 解析 + TCP 握手）总超时，防止网络异常时线程被长时间挂起。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// 解析 `host:443` 首个地址，带超时上限（用独立线程 + 通道超时，避免 DNS 卡死调用线程）。
+fn resolve_addr(host: &str) -> Option<SocketAddr> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let host_owned = host.to_string();
+    let _ = std::thread::spawn(move || {
+        let addr = (|| -> Option<SocketAddr> {
+            (host_owned.as_str(), 443u16).to_socket_addrs().ok()?.next()
+        })();
+        let _ = tx.send(addr);
+    });
+    rx.recv_timeout(CONNECT_TIMEOUT).ok().flatten()
+}
 
 /// GET https://{host}{path}，只在 200 时返回响应体（UTF-8 无损转换）。
 /// 超时 8 秒；任何错误都返回 None，调用方自行降级。
@@ -50,7 +67,7 @@ fn https_bytes(
 ) -> Option<(u16, Vec<u8>)> {
     use rustls::pki_types::ServerName;
 
-    let tcp = std::net::TcpStream::connect((host, 443u16)).ok()?;
+    let tcp = TcpStream::connect_timeout(&resolve_addr(host)?, CONNECT_TIMEOUT).ok()?;
     tcp.set_read_timeout(Some(Duration::from_secs(12))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(12))).ok();
 
@@ -79,7 +96,7 @@ fn https_bytes(
     if let Some(b) = body {
         req.push_str(&format!(
             "Content-Type: application/xml; charset=utf-8\r\nContent-Length: {}\r\n",
-            b.as_bytes().len()
+            b.len()
         ));
     }
     req.push_str("\r\n");
@@ -133,14 +150,10 @@ fn parse_response_bytes(buf: &[u8]) -> Option<(u16, Vec<u8>)> {
 /// 解析 chunked 编码（jsdelivr 常见）
 fn dechunk(mut src: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    loop {
-        let Some(pos) = src.windows(2).position(|w| w == b"\r\n") else { break };
+    while let Some(pos) = src.windows(2).position(|w| w == b"\r\n") {
         let line = String::from_utf8_lossy(&src[..pos]).to_string();
         let size_str = line.split(';').next().unwrap_or("").trim().to_string();
-        let size = match usize::from_str_radix(&size_str, 16) {
-            Ok(v) => v,
-            Err(_) => break,
-        };
+        let Ok(size) = usize::from_str_radix(&size_str, 16) else { break };
         src = &src[pos + 2..];
         if size == 0 {
             break;

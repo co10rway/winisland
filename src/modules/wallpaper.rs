@@ -73,14 +73,14 @@ fn decode_scaled(path: &str, w: u32, h: u32) -> Result<Vec<u8>, windows::core::E
 
         // 先裁剪到目标宽高比
         let cropped = {
-            let bm = factory.CreateBitmapFromSourceRect(
+            
+            factory.CreateBitmapFromSourceRect(
                 &frame,
                 crop_x,
                 crop_y,
                 crop_w,
                 crop_h,
-            )?;
-            bm
+            )?
         };
         // 再缩放到目标尺寸
         let scaled = factory.CreateBitmapScaler()?;

@@ -22,7 +22,6 @@ use windows::Win32::Graphics::Gdi::{
     DEFAULT_PITCH, FW_NORMAL, HDC, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
@@ -31,8 +30,6 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::render::{s, si, Canvas, W_NORMAL, W_SEMI};
 
 // 原生控件消息/按键（windows crate 未导出，手写值）
-const EM_SETMARGINS: u32 = 0x00D3;
-const EM_SETCUEBANNER: u32 = 0x1501;
 const VK_RETURN: u32 = 0x0D;
 const VK_ESCAPE: u32 = 0x1B;
 
@@ -172,7 +169,7 @@ unsafe fn ensure_class(hinst: HINSTANCE) {
     let class_name = w!("WinIslandTodoAdd");
     let wc = WNDCLASSW {
         lpfnWndProc: Some(wndproc),
-        hInstance: hinst.into(),
+        hInstance: hinst,
         lpszClassName: class_name,
         hIcon: crate::modules::tray::app_icon(),
         hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
@@ -196,10 +193,10 @@ unsafe fn build_edit_ui(parent: HWND) {
         CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY,
         DEFAULT_PITCH.0 as u32,
-        w!("Microsoft YaHei UI"),
+        crate::render::ui_font_pcwstr(),
     );
     EDIT_FONT.with(|c| c.set(font.0 as isize));
-    let brush = CreateSolidBrush(cref(INPUT_BG));
+    let brush = CreateSolidBrush(crate::modal::cref(INPUT_BG));
     EDIT_BRUSH.with(|c| c.set(brush.0 as isize));
 
     let ex = s(24.0);
@@ -222,11 +219,10 @@ unsafe fn build_edit_ui(parent: HWND) {
     .expect("CreateWindowExW edit");
     let _ = SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
     // 用经典渲染（与自绘框 + ey+5 的位置参数配套，文字垂直位置才对得上）。
-    // 设成 "Explorer" 主题会给 EDIT 加内部 padding，导致文字在框里偏上。
-    let _ = SetWindowTheme(h, w!(""), w!(""));
-    let _ = SendMessageW(h, EM_SETMARGINS, Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)), Some(LPARAM(0)));
+    crate::modal::set_edit_classic(h);
+    crate::modal::set_edit_margins(h);
     let wide = HSTRING::from("输入待办内容，回车添加");
-    let _ = SendMessageW(h, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(wide.as_ptr() as isize)));
+    let _ = SendMessageW(h, crate::modal::EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(wide.as_ptr() as isize)));
     EDIT.with(|c| c.set(h.0 as isize));
 }
 
@@ -307,10 +303,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     *slot = Canvas::new().ok();
                 }
                 if let Some(cv) = slot.as_mut() {
-                    let memdc = cv.draw_to_mem(w as i32, h as i32, BG, |cv, w, h| {
+                    let memdc = cv.draw_to_mem(w, h, BG, |cv, w, h| {
                         draw(cv, w, h);
                     });
-                    let _ = BitBlt(hdc, 0, 0, w as i32, h as i32, Some(memdc), 0, 0, SRCCOPY);
+                    let _ = BitBlt(hdc, 0, 0, w, h, Some(memdc), 0, 0, SRCCOPY);
                 }
             });
             let _ = EndPaint(hwnd, &ps);
@@ -349,8 +345,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CTLCOLOREDIT => {
             let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
-            let _ = SetTextColor(hdc, cref(TXT));
-            let _ = SetBkColor(hdc, cref(INPUT_BG));
+            let _ = SetTextColor(hdc, crate::modal::cref(TXT));
+            let _ = SetBkColor(hdc, crate::modal::cref(INPUT_BG));
             let _ = SetBkMode(hdc, TRANSPARENT);
             LRESULT(EDIT_BRUSH.with(|c| c.get()))
         }
@@ -375,8 +371,4 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
-}
-
-fn cref(hex: u32) -> windows::Win32::Foundation::COLORREF {
-    windows::Win32::Foundation::COLORREF(hex as u32)
 }

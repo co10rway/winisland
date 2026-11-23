@@ -474,34 +474,117 @@ pub fn data_path() -> PathBuf {
     data_dir().join("data.json")
 }
 
+/// 便捷：从缓存读取配置（Config::load 已做内存快照缓存，后台线程循环也能廉价调用）
+#[allow(dead_code)]
+pub fn current() -> Config {
+    Config::load()
+}
+
 impl Config {
+    /// 读取配置，带**内存快照缓存**：首次从磁盘解析后缓存明文副本，
+    /// `save()` 时刷新缓存。后台线程（行情轮询等）循环调用无需反复读盘；
+    /// 配置真正修改后由 `save()` 自动更新缓存，改完即刻生效。
     pub fn load() -> Config {
-        let p = config_path();
-        if let Ok(txt) = std::fs::read_to_string(&p) {
-            match serde_json::from_str::<Config>(&txt) {
-                Ok(mut c) => {
-                    c.panel.normalize();
-                    // v0.17.2: Mica/Acrylic 合并为「毛玻璃」，旧值平滑迁移
-                    if c.backdrop == "mica" || c.backdrop == "acrylic" {
-                        c.backdrop = "glass".into();
-                    }
-                    return c;
-                }
-                Err(e) => {
-                    // 备份损坏配置，避免用户数据丢失
-                    let _ = std::fs::copy(&p, p.with_extension("json.bak"));
-                    eprintln!("[winisland] config.json 解析失败（已备份为 .bak），使用默认配置: {e}");
-                }
+        if let Ok(mut c) = cache().write() {
+            if let Some(cached) = c.as_ref() {
+                return cached.clone();
             }
+            let loaded = load_disk();
+            let plain = {
+                let mut p = loaded;
+                secrets_unprotect(&mut p);
+                p
+            };
+            *c = Some(plain.clone());
+            return plain;
         }
-        Config::default()
+        // 锁极不可能中毒；兜底直接读盘，避免死锁时完全不可用
+        let mut plain = load_disk();
+        secrets_unprotect(&mut plain);
+        plain
     }
 
+    /// 保存配置：敏感凭据先经 DPAPI 加密，再写盘；随后刷新内存快照缓存（明文）。
     pub fn save(&self) {
+        let mut disk = self.clone();
+        secrets_protect(&mut disk);
         let p = config_path();
         let _ = std::fs::create_dir_all(p.parent().unwrap());
-        if let Ok(txt) = serde_json::to_string_pretty(self) {
+        if let Ok(txt) = serde_json::to_string_pretty(&disk) {
             let _ = std::fs::write(&p, txt);
         }
+        if let Ok(mut c) = cache().write() {
+            *c = Some(self.clone());
+        }
     }
+
+    /// 手动使内存快照缓存失效（例如用户在外部编辑器直接改了 config.json）。
+    /// 下次 `load()` 会重新读盘。
+    pub fn invalidate() {
+        if let Ok(mut c) = cache().write() {
+            *c = None;
+        }
+    }
+}
+
+/// 从磁盘解析配置（不含缓存）；错误时备份 .bak 并返回默认配置。
+fn load_disk() -> Config {
+    let p = config_path();
+    if let Ok(txt) = std::fs::read_to_string(&p) {
+        match serde_json::from_str::<Config>(&txt) {
+            Ok(mut c) => {
+                c.panel.normalize();
+                // v0.17.2: Mica/Acrylic 合并为「毛玻璃」，旧值平滑迁移
+                if c.backdrop == "mica" || c.backdrop == "acrylic" {
+                    c.backdrop = "glass".into();
+                }
+                return c;
+            }
+            Err(e) => {
+                // 备份损坏配置，避免用户数据丢失
+                let _ = std::fs::copy(&p, p.with_extension("json.bak"));
+                eprintln!("[winisland] config.json 解析失败（已备份为 .bak），使用默认配置: {e}");
+            }
+        }
+    }
+    Config::default()
+}
+
+/// 内存快照缓存。因为 Config 是 Send+Clone，后台线程读到的都是配置稳定时的一致性快照。
+fn cache() -> &'static std::sync::RwLock<Option<Config>> {
+    static CACHE: std::sync::OnceLock<std::sync::RwLock<Option<Config>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// 保存前：把邮箱密码与 CalDAV 密码加密为 DPAPI 密文（失败时保留原值）。
+fn secrets_protect(c: &mut Config) {
+    if let Some(v) = crate::crypto::protect(&c.mail.password) {
+        c.mail.password = v;
+    }
+    for src in secret_sources_mut(c) {
+        if let Some(v) = crate::crypto::protect(&src.dav_pass) {
+            src.dav_pass = v;
+        }
+    }
+}
+
+/// 读取后：把 DPAPI 密文解密为明文供上层使用（旧版明文则原样透传）。
+fn secrets_unprotect(c: &mut Config) {
+    if let Some(v) = crate::crypto::unprotect(&c.mail.password) {
+        c.mail.password = v;
+    }
+    for src in secret_sources_mut(c) {
+        if let Some(v) = crate::crypto::unprotect(&src.dav_pass) {
+            src.dav_pass = v;
+        }
+    }
+}
+
+fn secret_sources_mut(c: &mut Config) -> [&mut CalSource; 3] {
+    [
+        &mut c.schedule_sub.feishu,
+        &mut c.schedule_sub.dingtalk,
+        &mut c.schedule_sub.wecom,
+    ]
 }

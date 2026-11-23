@@ -60,6 +60,7 @@ const UNIT: u32 = 0xC2C2CC;
 /// 再叠一层冷调半透明层保证文字可读（通透磨砂玻璃观感）。
 /// 壁纸抓取失败（has_blur=false）时用带色调的半透明兜底，绝不与「无」的纯色底相同。
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn draw_glass_bg(cv: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, solid: u32, alpha: f32) {
     if cv.has_blur {
         // 通透磨砂：壁纸纹理明显（半径 12），叠淡冷蓝
@@ -245,6 +246,7 @@ fn draw_sliver(cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>) {
 
 // ---------------- 胶囊 ----------------
 
+#[allow(clippy::too_many_arguments)]
 fn draw_pill(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f32, alpha: f32, hits: &mut Vec<Hit>) {
     draw_glass_bg(cv, x, y, pw, ph, ph / 2.0, PILL_BG, alpha);
     cv.rrect_stroke(x + 0.5, y + 0.5, pw - 1.0, ph - 1.0, ph / 2.0, BORDER, alpha * 0.9, 1.0);
@@ -260,6 +262,7 @@ fn draw_pill(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f32, alpha
     cv.offset(0.0, 0.0);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f32, alpha: f32, hits: &mut Vec<Hit>) {
     let st = clock::local_time();
 
@@ -336,7 +339,7 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
     }
 
     // 验证码态
-    if app.code_pending || app.code_until.map_or(false, |t| Instant_now() < t) {
+    if app.code_pending || app.code_until.is_some_and(|t| instant_now() < t) {
         {
             if let Ok(shared) = app.mail_shared.lock() {
                 if let Some(mc) = &shared.latest {
@@ -346,7 +349,7 @@ fn draw_pill_content(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f3
                     // 点复制后 5 秒内按钮保持绿底「已复制」，与胶囊同时消失
                     let copied = app
                         .code_copied_at
-                        .map_or(false, |t| Instant_now() < t + std::time::Duration::from_secs(5));
+                        .is_some_and(|t| instant_now() < t + std::time::Duration::from_secs(5));
                     let bw = s(56.0);
                     let btn_x = x + pw - bw - 16.0;
                     let by = y + ph / 2.0 - s(12.0);
@@ -626,6 +629,7 @@ fn fmt_count(n: u64) -> String {
 
 /// 绘制右侧信息区并返回其左边界。上下轮播：旧条目上滑淡出、新条目自下滑入，
 /// 与面板翻页同一套弹簧手感（起手带初速、收尾自然减速）。
+#[allow(clippy::too_many_arguments)]
 fn draw_pill_info(cv: &mut Canvas, app: &App, right: f32, y: f32, ph: f32, now_f: f64, now_min: f64, alpha: f32) -> f32 {
     let items = pill_items(app, now_f, now_min);
     // 固定块宽 = 最长条目宽度：轮播时左边界不动，日期宽度才不会忽宽忽窄。
@@ -713,7 +717,7 @@ fn draw_info_line(cv: &mut Canvas, item: &(String, PillValue), right: f32, y0: f
 }
 
 use std::time::Instant;
-fn Instant_now() -> Instant {
+fn instant_now() -> Instant {
     Instant::now()
 }
 
@@ -728,7 +732,7 @@ pub fn pill_mode_key(app: &App) -> u32 {
             crate::app::ToastKind::Stock => 6,
         };
     }
-    if app.code_pending || app.code_until.map_or(false, |t| Instant_now() < t) {
+    if app.code_pending || app.code_until.is_some_and(|t| instant_now() < t) {
         return 3;
     }
     0
@@ -769,6 +773,7 @@ pub fn effective_pages(cfg: &crate::config::Config) -> Vec<&'static str> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_panel(app: &App, cv: &mut Canvas, w: f32, h: f32, o: f32, bg_a: f32, ct: f32, dy: f32, hits: &mut Vec<Hit>) -> f32 {
     // 圆角随展开在「胶囊半圆 → 面板圆角」之间连续过渡，避免变形时出现拐角
     let r = s(PILL_H as f32) * 0.5 * (1.0 - o) + s(24.0) * o;
@@ -982,12 +987,14 @@ fn empty_hint(cv: &mut Canvas, w: f32, txt: &str, alpha: f32) {
     cv.text_ex(pad, s(BODY_TOP), w - pad * 2.0, s(26.0), txt, 10.5, W_NORMAL, TXT3, alpha, 1, 1);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mini_stat(cv: &mut Canvas, x: f32, y: f32, w: f32, label: &str, value: &str, color: u32, alpha: f32) {
     cv.text1(x, y, w, s(12.0), label, 8.5, W_NORMAL, TXT3, alpha);
     cv.text1(x, y + s(11.0), w, s(18.0), value, 11.5, W_SEMI, color, alpha);
 }
 
 /// 行悬停：柔和高亮随悬停进度淡入淡出，返回当前进度
+#[allow(clippy::too_many_arguments)]
 fn row_hover(app: &App, cv: &mut Canvas, x: f32, y: f32, w: f32, h: f32, id: &HitId, alpha: f32) -> f32 {
     let p = app.anims.hover_p(id);
     if p > 0.004 {
@@ -1533,6 +1540,7 @@ fn color_pct(pct: f64) -> u32 {
 /// 底部一排页点：默认仍是小圆点，当前页主题色实心；鼠标悬停到某点时，该点渐变成
 /// 对应页面的图标（带高亮底圈 + 页面名标签），左右邻居被推开并放大成波浪。
 /// 点一下直接跳到对应页。单页时只保留隐私声明。
+#[allow(clippy::too_many_arguments)]
 fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, pages: &[&str], alpha: f32, hits: &mut Vec<Hit>) {
     let n = pages.len();
     let cy = h - s(28.0);
@@ -1560,7 +1568,7 @@ fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, pages: &[&
         }
     }
 
-    for i in 0..n {
+    for (i, page) in pages.iter().enumerate().take(n) {
         let base_x = x0 + gap * i as f32;
         let p = match center {
             Some(c) if cp > 0.004 => {
@@ -1591,7 +1599,7 @@ fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, pages: &[&
             let accent = if i == idx { crate::theme::main() } else { TXT };
             cv.circle(x, cy, ring_r * icon_p, mix(ROW, accent, 0.18), alpha * icon_p);
             cv.circle_stroke(x, cy, ring_r * icon_p, accent, alpha * 0.55 * icon_p, s(1.0));
-            draw_page_icon(cv, pages[i], x, cy, icon_size * icon_p, accent, alpha * icon_p);
+            draw_page_icon(cv, page, x, cy, icon_size * icon_p, accent, alpha * icon_p);
         }
 
         // 命中区固定在原位、贴合间距：hover 状态稳定，不会因推开/放大而抖动
@@ -1716,6 +1724,15 @@ fn post_drag_msg(msg: u32) {
     }
 }
 
+/// 让主面板进入/退出「拖放悬停」提示态。
+///
+/// OLE 拖放由 IDropTarget::DragEnter/DragLeave 自己投递；分区图标拖拽走的是
+/// 全局鼠标钩子，没有 OLE 事件，必须显式驱动同一套提示态，否则拖到灵动岛
+/// 附近时不会展开面板、也不显示「松开鼠标，暂存到中转站」。
+pub fn post_drag_hover(enter: bool) {
+    post_drag_msg(if enter { WM_DRAG_ENTER } else { WM_DRAG_LEAVE });
+}
+
 impl IDropTarget_Impl for DropTarget_Impl {
     fn DragEnter(&self, _pdataobj: Ref<'_, windows::Win32::System::Com::IDataObject>, _grfkeystate: MODIFIERKEYS_FLAGS, _pt: &POINTL, pdweffect: *mut DROPEFFECT) -> windows::core::Result<()> {
         // 告诉系统接受复制操作 —— 光标从"禁止"变为"复制"
@@ -1749,7 +1766,7 @@ impl IDropTarget_Impl for DropTarget_Impl {
         unsafe {
             let fmt = FORMATETC {
                 cfFormat: 15, // CF_HDROP
-                dwAspect: DVASPECT_CONTENT.0 as u32,
+                dwAspect: DVASPECT_CONTENT.0,
                 lindex: -1,
                 ptd: std::ptr::null_mut(),
                 tymed: TYMED_HGLOBAL.0 as u32,
@@ -1782,12 +1799,20 @@ impl IDropTarget_Impl for DropTarget_Impl {
             let ptr = Box::into_raw(boxed) as isize;
             let h = DROP_HWND.load(Ordering::Acquire);
             if h != 0 {
-                unsafe {
-                    let _ = PostMessageW(Some(HWND(h as *mut _)), WM_DROP_FILES, WPARAM(0), LPARAM(ptr));
+                let ok = unsafe {
+                    PostMessageW(Some(HWND(h as *mut _)), WM_DROP_FILES, WPARAM(0), LPARAM(ptr))
+                }
+                .is_ok();
+                crate::app::diag_log(&format!("Drop: post WM_DROP_FILES hwnd=0x{:X} ok={}", h, ok));
+                if !ok {
+                    unsafe { drop(Box::from_raw(ptr as *mut Vec<String>)); }
                 }
             } else {
+                crate::app::diag_log("Drop: DROP_HWND=0，丢弃路径列表");
                 unsafe { drop(Box::from_raw(ptr as *mut Vec<String>)); }
             }
+        } else {
+            crate::app::diag_log("Drop: 解析出的路径为空");
         }
         post_drag_msg(WM_DRAG_LEAVE);
         Ok(())

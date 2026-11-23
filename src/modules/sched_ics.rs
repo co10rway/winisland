@@ -178,7 +178,7 @@ pub fn sync_all_async(sub: &crate::config::ScheduleSub) {
             STATE.store(SYNC_OK, Ordering::Relaxed);
             let mut n = format!("已同步 {} 条今日日程", items.len());
             if !errs.is_empty() {
-                n.push_str("；");
+                n.push('；');
                 n.push_str(&errs.join("；"));
             }
             set_note(&n);
@@ -383,8 +383,8 @@ fn parse_ics(body: &str, off_min: i64, today: (i64, i64, i64)) -> Vec<ScheduleIt
                 continue;
             }
             "END:VEVENT" => {
-                if in_ev {
-                    if !cancelled && !sum.is_empty() {
+                if in_ev
+                    && !cancelled && !sum.is_empty() {
                         if let Some((y, m, d, hh, mm, is_utc)) = dt {
                             let mut days = days_from_civil(y, m, d);
                             let mut mins = hh * 60 + mm;
@@ -409,7 +409,6 @@ fn parse_ics(body: &str, off_min: i64, today: (i64, i64, i64)) -> Vec<ScheduleIt
                             }
                         }
                     }
-                }
                 in_ev = false;
                 continue;
             }
@@ -747,7 +746,7 @@ fn xml_unescape(s: &str) -> String {
             }
         } else {
             out.push_str("&#");
-            rest = &after;
+            rest = after;
         }
     }
     out.push_str(rest);
@@ -761,7 +760,7 @@ fn xml_unescape(s: &str) -> String {
 /// Base64 编码（Basic 认证头）
 fn b64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for c in data.chunks(3) {
         let b0 = c[0] as u32;
         let b1 = *c.get(1).unwrap_or(&0) as u32;

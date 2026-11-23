@@ -2,7 +2,9 @@
 //! 全部为系统组件，无第三方运行时依赖。
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use windows::Win32::Foundation::{RECT, HWND, POINT, SIZE};
+use windows::core::BOOL;
 use windows::Win32::Graphics::Direct2D::Common as D2DC;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
@@ -20,9 +22,61 @@ pub fn si(v: f32) -> i32 {
     (v * SCALE.get().copied().unwrap_or(1.0)) as i32
 }
 
+/// 候选 UI 字体族（按优先级）。首选「微软雅黑 UI」；DirectWrite 对主字体缺字的
+/// 字形本身会走系统字体回退，这里再叠加一层「首选字体系统里不存在就换一套」
+/// 的手动回退（如精简版系统没有 YaHei UI 但保留 YaHei/Segoe 时），保证中文、
+/// 西文与数字都能正常渲染。选择结果进程级缓存一次。
+const FONT_CANDIDATES: [&str; 3] =
+    ["Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI"];
+
+static UI_FONT: OnceLock<(&'static str, Vec<u16>)> = OnceLock::new();
+
+/// 返回选定 UI 字体族的 UTF-16 家族名指针（NUL 结尾）。
+/// 供 DirectWrite `CreateTextFormat` 与 GDI `CreateFontW` 复用，全项目不再硬编码字体名。
+/// 静态缓存保证返回值进程内永远有效。
+pub fn ui_font_pcwstr() -> PCWSTR {
+    let (_, wide) = UI_FONT.get_or_init(|| {
+        let dwrite: IDWriteFactory = unsafe {
+            DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).expect("DWriteCreateFactory")
+        };
+        let family = pick_font(&dwrite);
+        let mut v: Vec<u16> = family.encode_utf16().collect();
+        v.push(0); // NUL 结尾，GDI 直接可用
+        (family, v)
+    });
+    PCWSTR(wide.as_ptr())
+}
+
+/// 在系统字库中按优先级选出第一个存在的字体族名；全部缺失时退回首个候选。
+fn pick_font(dwrite: &IDWriteFactory) -> &'static str {
+    unsafe {
+        let mut coll: Option<IDWriteFontCollection> = None;
+        if dwrite
+            .GetSystemFontCollection(&mut coll as *mut _, false)
+            .is_ok()
+        {
+            if let Some(coll) = coll {
+                for name in FONT_CANDIDATES {
+                    let wide: Vec<u16> = name.encode_utf16().collect();
+                    let mut index: u32 = 0;
+                    let mut exists: BOOL = BOOL(0);
+                    if coll
+                        .FindFamilyName(PCWSTR(wide.as_ptr()), &mut index, &mut exists)
+                        .is_ok()
+                        && exists.as_bool()
+                    {
+                        return name;
+                    }
+                }
+            }
+        }
+    }
+    FONT_CANDIDATES[0]
+}
+
 #[inline]
 fn col(hex: u32, alpha: f32) -> D2DC::D2D1_COLOR_F {
-    D2DC::D2D1_COLOR_F {
+        D2DC::D2D1_COLOR_F {
         r: ((hex >> 16) & 0xFF) as f32 / 255.0,
         g: ((hex >> 8) & 0xFF) as f32 / 255.0,
         b: (hex & 0xFF) as f32 / 255.0,
@@ -131,7 +185,7 @@ impl Canvas {
         let b = slot.as_ref()?;
         if color.a >= 0.0 {
             unsafe {
-                let _ = b.SetColor(&color);
+                b.SetColor(&color);
             }
         }
         Some(b.clone())
@@ -259,7 +313,7 @@ impl Canvas {
             let bmp = self.rt.CreateBitmap(
                 D2DC::D2D_SIZE_U { width: self.blur_pw, height: self.blur_ph },
                 Some(self.blur_pixels.as_ptr() as *const std::ffi::c_void),
-                self.blur_pw as u32 * 4,
+                self.blur_pw * 4,
                 &props,
             );
             match bmp {
@@ -294,9 +348,9 @@ impl Canvas {
                 radiusY: r,
             };
             // 用画刷透明度控制壁纸亮度
-            let _ = brush.SetOpacity(alpha);
+            brush.SetOpacity(alpha);
             self.rt.FillRoundedRectangle(&rr, brush);
-            let _ = brush.SetOpacity(1.0);
+            brush.SetOpacity(1.0);
         }
     }
 
@@ -337,7 +391,7 @@ impl Canvas {
                 let f = self
                     .dwrite
                     .CreateTextFormat(
-                        w!("Microsoft YaHei UI"),
+                        ui_font_pcwstr(),
                         None,
                         weight,
                         DWRITE_FONT_STYLE_NORMAL,
@@ -378,6 +432,7 @@ impl Canvas {
     }
 
     /// 圆角矩形填充
+    #[allow(clippy::too_many_arguments)]
     pub fn rrect(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c: u32, alpha: f32) {
         let Some(brush) = self.solid(c, alpha) else { return };
         unsafe {
@@ -391,6 +446,7 @@ impl Canvas {
     }
 
     /// 圆角矩形描边
+    #[allow(clippy::too_many_arguments)]
     pub fn rrect_stroke(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c: u32, alpha: f32, sw: f32) {
         let Some(brush) = self.solid(c, alpha) else { return };
         unsafe {
@@ -423,16 +479,19 @@ impl Canvas {
     }
 
     /// 文本（盒子内左对齐、垂直居中）
+    #[allow(clippy::too_many_arguments)]
     pub fn text(&mut self, x: f32, y: f32, maxw: f32, maxh: f32, txt: &str, size: f32, weight: DWRITE_FONT_WEIGHT, c: u32, alpha: f32) {
         self.text_ex(x, y, maxw, maxh, txt, size, weight, c, alpha, 0, 1);
     }
 
     /// 文本（支持水平/垂直对齐；maxh<=0 时自动用行高）
+    #[allow(clippy::too_many_arguments)]
     pub fn text_ex(&mut self, x: f32, y: f32, maxw: f32, maxh: f32, txt: &str, size: f32, weight: DWRITE_FONT_WEIGHT, c: u32, alpha: f32, halign: i32, valign: i32) {
         self.text_full(x, y, maxw, maxh, txt, size, weight, c, alpha, halign, valign, false);
     }
 
     /// 单行文本（不折行，超出裁剪）
+    #[allow(clippy::too_many_arguments)]
     pub fn text1(&mut self, x: f32, y: f32, maxw: f32, maxh: f32, txt: &str, size: f32, weight: DWRITE_FONT_WEIGHT, c: u32, alpha: f32) {
         self.text_full(x, y, maxw, maxh, txt, size, weight, c, alpha, 0, 1, true);
     }
@@ -462,11 +521,13 @@ impl Canvas {
     }
 
     /// 居中文本快捷方式
+    #[allow(clippy::too_many_arguments)]
     pub fn text_c(&mut self, x: f32, y: f32, w: f32, h: f32, txt: &str, size: f32, weight: DWRITE_FONT_WEIGHT, c: u32, alpha: f32) {
         self.text_ex(x, y, w, h, txt, size, weight, c, alpha, 1, 1);
     }
 
     /// 圆角矩形竖向/横向渐变填充（c1 起始 → c2 结束）
+    #[allow(clippy::too_many_arguments)]
     pub fn rrect_grad(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c1: u32, c2: u32, horizontal: bool, alpha: f32) {
         unsafe {
             let stops = [
@@ -501,6 +562,7 @@ impl Canvas {
     }
 
     /// 圆角矩形三段横向渐变填充（c1 → c2(52%) → c3），极光胶囊专用
+    #[allow(clippy::too_many_arguments)]
     pub fn rrect_grad3(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c1: u32, c2: u32, c3: u32, alpha: f32) {
         unsafe {
             let stops = [
@@ -533,6 +595,7 @@ impl Canvas {
     }
 
     /// 直线
+    #[allow(clippy::too_many_arguments)]
     pub fn line(&self, x1: f32, y1: f32, x2: f32, y2: f32, c: u32, alpha: f32, width: f32) {
         let Some(brush) = self.solid(c, alpha) else { return };
         unsafe {
@@ -584,6 +647,7 @@ impl Canvas {
     }
 
     /// 进度条
+    #[allow(clippy::too_many_arguments)]
     pub fn progress(&self, x: f32, y: f32, w: f32, h: f32, ratio: f32, fg: u32, bg: u32) {
         self.rrect(x, y, w, h, h / 2.0, bg, 1.0);
         let fw = (w * ratio.clamp(0.0, 1.0)).max(h);

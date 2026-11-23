@@ -35,13 +35,15 @@ pub fn app_icon() -> HICON {
 pub fn add(hwnd: HWND) {
     unsafe {
         let icon = app_icon();
-        let mut nid = NOTIFYICONDATAW::default();
-        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        nid.hWnd = hwnd;
-        nid.uID = 1;
-        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-        nid.uCallbackMessage = TRAY_MSG;
-        nid.hIcon = icon;
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: 1,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            uCallbackMessage: TRAY_MSG,
+            hIcon: icon,
+            ..Default::default()
+        };
         set_str(&mut nid.szTip, "WinIsland 灵动岛");
         if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
             eprintln!("[winisland] 托盘图标添加失败");
@@ -51,10 +53,12 @@ pub fn add(hwnd: HWND) {
 
 pub fn remove(hwnd: HWND) {
     unsafe {
-        let mut nid = NOTIFYICONDATAW::default();
-        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        nid.hWnd = hwnd;
-        nid.uID = 1;
+        let nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: 1,
+            ..Default::default()
+        };
         let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
     }
 }

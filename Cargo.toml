@@ -1,6 +1,6 @@
 [package]
 name = "winisland"
-version = "0.17.2"
+version = "0.17.7"
 edition = "2021"
 description = "Windows 灵动岛 — 单一原生 exe、零运行时依赖的桌面灵动岛"
 license = "MIT"
@@ -33,6 +33,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
     "Win32_System_SystemServices",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Registry",

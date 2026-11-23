@@ -28,7 +28,6 @@ use windows::Win32::Graphics::Gdi::{
     SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::Input::Ime::{ImmAssociateContext, HIMC};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
@@ -346,7 +345,7 @@ unsafe fn setup_resources() {
         CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY,
         DEFAULT_PITCH.0 as u32,
-        w!("Microsoft YaHei UI"),
+        crate::render::ui_font_pcwstr(),
     );
     EDIT_FONT.with(|c| c.set(font.0 as isize));
 }
@@ -466,6 +465,7 @@ unsafe fn subclass_code(h: HWND) {
     subclass_into(h, Some(code_edit_proc));
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_edit(
     parent: HWND,
     x: f32,
@@ -493,8 +493,7 @@ unsafe fn create_edit(
     .expect("CreateWindowExW edit");
     let font = EDIT_FONT.with(|c| c.get()) as usize;
     let _ = SendMessageW(e, WM_SETFONT, Some(WPARAM(font)), Some(LPARAM(1)));
-    let theme_str = w!("");
-    let _ = SetWindowTheme(e, theme_str, theme_str);
+    crate::modal::set_edit_classic(e);
     let _ = SendMessageW(
         e,
         EM_SETMARGINS,
@@ -572,7 +571,7 @@ unsafe fn build_edits(hwnd: HWND) {
         let bx = s(PADX);
         let dx = |colx: f32| bx + s(colx - PADX);
         let handles = [
-            create_edit(hwnd, dx(CODE_X), ey, s(CODE_W), eh, 100 + i * 4 + 0, &row[0], false),
+            create_edit(hwnd, dx(CODE_X), ey, s(CODE_W), eh, 100 + i * 4, &row[0], false),
             create_edit(hwnd, dx(COST_X), ey, s(COST_W), eh, 100 + i * 4 + 1, &row[1], true),
             create_edit(hwnd, dx(QTY_X), ey, s(QTY_W), eh, 100 + i * 4 + 2, &row[2], true),
             create_edit(hwnd, dx(ALERT_X), ey, s(ALERT_W), eh, 100 + i * 4 + 3, &row[3], true),
@@ -821,7 +820,7 @@ fn ensure_class(hinst: HINSTANCE) {
         let class_name = w!("WinIslandWatchEdit");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
-            hInstance: hinst.into(),
+            hInstance: hinst,
             lpszClassName: class_name,
             hIcon: crate::modules::tray::app_icon(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
@@ -927,15 +926,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let mut slot = cell.borrow_mut();
                 if slot.is_none() { *slot = Canvas::new().ok(); }
                 if let Some(cv) = slot.as_mut() {
-                    let memdc = cv.draw_to_mem(w as i32, h as i32, BG, |cv, w, h| draw(cv, w, h));
-                    let _ = BitBlt(hdc, 0, 0, w as i32, h as i32, Some(memdc), 0, 0, SRCCOPY);
+                    let memdc = cv.draw_to_mem(w, h, BG, draw);
+                    let _ = BitBlt(hdc, 0, 0, w, h, Some(memdc), 0, 0, SRCCOPY);
                 }
             });
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_COMMAND => {
-            let id = (wparam.0 & 0xFFFF) as usize;
+            let id = wparam.0 & 0xFFFF;
             let notify = ((wparam.0 >> 16) & 0xFFFF) as u32;
             if id >= 100 && !BUILDING.with(|b| b.get()) {
                 let k = (id - 100) % 4;
@@ -948,7 +947,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 let _ = InvalidateRect(Some(hwnd), None, false);
                             }
                         }
-                        1 | 2 | 3 => {
+                        1..=3 => {
                             // 成本 / 数量 / 提醒：粘贴兜底清洗（键盘输入已被 WM_CHAR 拦截）
                             sanitize_numeric(idx, k);
                         }
@@ -960,7 +959,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CTLCOLOREDIT => {
             let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
-            let _ = SetTextColor(hdc, cref(TXT));
+            let _ = SetTextColor(hdc, crate::modal::cref(TXT));
             let _ = SetBkMode(hdc, TRANSPARENT);
             LRESULT(GetStockObject(NULL_BRUSH).0 as isize)
         }
@@ -977,7 +976,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let sc = SCROLL.with(|c| c.get());
             let idx = ((ly - LIST_TOP + sc) / ROW_H).floor() as isize;
             let n = ROWS.with(|r| r.borrow().len()) as isize;
-            let newh = if ly >= LIST_TOP && ly <= LIST_BOT && idx >= 0 && idx < n { idx } else { -1 };
+            let newh = if (LIST_TOP..=LIST_BOT).contains(&ly) && idx >= 0 && idx < n { idx } else { -1 };
             if newh != HOVER.with(|c| c.get()) {
                 HOVER.with(|c| c.set(newh));
                 let _ = InvalidateRect(Some(hwnd), None, false);
@@ -1088,8 +1087,4 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
-}
-
-fn cref(hex: u32) -> windows::Win32::Foundation::COLORREF {
-    windows::Win32::Foundation::COLORREF(hex as u32)
 }

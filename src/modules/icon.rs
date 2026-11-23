@@ -133,6 +133,7 @@ pub fn active(app: &crate::app::App) -> bool {
 ///
 /// 内容坐标全部来自 256×256 设计稿：横向以极光胶囊宽 192、纵向以胶囊高 72
 /// 为基准各自缩放（小尺寸徽章模式）或整体等比缩放（大尺寸底板模式）。
+#[allow(clippy::too_many_arguments)]
 pub fn draw_icon(cv: &mut Canvas, _id: &str, cx: f32, cy: f32, w: f32, h: f32, sig: Signal, alpha: f32) {
     let small = w.min(h) < 48.0;
     let (kx, ky) = if small {
@@ -318,6 +319,7 @@ fn draw_music(cv: &mut Canvas, cx: f32, cy: f32, kx: f32, ky: f32, sig: Signal, 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_state(cv: &mut Canvas, st: u8, cx: f32, cy: f32, kx: f32, ky: f32, sig: Signal, alpha: f32) {
     match st {
         ST_TYPING => draw_typing(cv, cx, cy, kx, ky, sig, alpha),

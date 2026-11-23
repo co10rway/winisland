@@ -1,10 +1,10 @@
 //! 构建脚本：把应用图标（assets/icon.ico）编译成 COFF 资源对象并链接进 exe。
 //!
-//! 两条路径：
-//!   * msvc（Windows 本机）：用 Windows SDK 的 rc.exe 编出 .res，再用 MSVC 的 cvtres
-//!     转成 COFF 对象 → cargo:rustc-link-arg 交给 link.exe。
-//!   * gnu（Linux 交叉编译）：用 zig 自带的资源编译器（resinator）替代 windres：
-//!       zig rc /:output-format coff /:target x86_64 app.rc app_res.o
+//! 两条路径：其一为 msvc（Windows 本机），用 Windows SDK 的 rc.exe 编出 .res，
+//! 再用 MSVC 的 cvtres 转成 COFF 对象 → cargo:rustc-link-arg 交给 link.exe；
+//! 其二为 gnu（Linux 交叉编译），用 zig 自带的资源编译器（resinator）替代 windres：
+//! `zig rc /:output-format coff /:target x86_64 app.rc app_res.o`。
+//!
 //! 资源链接后，资源管理器、任务栏、ALT-TAB、任务管理器显示的都是这个图标。
 //!
 //! 找不到工具链时只打印警告并跳过图标，不让构建失败（图标是装饰，不该挡住编译）。

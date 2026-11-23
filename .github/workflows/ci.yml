@@ -15,7 +15,7 @@ jobs:
       - name: Check
         run: cargo check --all-features
       - name: Clippy
-        run: cargo clippy --all-features -- -D warnings || true
+        run: cargo clippy --all-features -- -D warnings
       - name: Build release
         run: cargo build --release
       - uses: actions/upload-artifact@v4

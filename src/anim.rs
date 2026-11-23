@@ -161,7 +161,7 @@ impl Anims {
     /// 推进悬停进度：当前悬停的控件趋向 1，其余趋向 0
     pub fn hover_step(&mut self, hover: Option<&HitId>, dt: f32) {
         for (id, sp) in self.hovers.iter_mut() {
-            let on = hover.map_or(false, |h| h == &*id);
+            let on = hover == Some(&*id);
             sp.target = if on { 1.0 } else { 0.0 };
             sp.step(dt);
         }

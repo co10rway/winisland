@@ -133,7 +133,7 @@ impl Glassy {
                 );
             }
     r?;
-    let dev = dev.ok_or_else(|| windows::core::Error::empty())?;
+    let dev = dev.ok_or_else(windows::core::Error::empty)?;
     let dxgi: IDXGIDevice = dev.cast()?;
 
             // 2) 关闭 DWM 系统背板。系统背板只对「激活的顶层窗口」显示壁纸采样；

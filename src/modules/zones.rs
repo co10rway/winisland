@@ -98,9 +98,16 @@ thread_local! {
     /// 当前桌面项快照
     static ITEMS: RefCell<Vec<DeskItem>> = const { RefCell::new(Vec::new()) };
     /// 桌面项签名（用于轮询变更）
-    static SIGN: RefCell<String> = RefCell::new(String::new());
+    static SIGN: RefCell<String> = const { RefCell::new(String::new()) };
     /// 正在拖拽的面板内图标（跨分区移动归属）
     static IDRAG: RefCell<Option<ItemDrag>> = const { RefCell::new(None) };
+    /// 全局鼠标钩子捕获的「从分区图标起拖」状态。
+    /// 分区窗口是否收到鼠标消息不可靠（分层窗口 + owner 关系 + 捕获），
+    /// 钩子能保证收到每一次物理按下/松开，用它兜底把图标拖到灵动岛的入站走通。
+    static HOOK_DRAG: RefCell<Option<HookDrag>> = const { RefCell::new(None) };
+    /// 钩子拖拽当前是否处于「悬停在灵动岛上」——用于只在状态翻转时投递
+    /// 进入/离开消息，避免每次鼠标移动都骚扰主线程。
+    static HOOK_HOVER: Cell<bool> = const { Cell::new(false) };
     /// 拖拽跟随浮窗句柄（0 = 未创建）
     static GHOST_HW: Cell<isize> = const { Cell::new(0) };
     static GHOST_CLASSED: Cell<bool> = const { Cell::new(false) };
@@ -128,6 +135,15 @@ struct ItemDrag {
     name: String,
     last: POINT,
     moved: bool,
+}
+
+/// 全局钩子口径的拖拽：按下时命中分区图标则记录起点与项名，
+/// 松开时若移动过且落点在主面板矩形内 → 把该文件推入文件中转站。
+struct HookDrag {
+    /// 按下时的屏幕坐标（判断是否真的拖动过）
+    start: POINT,
+    /// 被拖的项名（用于从 ITEMS 取真实路径）
+    name: String,
 }
 
 #[derive(Clone)]
@@ -264,69 +280,103 @@ fn shell() -> (HWND, HWND) {
         if prog.0.is_null() {
             return (HWND::default(), HWND::default());
         }
-        let mut def = match FindWindowExW(Some(prog), None, w!("SHELLDLL_DefView"), None) {
-            Ok(h) => h,
-            Err(_) => HWND::default(),
-        };
+        let mut def = FindWindowExW(Some(prog), None, w!("SHELLDLL_DefView"), None)
+            .unwrap_or_default();
         if def.0.is_null() {
-            let mut ww = match FindWindowExW(None, None, w!("WorkerW"), None) {
-                Ok(h) => h,
-                Err(_) => HWND::default(),
-            };
+            let mut ww = FindWindowExW(None, None, w!("WorkerW"), None).unwrap_or_default();
             let mut guard = 0u32;
             while !ww.0.is_null() && guard < 64 {
-                let inside = match FindWindowExW(Some(ww), None, w!("SHELLDLL_DefView"), None) {
-                    Ok(h) => h,
-                    Err(_) => HWND::default(),
-                };
+                let inside = FindWindowExW(Some(ww), None, w!("SHELLDLL_DefView"), None)
+                    .unwrap_or_default();
                 if !inside.0.is_null() {
                     def = inside;
                     break;
                 }
-                ww = match FindWindowExW(None, Some(ww), w!("WorkerW"), None) {
-                    Ok(h) => h,
-                    Err(_) => HWND::default(),
-                };
+                ww = FindWindowExW(None, Some(ww), w!("WorkerW"), None).unwrap_or_default();
                 guard += 1;
             }
         }
         if def.0.is_null() {
             return (HWND::default(), HWND::default());
         }
-        let layer = match GetParent(def) {
-            Ok(h) => h,
-            Err(_) => HWND::default(),
-        };
+        let layer = GetParent(def).unwrap_or_default();
         (layer, def)
     }
 }
 
 /// Explorer 桌面图标列表窗口（SysListView32）。
 ///
-/// 关键：**不能隐藏 SHELLDLL_DefView 本身**——Win10/11 的壁纸由 DefView 自己绘制，
-/// 隐藏它会把壁纸一起隐藏（桌面变纯黑，实测截图已确认）。图标实际画在
-/// DefView 的子窗口 SysListView32 里，只隐藏这一层，壁纸就能留着。
+/// 关键：**绝不能隐藏 SHELLDLL_DefView 本身**——Win10/11 的壁纸由 DefView 自己绘制，
+/// 隐藏它会把壁纸一起隐藏，整块桌面变成纯黑（实测已确认，v0.17.3 曾因兜底分支
+/// 误隐藏 DefView 导致用户「运行后屏幕黑了」）。图标实际画在 DefView 的子窗口
+/// SysListView32 里，只隐藏这一层，壁纸才能留着。
+///
+/// 因此这里**找不到就返回 NULL**，由调用方保持不动，宁可与真实图标并存，
+/// 也不允许退化成隐藏 DefView。
 fn desktop_icon_view() -> HWND {
     let (_, def) = shell();
     if def.0.is_null() {
         return HWND::default();
     }
     unsafe {
-        match FindWindowExW(Some(def), None, w!("SysListView32"), None) {
-            Ok(h) if !h.0.is_null() => h,
-            _ => def, // 找不到列表窗口（极端情况）→ 退回旧行为，至少图标不重复
-        }
+        // Win11 不同 Build 的层级不完全一样，直接子窗口找不到时向下递归几层
+        find_child_by_class(def, "SysListView32", 0)
     }
+}
+
+/// 深度优先查找指定类名的子窗口（限深限宽，避免在 Explorer 窗口树上失控）。
+unsafe fn find_child_by_class(parent: HWND, name: &str, depth: u32) -> HWND {
+    if depth > 4 {
+        return HWND::default();
+    }
+    let mut cur = GetWindow(parent, GW_CHILD).unwrap_or_default();
+    let mut guard = 0u32;
+    while !cur.0.is_null() && guard < 128 {
+        let mut buf = [0u16; 128];
+        let n = GetClassNameW(cur, &mut buf);
+        if n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == name {
+            return cur;
+        }
+        let deeper = find_child_by_class(cur, name, depth + 1);
+        if !deeper.0.is_null() {
+            return deeper;
+        }
+        cur = GetWindow(cur, GW_HWNDNEXT).unwrap_or_default();
+        guard += 1;
+    }
+    HWND::default()
 }
 
 /// 隐藏 / 显示 Explorer 桌面图标（图标由本模块托管，壁纸保持可见）
 fn set_shell_icons_visible(show: bool) {
     let h = desktop_icon_view();
-    if h.0.is_null() {
+    let (_, def) = shell();
+    unsafe {
+        if !def.0.is_null() {
+            // 防御性修复：历史版本可能误把 DefView 隐藏过，导致桌面纯黑。
+            // 每次都先把壁纸层拉回来（幂等：已可见时 SW_SHOW 是空操作）。
+            // 这样即使用户的桌面此刻是黑的，启动一次本版本也会自动恢复。
+            let _ = ShowWindow(def, SW_SHOW);
+        }
+    }
+    if h.0.is_null() || h == def {
+        // 没找到图标列表窗口：保持原样，绝不动 DefView（否则壁纸一起消失）
+        crate::app::diag_log(&format!(
+            "ICON_HIDE skip show={} reason=no_SysListView32 def_null={}",
+            show,
+            def.0.is_null()
+        ));
         return;
     }
     unsafe {
         let _ = ShowWindow(h, if show { SW_SHOW } else { SW_HIDE });
+        let vis = IsWindowVisible(h).as_bool();
+        crate::app::diag_log(&format!(
+            "ICON_HIDE show={} still_visible={} zones={}",
+            show,
+            vis,
+            WIN.with(|v| v.borrow().iter().filter(|x| x.is_some()).count())
+        ));
     }
 }
 
@@ -339,113 +389,8 @@ fn set_shell_icons_visible(show: bool) {
 // 改为 layered 窗口 + UpdateLayeredWindow：每次内容变化都**整张重建**一张
 // 32bpp 预乘 ARGB 位图再提交，物理上不可能有残留；窗口移动时 DWM 搬运的是
 // 完整图层而不是屏幕像素，所以拖动同样不会重影。
-
-/// 一张离屏 32bpp（预乘 BGRA、top-down）位图及其 DC
-struct Surf {
-    dib: HBITMAP,
-    mdc: HDC,
-    old: HGDIOBJ,
-    buf: *mut u32,
-    w: i32,
-    h: i32,
-}
-
-impl Surf {
-    fn new(w: i32, h: i32) -> Option<Surf> {
-        unsafe {
-            let mut bmi = BITMAPINFO::default();
-            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-            bmi.bmiHeader.biWidth = w;
-            bmi.bmiHeader.biHeight = -h; // 负高 = top-down，与 GDI 坐标一致
-            bmi.bmiHeader.biPlanes = 1;
-            bmi.bmiHeader.biBitCount = 32;
-            bmi.bmiHeader.biCompression = BI_RGB.0;
-            let mut bits: *mut c_void = std::ptr::null_mut();
-            let dib = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
-            if dib.0.is_null() || bits.is_null() {
-                return None;
-            }
-            let mdc = CreateCompatibleDC(None);
-            if mdc.0.is_null() {
-                let _ = DeleteObject(dib.into());
-                return None;
-            }
-            let old = SelectObject(mdc, dib.into());
-            Some(Surf {
-                dib,
-                mdc,
-                old,
-                buf: bits as *mut u32,
-                w,
-                h,
-            })
-        }
-    }
-
-    fn pixels(&mut self) -> &mut [u32] {
-        unsafe { std::slice::from_raw_parts_mut(self.buf, (self.w * self.h) as usize) }
-    }
-}
-
-impl Drop for Surf {
-    fn drop(&mut self) {
-        unsafe {
-            SelectObject(self.mdc, self.old);
-            let _ = DeleteDC(self.mdc);
-            let _ = DeleteObject(self.dib.into());
-        }
-    }
-}
-
-/// 写一个预乘 ARGB 像素（r,g,b 未预乘）
-#[inline]
-fn put_px(buf: &mut [u32], i: usize, c: (u32, u32, u32), a: u32) {
-    buf[i] = (a << 24)
-        | ((c.0 * a / 255) << 16)
-        | ((c.1 * a / 255) << 8)
-        | (c.2 * a / 255);
-}
-
-/// 把一个未预乘颜色按 alpha 叠加到已有预乘像素上（用于滚动条等画在面板之上的装饰）
-#[inline]
-fn blend_px(buf: &mut [u32], i: usize, c: (u32, u32, u32), a: u32) {
-    let cur = buf[i];
-    let da = (cur >> 24) & 0xff;
-    let na = a + da * (255 - a) / 255;
-    let mix = |src: u32, dst: u32| -> u32 { (src * a / 255 + dst * (255 - a) / 255).min(255) };
-    let r = mix(c.0, (cur >> 16) & 0xff);
-    let g = mix(c.1, (cur >> 8) & 0xff);
-    let b = mix(c.2, cur & 0xff);
-    buf[i] = (na << 24) | (r << 16) | (g << 8) | b;
-}
-
-/// 圆角覆盖率（0-4）。返回 4 表示完全在圆角内。只对四角像素调用。
-fn corner_cover(x: i32, y: i32, w: i32, h: i32, r: i32) -> u32 {
-    let (cx, cy) = if x < r && y < r {
-        (r as f32, r as f32)
-    } else if x >= w - r && y < r {
-        ((w - r) as f32, r as f32)
-    } else if x < r && y >= h - r {
-        (r as f32, (h - r) as f32)
-    } else if x >= w - r && y >= h - r {
-        ((w - r) as f32, (h - r) as f32)
-    } else {
-        return 4;
-    };
-    let rf = r as f32;
-    let mut hit = 0u32;
-    for sy in 0..2 {
-        for sx in 0..2 {
-            let px = x as f32 + 0.25 + sx as f32 * 0.5;
-            let py = y as f32 + 0.25 + sy as f32 * 0.5;
-            let (dx, dy) = (px - cx, py - cy);
-            if dx * dx + dy * dy <= rf * rf {
-                hit += 1;
-            }
-        }
-    }
-    hit
-}
+mod zones_surf;
+use zones_surf::{Surf, blend_px, corner_cover, put_px};
 
 // ── 类注册 ──
 
@@ -460,7 +405,10 @@ fn register_class() {
             hInstance: hinst.into(),
             lpszClassName: CLASS,
             hIcon: crate::modules::tray::app_icon(),
-            hbrBackground: std::mem::transmute(GetStockObject(NULL_BRUSH)),
+            hbrBackground: std::mem::transmute::<
+                windows::Win32::Graphics::Gdi::HGDIOBJ,
+                windows::Win32::Graphics::Gdi::HBRUSH,
+            >(GetStockObject(NULL_BRUSH)),
             style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             ..Default::default()
         };
@@ -606,7 +554,7 @@ fn desktop_items() -> Vec<DeskItem> {
         }
     }
 
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 
@@ -871,6 +819,8 @@ pub fn sync() {
         }
     });
     prewarm_context_menu();
+    // 分区增删 / 显隐 / 位置刚变完，让灵动岛立刻重判遮挡
+    crate::app::occ_poke();
 }
 
 /// 低频兜底：只在「配置要显示、窗口却真没了/被最小化」时动一下。
@@ -1418,6 +1368,8 @@ fn toggle_collapse(idx: usize) {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
             render(hw, idx);
+            // 折叠/展开改了高度：让灵动岛立刻重判是否被这块分区压住
+            crate::app::occ_poke();
         }
     }
 }
@@ -1820,7 +1772,10 @@ fn register_ghost_class() {
             lpfnWndProc: Some(ghost_wndproc),
             hInstance: hinst.into(),
             lpszClassName: GHOST_CLASS,
-            hbrBackground: std::mem::transmute(GetStockObject(NULL_BRUSH)),
+            hbrBackground: std::mem::transmute::<
+                windows::Win32::Graphics::Gdi::HGDIOBJ,
+                windows::Win32::Graphics::Gdi::HBRUSH,
+            >(GetStockObject(NULL_BRUSH)),
             ..Default::default()
         };
         RegisterClassW(&wc);
@@ -1907,7 +1862,7 @@ fn render_ghost(name: &str, at: POINT) {
             CLIP_DEFAULT_PRECIS,
             ANTIALIASED_QUALITY,
             (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            w!("Microsoft YaHei UI"),
+            crate::render::ui_font_pcwstr(),
         );
         let old_font = SelectObject(hdc, font.into());
         let _ = SetBkMode(hdc, TRANSPARENT);
@@ -1993,23 +1948,104 @@ fn render_ghost(name: &str, at: POINT) {
 /// 屏幕坐标处命中的分区窗口索引（拖拽落点判定）。
 /// 浮窗带 WS_EX_TRANSPARENT，WindowFromPoint 会自动跳过它。
 fn window_zone_at(pt: POINT) -> Option<usize> {
+    // 几何判定（遍历分区窗口矩形），不用 WindowFromPoint。
+    // 拖拽时鼠标被 SetCapture 捕获到源分区窗口，WindowFromPoint 会返回捕获
+    // 它的那个窗口（即源分区），导致「拖到别的分区」被误判成「还在源分区」，
+    // 跨分区移动、落点判定全部失效。几何判定不受捕获影响。
+    let mut hit = None;
+    WIN.with(|ws| {
+        for (i, hw) in ws.borrow().iter().enumerate() {
+            let Some(hw) = *hw else { continue };
+            if !unsafe { IsWindowVisible(hw).as_bool() } {
+                continue;
+            }
+            let mut rc = RECT::default();
+            if unsafe { GetWindowRect(hw, &mut rc) }.is_err() {
+                continue;
+            }
+            if pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom {
+                hit = Some(i);
+                break;
+            }
+        }
+    });
+    hit
+}
+
+/// 屏幕坐标是否落在主面板（灵动岛）窗口矩形内。
+///
+/// 不能用 WindowFromPoint + 类名：拖拽图标时鼠标被 SetCapture 捕获到分区窗口，
+/// 捕获期间 WindowFromPoint 会返回捕获窗口本身，而不是光标下的主面板，
+/// 于是落点判定永远失败（这正是"拖到灵动岛没反应"的根因）。
+/// 直接按主面板 HWND 取窗口矩形做几何判定，不受鼠标捕获和透明分层影响。
+/// 屏幕坐标点命中的分区图标项名（几何判定，遍历所有分区窗口）。
+/// 全局钩子用它判断「按下处是不是分区里的某个图标」——不依赖分区窗口是否
+/// 收到鼠标消息，也不受 SetCapture 影响。
+/// 把单个文件路径投递给主面板的入站通道（复用 OLE 拖放用的 WM_DROP_FILES）。
+/// 为什么不直接在钩子里调 push_file_external：钩子回调有超时限制，
+/// 重绘/写盘放在里面会拖慢全局鼠标；投递到主线程做，最稳且复用已验证路径。
+fn post_drop_file(path: String) -> bool {
     unsafe {
-        let hw = WindowFromPoint(pt);
+        let Ok(hw) = FindWindowW(w!("WinIsland"), None) else {
+            return false;
+        };
         if hw.0.is_null() {
-            return None;
+            return false;
         }
-        let mut buf = [0u16; 64];
-        let n = GetClassNameW(hw, &mut buf);
-        let cls = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-        if cls != "WinIslandZone" {
-            return None;
+        let boxed = Box::new(vec![path]);
+        let ptr = Box::into_raw(boxed) as isize;
+        if PostMessageW(Some(hw), crate::ui::WM_DROP_FILES, WPARAM(0), LPARAM(ptr)).is_err() {
+            // 投递失败必须自己回收，否则泄漏
+            drop(Box::from_raw(ptr as *mut Vec<String>));
+            return false;
         }
-        let idx = GetWindowLongPtrW(hw, GWLP_USERDATA);
-        if idx < 0 {
-            None
-        } else {
-            Some(idx as usize)
+        true
+    }
+}
+
+fn zone_icon_at_screen(pt: POINT) -> Option<String> {
+    let mut hit: Option<String> = None;
+    WIN.with(|ws| {
+        for (i, hw) in ws.borrow().iter().enumerate() {
+            let Some(hw) = *hw else { continue };
+            unsafe {
+                let mut rc = RECT::default();
+                if GetWindowRect(hw, &mut rc).is_err() {
+                    continue;
+                }
+                if pt.x < rc.left || pt.x >= rc.right || pt.y < rc.top || pt.y >= rc.bottom {
+                    continue;
+                }
+            }
+            if let Some(k) = icon_at(hw, pt) {
+                let name = crate::app::with_cfg(|c| {
+                    c.zones.get(i).and_then(|z| z.items.get(k).cloned())
+                });
+                if let Some(n) = name {
+                    hit = Some(n);
+                    break;
+                }
+            }
         }
+    });
+    hit
+}
+
+fn window_is_main_panel(pt: POINT) -> bool {
+    unsafe {
+        let Ok(hw) = FindWindowW(w!("WinIsland"), None) else {
+            return false;
+        };
+        if hw.0.is_null() {
+            return false;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hw, &mut r).is_err() {
+            return false;
+        }
+        // 放几像素容差，顶部小黑条/圆角边缘也能命中
+        const T: i32 = 6;
+        pt.x >= r.left - T && pt.x <= r.right + T && pt.y >= r.top - T && pt.y <= r.bottom + T
     }
 }
 
@@ -2060,6 +2096,102 @@ fn scroll_zone(idx: usize, notches: i32) {
 /// 全局滚轮钩子：分区是 `WS_EX_NOACTIVATE`（不抢焦点），收不到 WM_MOUSEWHEEL，
 /// 用低级鼠标钩子当光标落在分区上时把滚轮转给该分区；分区不可滚时放行。
 unsafe extern "system" fn wheel_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // 分区图标 → 灵动岛（文件中转站）的全局兜底。
+    //
+    // 为什么用全局钩子而不是分区窗口的 WM_LBUTTONDOWN/UP：
+    // 实测 drag.log 里分区窗口的 ZONE_DOWN/UP/DROP 一次都没触发，说明按下事件
+    // 并没有可靠地到达分区窗口的消息过程（分层窗口 + owner=DefView + 分层
+    // 命中测试都可能影响）。低级鼠标钩子由系统在鼠标驱动层回调，不经过任何
+    // 窗口的命中测试，能保证收到每一次物理按下/松开，用它兜底最稳。
+    //
+    // 钩子里只做「记录起点 / 判定落点」，真正的入站走 PostMessage 到主线程，
+    // 避免在钩子回调里做重绘、写盘等重活拖慢全局鼠标响应。
+    if code >= 0 && lparam.0 != 0 {
+        let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        match wparam.0 as u32 {
+            WM_LBUTTONDOWN => {
+                HOOK_HOVER.with(|c| c.set(false));
+                // 按下处若是分区里的某个图标，记下项名与起点，等松手判定
+                if let Some(name) = zone_icon_at_screen(ms.pt) {
+                    crate::app::diag_log(&format!(
+                        "HK_DOWN name={} at=({},{})",
+                        name, ms.pt.x, ms.pt.y
+                    ));
+                    HOOK_DRAG.with(|d| {
+                        *d.borrow_mut() = Some(HookDrag {
+                            start: ms.pt,
+                            name,
+                        })
+                    });
+                } else {
+                    HOOK_DRAG.with(|d| *d.borrow_mut() = None);
+                }
+            }
+            WM_MOUSEMOVE => {
+                // 拖着分区图标经过灵动岛时，驱动与 OLE 拖放相同的「悬停提示态」：
+                // 面板自动展开并显示「松开鼠标，暂存到中转站」。
+                // 只在状态翻转时投递一次，避免每条鼠标移动消息都打扰主线程。
+                if HOOK_DRAG.with(|d| d.borrow().is_some()) {
+                    let inside = window_is_main_panel(ms.pt);
+                    let was = HOOK_HOVER.with(|c| c.get());
+                    if inside != was {
+                        HOOK_HOVER.with(|c| c.set(inside));
+                        crate::ui::post_drag_hover(inside);
+                    }
+                }
+            }
+            WM_LBUTTONUP => {
+                // 松手：只有「真的拖动过」且落点在灵动岛内，才推入中转站
+                let pending = HOOK_DRAG.with(|d| d.borrow_mut().take());
+                let was_hover = HOOK_HOVER.with(|c| c.replace(false));
+                if let Some(h) = pending {
+                    let dx = (ms.pt.x - h.start.x).abs();
+                    let dy = (ms.pt.y - h.start.y).abs();
+                    let moved = dx > 6 || dy > 6;
+                    let in_panel = window_is_main_panel(ms.pt);
+                    crate::app::diag_log(&format!(
+                        "HK_UP name={} at=({},{}) moved={} inPanel={}",
+                        h.name, ms.pt.x, ms.pt.y, moved, in_panel
+                    ));
+                    if moved && in_panel {
+                        // 只推物理文件；虚拟项（此电脑/回收站）没有磁盘路径
+                        let path = ITEMS.with(|v| {
+                            v.borrow()
+                                .iter()
+                                .find(|i| i.name == h.name)
+                                .filter(|i| i.pidl.is_none())
+                                .map(|i| i.path.clone())
+                        });
+                        if let Some(p) = path {
+                            if p.exists() {
+                                crate::app::diag_log(&format!(
+                                    "HK_DROP name={} at=({},{}) path={}",
+                                    h.name, ms.pt.x, ms.pt.y,
+                                    p.to_string_lossy()
+                                ));
+                                // 入站会顺带清掉提示态（WM_DROP_FILES 里 set_drag_hover(false)）
+                                if post_drop_file(p.to_string_lossy().to_string()) {
+                                    return CallNextHookEx(None, code, wparam, lparam);
+                                }
+                                crate::ui::post_drag_hover(false);
+                            }
+                        }
+                        // 落在灵动岛上但没推成（虚拟项/路径失效）：撤掉提示态，
+                        // 否则面板会一直停在「松开鼠标暂存」的引导界面。
+                        if was_hover || in_panel {
+                            crate::ui::post_drag_hover(false);
+                        }
+                    } else if was_hover {
+                        // 没落在灵动岛（或没真正拖动）：退出提示态
+                        crate::ui::post_drag_hover(false);
+                    }
+                } else if was_hover {
+                    crate::ui::post_drag_hover(false);
+                }
+            }
+            _ => {}
+        }
+    }
     if code >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL && lparam.0 != 0 {
         let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
         if let Some(idx) = window_zone_at(ms.pt) {
@@ -2286,7 +2418,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
             // 点在图标上：启动跨分区图标拖拽（未拖动前松手 = 无操作，双击仍会触发打开）
-            if let Some(i) = icon_at(hwnd, sp) {
+            let hit_icon = icon_at(hwnd, sp);
+            crate::app::diag_log(&format!("ZONE_DOWN at=({},{}) hit_icon={:?}", sp.x, sp.y, hit_icon));
+            if let Some(i) = hit_icon {
                 let name =
                     crate::app::with_cfg(|c| c.zones.get(idx).and_then(|z| z.items.get(i).cloned()));
                 if let Some(n) = name {
@@ -2462,12 +2596,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     DragMode::None => {}
                 }
                 let _ = MoveWindow(hwnd, l, t, r - l, b - t, true);
+                // 分区正被拖动/缩放：立刻重判遮挡，靠到灵动岛跟前时能及时收起
+                crate::app::occ_poke();
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONUP => {
             // 面板内图标拖拽收尾：落到其它分区 → 移动归属
+            let had_idrag = IDRAG.with(|d| d.borrow().is_some());
+            let up_pt = cursor_screen();
+            crate::app::diag_log(&format!("ZONE_UP at=({},{}) had_idrag={}", up_pt.x, up_pt.y, had_idrag));
             let mut idrag = IDRAG.with(|d| d.borrow_mut().take());
             if let Some(s) = idrag.as_mut() {
                 // 落点必须用「松手瞬间」的光标位置，不能沿用最后一次 MOUSEMOVE：
@@ -2488,6 +2627,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
                 if s.moved {
+                    // 诊断：记录每次分区图标拖拽的落点判定过程（写入 %APPDATA%\WinIsland\drag.log）
+                    unsafe {
+                        let hit = WindowFromPoint(s.last);
+                        let mut cbuf = [0u16; 64];
+                        let cn = GetClassNameW(hit, &mut cbuf);
+                        let cname = String::from_utf16_lossy(&cbuf[..cn.max(0) as usize]);
+                        let main_rect = FindWindowW(w!("WinIsland"), None)
+                            .ok()
+                            .and_then(|h| {
+                                let mut r = RECT::default();
+                                if GetWindowRect(h, &mut r).is_ok() {
+                                    Some(format!("({},{})-({},{})", r.left, r.top, r.right, r.bottom))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| "no-hwnd".into());
+                        crate::app::diag_log(&format!(
+                            "ZONE_DROP name={} at=({},{}) WindowFromPoint={} mainRect={} inMain={}",
+                            s.name, s.last.x, s.last.y, cname, main_rect,
+                            window_is_main_panel(s.last)
+                        ));
+                    }
                     if let Some(t) = window_zone_at(s.last) {
                         if t != s.from {
                             let done = crate::app::with_cfg(|c| {
@@ -2516,6 +2678,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if done {
                                 crate::app::save_now();
                                 sync();
+                            }
+                        }
+                    } else if window_is_main_panel(s.last) {
+                        // 落到主面板（灵动岛）：把拖的物理文件推入文件中转站。
+                        // 分区图标拖拽是自绘的 IDRAG，不走 OLE 拖放那套，
+                        // 所以必须在这里手动交接，否则落点在主面板上什么都不会发生。
+                        // 只有真实磁盘文件能暂存；虚拟项（此电脑/回收站）没有磁盘路径。
+                        let item = ITEMS.with(|v| {
+                            v.borrow().iter().find(|i| i.name == s.name).cloned()
+                        });
+                        match item {
+                            None => crate::app::diag_log("ZONE_DROP 未找到 ITEMS 项"),
+                            Some(item) => {
+                                let ok = item.pidl.is_none() && item.path.exists();
+                                crate::app::diag_log(&format!(
+                                    "ZONE_DROP item path={} pidl={} exists={} ok={}",
+                                    item.path.to_string_lossy(), item.pidl.is_some(),
+                                    item.path.exists(), ok
+                                ));
+                                if ok {
+                                    crate::app::push_file_external(
+                                        item.path.to_string_lossy().to_string(),
+                                    );
+                                    crate::app::focus_filehub();
+                                }
                             }
                         }
                     }
@@ -2841,7 +3028,7 @@ fn render(hwnd: HWND, idx: usize) {
             CLIP_DEFAULT_PRECIS,
             ANTIALIASED_QUALITY,
             (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            w!("Microsoft YaHei UI"),
+            crate::render::ui_font_pcwstr(),
         );
         let old_font = SelectObject(hdc, font_bold.into());
         let _ = SetBkMode(hdc, TRANSPARENT);
@@ -2878,7 +3065,7 @@ fn render(hwnd: HWND, idx: usize) {
                 CLIP_DEFAULT_PRECIS,
                 ANTIALIASED_QUALITY,
                 (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-                w!("Microsoft YaHei UI"),
+                crate::render::ui_font_pcwstr(),
             );
             let old_small = SelectObject(hdc, font_small.into());
             let _ = SetTextColor(hdc, COLORREF(0xE6ECE9));
