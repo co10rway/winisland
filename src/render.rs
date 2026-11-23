@@ -9,7 +9,7 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common as DxgiC;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
-use windows::core::{w, PCWSTR};
+use windows::core::{w, Interface, PCWSTR};
 
 /// 全局 UI 缩放（DPI/96）
 pub static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -34,6 +34,11 @@ type FmtKey = (u32, u32, i32, i32, bool); // weight, size*100, halign, valign, n
 
 pub struct Canvas {
     pub dcrt: ID2D1DCRenderTarget,
+    /// 当前绘制目标：默认是 dcrt 的基接口；毛玻璃路径下每帧切换为
+    /// BeginDraw 取到的 ID2D1DeviceContext。所有图元通过它绘制。
+    rt: ID2D1RenderTarget,
+    /// dcrt 的基接口缓存（normal 路径每帧复位 `rt` 用，避免重复 QueryInterface）
+    dcrt_base: ID2D1RenderTarget,
     dwrite: IDWriteFactory,
     fmts: HashMap<FmtKey, IDWriteTextFormat>,
     /// 复用的纯色画刷：每帧上百个图元共用同一个 COM 对象，只改颜色，
@@ -47,6 +52,21 @@ pub struct Canvas {
     /// 当前绑定到渲染目标的尺寸
     w: i32,
     h: i32,
+    /// 当前是否走 DirectComposition 毛玻璃路径。
+    /// UI 层据此把最外层背景/小黑条底色改为半透明，让 DWM 系统背板透出来。
+    pub glassy: bool,
+    /// 毛玻璃下主底色相对 alpha（背板透出强度）。normal 路径恒为 1.0。
+    pub glass_bg_alpha: f32,
+    /// 自绘毛玻璃：缓存的模糊壁纸 BGRA 像素（按最大窗口尺寸生成一次）。
+    blur_pixels: Vec<u8>,
+    blur_pw: u32,
+    blur_ph: u32,
+    /// 绑定到 device context 的位图/画刷，surface 重建（generation 变化）后作废。
+    blur_bmp: Option<ID2D1Bitmap>,
+    blur_brush: Option<ID2D1BitmapBrush>,
+    blur_bmp_gen: u64,
+    /// 是否成功抓到壁纸（false 时 UI 退回带色调的兜底底）
+    pub has_blur: bool,
 }
 
 impl Canvas {
@@ -65,12 +85,16 @@ impl Canvas {
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             };
             let dcrt = factory.CreateDCRenderTarget(&props)?;
+            let dcrt_base: ID2D1RenderTarget = dcrt.cast()
+                .map_err(|e| format!("dcrt->render target cast: {e}"))?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let screen = GetWindowDC(None);
             let memdc = CreateCompatibleDC(Some(screen));
             ReleaseDC(None, screen);
             Ok(Canvas {
                 dcrt,
+                rt: dcrt_base.clone(),
+                dcrt_base,
                 dwrite,
                 fmts: HashMap::new(),
                 brush: std::cell::RefCell::new(None),
@@ -80,6 +104,15 @@ impl Canvas {
                 cap_h: 0,
                 w: 0,
                 h: 0,
+                glassy: false,
+                glass_bg_alpha: 1.0,
+                blur_pixels: Vec::new(),
+                blur_pw: 0,
+                blur_ph: 0,
+                blur_bmp: None,
+                blur_brush: None,
+                blur_bmp_gen: 0,
+                has_blur: false,
             })
         }
     }
@@ -90,7 +123,7 @@ impl Canvas {
         let color = col(c, alpha);
         let mut slot = self.brush.borrow_mut();
         if slot.is_none() {
-            match unsafe { self.dcrt.CreateSolidColorBrush(&color, None) } {
+            match unsafe { self.rt.CreateSolidColorBrush(&color, None) } {
                 Ok(b) => *slot = Some(b),
                 Err(_) => return None,
             }
@@ -152,11 +185,17 @@ impl Canvas {
     /// 渲染一帧并提交到分层窗口
     pub fn present(&mut self, hwnd: HWND, w: i32, h: i32, draw: impl FnOnce(&mut Canvas, f32, f32)) {
         self.ensure_size(w, h);
+        self.glassy = false; // normal 路径：底色不透明，走 ULW
+        self.glass_bg_alpha = 1.0;
+        self.has_blur = false;
+        self.rt = self.dcrt_base.clone(); // 复位绘制目标为 DCRT
+        // 画刷绑定创建它的 render target：从 glassy 回退到 DCRT 后必须作废旧画刷
+        *self.brush.borrow_mut() = None;
         unsafe {
-            self.dcrt.BeginDraw();
-            self.dcrt.Clear(Some(&D2DC::D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            self.rt.BeginDraw();
+            self.rt.Clear(Some(&D2DC::D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
             draw(self, w as f32, h as f32);
-            if self.dcrt.EndDraw(None, None).is_err() {
+            if self.rt.EndDraw(None, None).is_err() {
                 // 渲染失败：静默跳过本帧（v0.1 策略）
             }
             let blend = BLENDFUNCTION {
@@ -179,6 +218,116 @@ impl Canvas {
                 ULW_ALPHA,
             );
         }
+    }
+
+    /// 准备自绘毛玻璃背景：抓壁纸→模糊→上传成 D2D 位图画刷。
+    /// 像素按窗口最大尺寸缓存一次，surface 重建（generation 变化）才重建位图。
+    fn ensure_blur(&mut self, g: &crate::modules::glassy::Glassy, w: u32, h: u32) {
+        // 半径 12：保留可见的壁纸纹理，呈现通透磨砂感（原 Acrylic 配方）。
+        let radius: usize = 12;
+        // 1) 像素缓存：尺寸不够时重新抓取（放大 1.2 倍减少重抓次数）
+        if self.blur_pixels.is_empty() || w > self.blur_pw || h > self.blur_ph {
+            let cw = (w * 6 / 5).max(w + 16);
+            let ch = (h * 6 / 5).max(h + 16);
+            match crate::modules::wallpaper::capture_blurred(cw, ch, radius) {
+                Ok(b) => {
+                    self.blur_pixels = b.pixels;
+                    self.blur_pw = b.w;
+                    self.blur_ph = b.h;
+                    self.has_blur = true;
+                    self.blur_bmp_gen = 0; // 强制重建位图
+                }
+                Err(_) => {
+                    self.has_blur = false;
+                    return;
+                }
+            }
+        }
+        // 2) 位图绑定 device context：generation 变了或还没建就重建
+        if self.blur_bmp_gen == g.generation && self.blur_bmp.is_some() {
+            return;
+        }
+        unsafe {
+            let props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2DC::D2D1_PIXEL_FORMAT {
+                    format: DxgiC::DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2DC::D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            let bmp = self.rt.CreateBitmap(
+                D2DC::D2D_SIZE_U { width: self.blur_pw, height: self.blur_ph },
+                Some(self.blur_pixels.as_ptr() as *const std::ffi::c_void),
+                self.blur_pw as u32 * 4,
+                &props,
+            );
+            match bmp {
+                Ok(bmp) => {
+                    let bp = D2D1_BITMAP_BRUSH_PROPERTIES {
+                        extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                        extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                        interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    };
+                    match self.rt.CreateBitmapBrush(&bmp, Some(&bp), None) {
+                        Ok(brush) => {
+                            self.blur_brush = Some(brush);
+                            self.blur_bmp = Some(bmp);
+                            self.blur_bmp_gen = g.generation;
+                        }
+                        Err(_) => self.has_blur = false,
+                    }
+                }
+                Err(_) => self.has_blur = false,
+            }
+        }
+    }
+
+    /// 用模糊壁纸以圆角形状填充背景（四角完美贴合，不留矩形直角）。
+    /// alpha 用于把壁纸压暗到合适的玻璃亮度。
+    pub fn rrect_blur(&self, x: f32, y: f32, w: f32, h: f32, r: f32, alpha: f32) {
+        let Some(brush) = &self.blur_brush else { return };
+        unsafe {
+            let rr = D2D1_ROUNDED_RECT {
+                rect: D2DC::D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
+                radiusX: r,
+                radiusY: r,
+            };
+            // 用画刷透明度控制壁纸亮度
+            let _ = brush.SetOpacity(alpha);
+            self.rt.FillRoundedRectangle(&rr, brush);
+            let _ = brush.SetOpacity(1.0);
+        }
+    }
+
+    /// 毛玻璃路径：把当前帧绘制到 DirectComposition surface（GPU，alpha 保留）。
+    /// 背景用自绘的模糊壁纸（圆角），不再依赖系统矩形背板。
+    pub fn present_glassy(
+        &mut self,
+        g: &mut crate::modules::glassy::Glassy,
+        w: i32,
+        h: i32,
+        draw: impl FnOnce(&mut Canvas, f32, f32),
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        g.ensure_surface(w, h)?;
+        let rect = RECT { left: 0, top: 0, right: w, bottom: h };
+        let mut offset = POINT { x: 0, y: 0 };
+        let surface = g.surface();
+        let dc: ID2D1DeviceContext = unsafe { surface.BeginDraw(Some(&rect), &mut offset)? };
+        self.rt = dc.cast()?;
+        self.glassy = true;
+        self.glass_bg_alpha = 0.62;
+        *self.brush.borrow_mut() = None; // 新设备上下文：画刷缓存作废
+        self.ensure_blur(g, w as u32, h as u32);
+        unsafe {
+            dc.BeginDraw();
+            dc.Clear(Some(&D2DC::D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            draw(self, w as f32, h as f32);
+            dc.EndDraw(None, None)?;
+            surface.EndDraw()?;
+            g.device().Commit()?;
+        }
+        Ok(())
     }
 
     fn fmt(&mut self, size: f32, weight: DWRITE_FONT_WEIGHT, halign: i32, valign: i32, nowrap: bool) -> IDWriteTextFormat {
@@ -221,7 +370,7 @@ impl Canvas {
     pub fn rect(&self, x: f32, y: f32, w: f32, h: f32, c: u32, alpha: f32) {
         let Some(brush) = self.solid(c, alpha) else { return };
         unsafe {
-            self.dcrt.FillRectangle(
+            self.rt.FillRectangle(
                 &D2DC::D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
                 &brush,
             );
@@ -237,7 +386,7 @@ impl Canvas {
                 radiusX: r,
                 radiusY: r,
             };
-            self.dcrt.FillRoundedRectangle(&rr, &brush);
+            self.rt.FillRoundedRectangle(&rr, &brush);
         }
     }
 
@@ -250,7 +399,7 @@ impl Canvas {
                 radiusX: r,
                 radiusY: r,
             };
-            self.dcrt.DrawRoundedRectangle(&rr, &brush, sw, None);
+            self.rt.DrawRoundedRectangle(&rr, &brush, sw, None);
         }
     }
 
@@ -269,7 +418,7 @@ impl Canvas {
                 radiusX: r,
                 radiusY: r,
             };
-            self.dcrt.FillEllipse(&e, &brush);
+            self.rt.FillEllipse(&e, &brush);
         }
     }
 
@@ -301,7 +450,7 @@ impl Canvas {
                 right: x + maxw.max(1.0),
                 bottom: y + h,
             };
-            self.dcrt.DrawText(
+            self.rt.DrawText(
                 &wide,
                 &fmt,
                 &rect,
@@ -332,13 +481,13 @@ impl Canvas {
                 },
             };
             let coll = match self
-                .dcrt
+                .rt
                 .CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
             {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let brush = match self.dcrt.CreateLinearGradientBrush(&props, None, &coll) {
+            let brush = match self.rt.CreateLinearGradientBrush(&props, None, &coll) {
                 Ok(b) => b,
                 Err(_) => return,
             };
@@ -347,7 +496,7 @@ impl Canvas {
                 radiusX: r,
                 radiusY: r,
             };
-            self.dcrt.FillRoundedRectangle(&rr, &brush);
+            self.rt.FillRoundedRectangle(&rr, &brush);
         }
     }
 
@@ -364,13 +513,13 @@ impl Canvas {
                 endPoint: windows_numerics::Vector2 { X: x + w, Y: y },
             };
             let coll = match self
-                .dcrt
+                .rt
                 .CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
             {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let brush = match self.dcrt.CreateLinearGradientBrush(&props, None, &coll) {
+            let brush = match self.rt.CreateLinearGradientBrush(&props, None, &coll) {
                 Ok(b) => b,
                 Err(_) => return,
             };
@@ -379,7 +528,7 @@ impl Canvas {
                 radiusX: r,
                 radiusY: r,
             };
-            self.dcrt.FillRoundedRectangle(&rr, &brush);
+            self.rt.FillRoundedRectangle(&rr, &brush);
         }
     }
 
@@ -387,7 +536,7 @@ impl Canvas {
     pub fn line(&self, x1: f32, y1: f32, x2: f32, y2: f32, c: u32, alpha: f32, width: f32) {
         let Some(brush) = self.solid(c, alpha) else { return };
         unsafe {
-            self.dcrt.DrawLine(
+            self.rt.DrawLine(
                 windows_numerics::Vector2 { X: x1, Y: y1 },
                 windows_numerics::Vector2 { X: x2, Y: y2 },
                 &brush,
@@ -406,18 +555,23 @@ impl Canvas {
                 radiusX: r,
                 radiusY: r,
             };
-            self.dcrt.DrawEllipse(&e, &brush, sw, None);
+            self.rt.DrawEllipse(&e, &brush, sw, None);
         }
     }
 
     /// 绘制到内存位图（不提交到分层窗口）。返回 memdc，调用方自行 BitBlt 到窗口。
     pub fn draw_to_mem(&mut self, w: i32, h: i32, bg: u32, draw: impl FnOnce(&mut Canvas, f32, f32)) -> HDC {
         self.ensure_size(w, h);
+        self.glassy = false;
+        self.glass_bg_alpha = 1.0;
+        self.has_blur = false;
+        self.rt = self.dcrt_base.clone();
+        *self.brush.borrow_mut() = None;
         unsafe {
-            self.dcrt.BeginDraw();
-            self.dcrt.Clear(Some(&col(bg, 1.0)));
+            self.rt.BeginDraw();
+            self.rt.Clear(Some(&col(bg, 1.0)));
             draw(self, w as f32, h as f32);
-            if self.dcrt.EndDraw(None, None).is_err() {
+            if self.rt.EndDraw(None, None).is_err() {
                 // 忽略：下一次 WM_PAINT 会重画
             }
         }
@@ -439,7 +593,7 @@ impl Canvas {
     /// 后续绘制整体平移（绝对变换，非累加）。传 (0,0) 复位。
     pub fn offset(&self, dx: f32, dy: f32) {
         unsafe {
-            self.dcrt.SetTransform(&windows_numerics::Matrix3x2 {
+            self.rt.SetTransform(&windows_numerics::Matrix3x2 {
                 M11: 1.0,
                 M12: 0.0,
                 M21: 0.0,
@@ -453,7 +607,7 @@ impl Canvas {
     /// 压入矩形裁剪区（用于页面滑动时裁掉溢出内容）
     pub fn push_clip(&self, x: f32, y: f32, w: f32, h: f32) {
         unsafe {
-            self.dcrt.PushAxisAlignedClip(
+            self.rt.PushAxisAlignedClip(
                 &D2DC::D2D_RECT_F {
                     left: x,
                     top: y,
@@ -467,7 +621,7 @@ impl Canvas {
 
     pub fn pop_clip(&self) {
         unsafe {
-            self.dcrt.PopAxisAlignedClip();
+            self.rt.PopAxisAlignedClip();
         }
     }
 }

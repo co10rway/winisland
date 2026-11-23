@@ -305,12 +305,20 @@ pub struct Config {
     /// - "work"：工作模式 —— 右侧轮播今日已赚 / 已工作 / 进度 / 距下班 / 打字
     /// - "stock"：盯盘模式 —— 左侧状态显示「盯盘中」，右侧轮播每只自选的股价与涨跌幅 + 今日盈亏
     pub mode: String,
+    /// 毛玻璃背板："none"（默认，分层自绘）/ "glass"（毛玻璃，自绘模糊壁纸）。
+    /// 旧配置里的 "mica"/"acrylic" 在 load 时归一到 "glass"。
+    pub backdrop: String,
 }
 
 impl Config {
     /// 是否处于盯盘模式（决定胶囊左侧状态徽标与右侧轮播内容）
     pub fn stock_mode(&self) -> bool {
         self.mode == "stock"
+    }
+
+    /// 是否启用毛玻璃（DirectComposition + 自绘模糊壁纸路径）。
+    pub fn glassy(&self) -> bool {
+        self.backdrop == "glass"
     }
 }
 
@@ -446,6 +454,7 @@ impl Default for Config {
             schedule_lead_minutes: 5,
             schedule_sub: ScheduleSub::default(),
             mode: "work".into(),
+            backdrop: "none".into(),
         }
     }
 }
@@ -472,6 +481,10 @@ impl Config {
             match serde_json::from_str::<Config>(&txt) {
                 Ok(mut c) => {
                     c.panel.normalize();
+                    // v0.17.2: Mica/Acrylic 合并为「毛玻璃」，旧值平滑迁移
+                    if c.backdrop == "mica" || c.backdrop == "acrylic" {
+                        c.backdrop = "glass".into();
+                    }
                     return c;
                 }
                 Err(e) => {

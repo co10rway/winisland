@@ -118,6 +118,8 @@ enum RowKind {
     PageRow,
     /// 主题色：一排可点色块
     Theme,
+    /// 毛玻璃背板：无 / Mica / Acrylic 三档
+    Backdrop,
     /// 工作日：一排「一二三四五六日」可点方块
     Weekday,
     /// 时间选择器：点击弹出时/分选择面板（不创建原生 EDIT）
@@ -189,6 +191,9 @@ impl Row {
     /// 主题色选择行：右侧一排色块
     fn theme() -> Row {
         Row { kind: RowKind::Theme, slot: 0, label: "主题色", desc: "胶囊与面板的强调色", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
+    }
+    fn backdrop() -> Row {
+        Row { kind: RowKind::Backdrop, slot: 0, label: "毛玻璃背板", desc: "毛玻璃=模糊壁纸作圆角底、四角贴合；切换后重启生效", suffix: "", placeholder: "", fw: 0.0, int: false, pwd: false, btns: Vec::new() }
     }
     /// 工作日选择行：哪天算上班
     fn weekday() -> Row {
@@ -268,6 +273,7 @@ fn layout(page: &Page) -> Layout {
                             | RowKind::Action
                             | RowKind::PageRow
                             | RowKind::Theme
+                            | RowKind::Backdrop
                             | RowKind::Weekday
                     )
                 {
@@ -300,6 +306,7 @@ fn pages() -> Vec<Page> {
                 Row::toggle(2, "打字统计", "统计 WPM 与今日输入字数，关闭后胶囊改显时间"),
                 Row::caption("外观"),
                 Row::theme(),
+                Row::backdrop(),
                 Row::note("灵动岛固定在屏幕顶部居中：没有窗口压住面板区域时显示面板，被压住时收成横条。金额符号固定为 ¥。"),
             ],
         },
@@ -469,6 +476,8 @@ enum HitId {
     Toggle(usize, i32),
     Btn(usize, i32),
     Theme(usize),
+    /// 毛玻璃背板档位：0=无 1=Mica 2=Acrylic
+    Backdrop(usize),
     /// 工作日（0=周一 … 6=周日）
     Weekday(usize),
     /// 底部「保存并应用」按钮：保存所有页配置 + 刷新面板数据
@@ -1174,7 +1183,7 @@ fn draw_page(cv: &mut Canvas, page: &Page, idx: usize, hover: HitId, hits: &mut 
         let row = &page.rows[pl.row];
         let is_card_row = matches!(
             row.kind,
-            RowKind::Toggle | RowKind::Field | RowKind::Time | RowKind::Action | RowKind::PageRow | RowKind::Theme | RowKind::Weekday
+            RowKind::Toggle | RowKind::Field | RowKind::Time | RowKind::Action | RowKind::PageRow | RowKind::Theme | RowKind::Backdrop | RowKind::Weekday
         );
         if is_card_row {
             if let Some(py) = prev {
@@ -1345,6 +1354,30 @@ fn draw_row(cv: &mut Canvas, row: &Row, page: usize, pl: &Placed, cx: f32, cw: f
                 cv.circle(bx + d / 2.0, by + d / 2.0, d / 2.0, *c, ta);
                 push_hit(hits, HitId::Theme(i), bx - s(4.0), by - s(4.0), d + s(8.0), d + s(8.0));
                 bx += d + gap;
+            }
+        }
+        RowKind::Backdrop => {
+            cv.text1(inner_l, ly, inner_w, s(19.0), row.label, 13.0, W_MED, TXT, ta);
+            if has_desc {
+                cv.text1(inner_l, dy, inner_w, s(16.0), row.desc, 11.0, W_NORMAL, TXT3, ta);
+            }
+            let cur = crate::app::with_cfg(|c| c.backdrop.clone());
+            let opts = ["无", "毛玻璃"];
+            let ids = ["none", "glass"];
+            let seg = s(76.0);
+            let gap = s(8.0);
+            let total = 2.0 * seg + 1.0 * gap;
+            let mut bx = cx + cw - s(18.0) - total;
+            let by = ry + (rh - s(30.0)) / 2.0;
+            let bh = s(30.0);
+            for i in 0..2usize {
+                let sel = cur == ids[i];
+                let hov = hover == HitId::Backdrop(i);
+                let bg = if sel { crate::theme::main() } else if hov { 0x24242C } else { 0x1B1B22 };
+                cv.rrect(bx, by, seg, bh, s(9.0), bg, ta * if sel { 0.95 } else { 0.9 });
+                cv.text_c(bx, by, seg, bh, opts[i], 12.0, if sel { W_SEMI } else { W_NORMAL }, if sel { 0xFFFFFF } else { TXT2 }, ta);
+                push_hit(hits, HitId::Backdrop(i), bx, by, seg, bh);
+                bx += seg + gap;
             }
         }
         RowKind::Weekday => {
@@ -2040,6 +2073,21 @@ fn on_click(hwnd: HWND, id: HitId) {
             crate::app::save_now();
             crate::app::redraw(); // 岛立即换色
             flash("主题已更新");
+            invalidate(hwnd);
+        }
+        HitId::Backdrop(i) => {
+            let ids = ["none", "glass"];
+            if let Some(id) = ids.get(i) {
+                let old = crate::app::with_cfg(|c| c.backdrop.clone());
+                crate::app::with_cfg(|c| c.backdrop = (*id).to_string());
+                crate::app::save_now();
+                // 切换窗口呈现路径需重启（WS_EX_LAYERED 样式创建时定死）
+                if old != *id {
+                    flash("已保存，重启后生效");
+                } else {
+                    flash("已保持当前设置");
+                }
+            }
             invalidate(hwnd);
         }
         HitId::Sync => {

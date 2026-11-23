@@ -101,6 +101,8 @@ impl Flash {
 pub struct App {
     pub hwnd: HWND,
     pub canvas: Option<Canvas>,
+    /// DirectComposition 毛玻璃链路（Mica/Acrylic）。None = 分层自绘路径。
+    pub glassy: Option<crate::modules::glassy::Glassy>,
     pub cfg: Config,
     pub store: Store,
     pub sal: salary::SalaryCalc,
@@ -430,7 +432,11 @@ pub fn run() {
         let y = 8;
 
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            if cfg.glassy() {
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            } else {
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            },
             class_name,
             w!("WinIsland"),
             WS_POPUP,
@@ -460,10 +466,27 @@ pub fn run() {
         // 启动前的旧邮件由邮件线程的时间基准挡住，不会走到这里。
         let last_mail_seq = 0u64;
 
+        // 毛玻璃（Mica/Acrylic）：DirectComposition 链路。失败则回退到分层自绘，
+        // 此时窗口需重新带上 WS_EX_LAYERED（创建时按配置去掉了它）。
+        let mut glassy = None;
+        if cfg.glassy() {
+            match crate::modules::glassy::Glassy::enable(hwnd, w, h) {
+                Ok(g) => {
+                    diag_log("glassy: DirectComposition 毛玻璃已启用");
+                    glassy = Some(g);
+                }
+                Err(e) => {
+                    diag_log(&format!("glassy: 启用失败，回退分层自绘: {e}"));
+                    ensure_layered_style(hwnd);
+                }
+            }
+        }
+
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
                 hwnd,
                 canvas: None,
+                glassy,
                 cfg: cfg.clone(),
                 store,
                 sal: salary::SalaryCalc::new(&cfg.salary),
@@ -710,6 +733,7 @@ fn preview_app(demo: bool) -> App {
     App {
         hwnd: HWND::default(),
         canvas: None,
+        glassy: None,
         cfg: cfg.clone(),
         store,
         sal,
@@ -1443,6 +1467,17 @@ pub fn diag_log(msg: &str) {
         });
 }
 
+/// 给窗口补上 WS_EX_LAYERED（毛玻璃启用失败/渲染失败回退时用）。
+/// 毛玻璃路径的窗口在创建时去掉了该样式；回退到分层自绘前必须加回。
+fn ensure_layered_style(hwnd: HWND) {
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if ex & (WS_EX_LAYERED.0 as isize) == 0 {
+            let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_LAYERED.0 as isize));
+        }
+    }
+}
+
 pub fn redraw() {
     // SetWindowPos 会同步派发 WM_PAINT，避免重入
     if REDRAWING.with(|f| f.get()) {
@@ -1495,15 +1530,47 @@ pub fn redraw() {
             Some(c) => c,
             None => return,
         };
+        let glassy = app.glassy.take();
         let mut hits: Vec<ui::Hit> = Vec::new();
         let mut scroll_max = 0.0f32;
+        let hwnd = app.hwnd;
+        let mut fell_back = false;
+        // 当前帧还存活、需要恢复进 App 的毛玻璃链路（此作用域内不可动 app 自身）
+        let mut keep_glassy: Option<crate::modules::glassy::Glassy> = None;
         {
             let app_ref = &*app;
-            canvas.present(app_ref.hwnd, w, h, |cv, cw, ch| {
+            match glassy {
+                Some(mut g) => {
+                    let r = canvas.present_glassy(&mut g, w, h, |cv, cw, ch| {
+                        scroll_max = ui::draw_frame(app_ref, cv, cw, ch, &mut hits);
+                    });
+                    match r {
+                        Ok(()) => keep_glassy = Some(g),
+                        Err(e) => {
+                            diag_log(&format!("glassy: 渲染失败，回退分层自绘: {e}"));
+                            fell_back = true;
+                        }
+                    }
+                }
+                None => {
+                    canvas.present(hwnd, w, h, |cv, cw, ch| {
+                        scroll_max = ui::draw_frame(app_ref, cv, cw, ch, &mut hits);
+                    });
+                }
+            }
+        }
+        if fell_back {
+            // 回退：补回分层样式后按普通分层自绘重画一次
+            ensure_layered_style(hwnd);
+            let app_ref = &*app;
+            hits.clear();
+            scroll_max = 0.0;
+            canvas.present(hwnd, w, h, |cv, cw, ch| {
                 scroll_max = ui::draw_frame(app_ref, cv, cw, ch, &mut hits);
             });
         }
         app.canvas = Some(canvas);
+        app.glassy = keep_glassy;
         app.hits = hits;
         app.scroll_max = scroll_max;
         app.scroll = app.scroll.clamp(0.0, scroll_max);

@@ -56,6 +56,22 @@ const TXT3: u32 = 0x66666F;
 /// 数值旁的单位：比普通次级文字亮，但仍明显区别于大号数值
 const UNIT: u32 = 0xC2C2CC;
 
+/// 毛玻璃下画最外层背景：先用模糊壁纸按圆角填充（四角完美贴合），
+/// 再叠一层冷调半透明层保证文字可读（通透磨砂玻璃观感）。
+/// 壁纸抓取失败（has_blur=false）时用带色调的半透明兜底，绝不与「无」的纯色底相同。
+#[inline]
+fn draw_glass_bg(cv: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, solid: u32, alpha: f32) {
+    if cv.has_blur {
+        // 通透磨砂：壁纸纹理明显（半径 12），叠淡冷蓝
+        cv.rrect_blur(x, y, w, h, r, 0.62 * alpha);
+        cv.rrect(x, y, w, h, r, 0x1B2433, 0.40 * alpha);
+    } else {
+        // 壁纸抓取失败兜底：带色调的半透明底，与「无」的纯色不透明底明显不同。
+        cv.rrect(x, y, w, h, r, 0x1B2433, 0.72 * alpha);
+    }
+    let _ = solid; // 毛玻璃下不再使用纯色底参数，保留签名以兼容调用点
+}
+
 
 const GREEN: u32 = 0x4ADE80;
 const ORANGE: u32 = 0xF5A623;
@@ -222,7 +238,7 @@ fn draw_sliver(cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>) {
     let sw = s(SLIVER_W as f32);
     let sh = s(SLIVER_H as f32);
     let x = (w - sw) / 2.0;
-    cv.rrect(x, 0.0, sw, sh, sh / 2.0, SLIVER_BG, alpha);
+    draw_glass_bg(cv, x, 0.0, sw, sh, sh / 2.0, SLIVER_BG, alpha);
     cv.rrect_stroke(x + 0.5, 0.5, sw - 1.0, sh - 1.0, sh / 2.0, BORDER, alpha * 0.85, 1.0);
     push_hit(hits, HitId::Pill, x, 0.0, sw, sh);
 }
@@ -230,7 +246,7 @@ fn draw_sliver(cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>) {
 // ---------------- 胶囊 ----------------
 
 fn draw_pill(app: &App, cv: &mut Canvas, x: f32, y: f32, pw: f32, ph: f32, alpha: f32, hits: &mut Vec<Hit>) {
-    cv.rrect(x, y, pw, ph, ph / 2.0, PILL_BG, alpha);
+    draw_glass_bg(cv, x, y, pw, ph, ph / 2.0, PILL_BG, alpha);
     cv.rrect_stroke(x + 0.5, y + 0.5, pw - 1.0, ph - 1.0, ph / 2.0, BORDER, alpha * 0.9, 1.0);
     push_hit(hits, HitId::Pill, x, y, pw, ph);
 
@@ -756,7 +772,7 @@ pub fn effective_pages(cfg: &crate::config::Config) -> Vec<&'static str> {
 fn draw_panel(app: &App, cv: &mut Canvas, w: f32, h: f32, o: f32, bg_a: f32, ct: f32, dy: f32, hits: &mut Vec<Hit>) -> f32 {
     // 圆角随展开在「胶囊半圆 → 面板圆角」之间连续过渡，避免变形时出现拐角
     let r = s(PILL_H as f32) * 0.5 * (1.0 - o) + s(24.0) * o;
-    cv.rrect(0.0, 0.0, w, h, r, BG, bg_a);
+    draw_glass_bg(cv, 0.0, 0.0, w, h, r, BG, bg_a);
     if bg_a > 0.35 {
         cv.rrect_stroke(0.5, 0.5, w - 1.0, h - 1.0, r, BORDER, bg_a * 0.9, 1.0);
     }
