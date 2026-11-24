@@ -797,10 +797,11 @@ fn draw_panel(app: &App, cv: &mut Canvas, w: f32, h: f32, o: f32, bg_a: f32, ct:
         draw_reminder_bar(app, cv, w, header_h, ct, hits, r);
         cv.line(pad, header_h + s(2.0), w - pad, header_h + s(2.0), BORDER, ct * 0.6, s(1.0));
     } else {
-        let date_s = clock::date_cn(&st);
-        cv.text_ex(pad, 0.0, s(190.0), header_h, &date_s, 13.0, W_MED, TXT2, ct, 0, 1);
-        let dw = text_w(&date_s, 13.0);
-        cv.text_ex(pad + dw + s(10.0), 0.0, s(96.0), header_h, &clock::hhmmss(&st), 18.0, W_BOLD, TXT, ct, 0, 1);
+        // 星期前置、日期主体弱化；时间去秒并收字号，把视觉焦点让给页面内容
+        let date_s = clock::date_cn_weekday_first(&st);
+        cv.text_ex(pad, 0.0, s(150.0), header_h, &date_s, 11.5, W_NORMAL, TXT2, ct, 0, 1);
+        let dw = text_w(&date_s, 11.5);
+        cv.text_ex(pad + dw + s(12.0), 0.0, s(80.0), header_h, &clock::hhmm(&st), 15.0, W_MED, TXT, ct, 0, 1);
 
         let bw = s(28.0);
         let bx = w - bw - pad;
@@ -964,21 +965,93 @@ fn ellipsize(txt: &str, size: f32, maxw: f32) -> String {
     out
 }
 
-/// 页标题行；右上角优先显示操作反馈（绿，带淡入淡出），否则显示统计信息（灰）
-fn draw_label(app: &App, cv: &mut Canvas, w: f32, title: &str, right: Option<String>, alpha: f32) {
+/// 页标题图标：每页一枚专属主色符号，统一圆底 + 描边风格
+#[derive(Clone, Copy)]
+enum PageIcon {
+    Overview,
+    Schedule,
+    Todo,
+    Files,
+    Clips,
+    Health,
+    Salary,
+    Watch,
+}
+
+/// 标题行主色图标：统一圆底 + 描边，内部用极简线条表达页型语义
+fn page_icon(cv: &mut Canvas, kind: PageIcon, cx: f32, cy: f32, accent: u32, alpha: f32) {
+    cv.circle(cx, cy, s(7.5), mix(ROW2, accent, 0.22), alpha);
+    cv.circle_stroke(cx, cy, s(7.5), accent, alpha, s(1.2));
+    let lw = s(1.1);
+    match kind {
+        PageIcon::Overview => {
+            cv.line(cx, cy, cx, cy - s(3.4), accent, alpha, lw);
+            cv.line(cx, cy, cx + s(2.8), cy + s(1.4), accent, alpha, lw);
+        }
+        PageIcon::Schedule => {
+            cv.rrect_stroke(cx - s(4.2), cy - s(3.6), s(8.4), s(7.2), s(1.2), accent, alpha, lw);
+            cv.line(cx - s(4.2), cy - s(1.4), cx + s(4.2), cy - s(1.4), accent, alpha, lw);
+        }
+        PageIcon::Todo => {
+            cv.line(cx - s(3.4), cy + s(0.3), cx - s(0.8), cy + s(3.0), accent, alpha, lw + s(0.4));
+            cv.line(cx - s(0.8), cy + s(3.0), cx + s(3.6), cy - s(2.8), accent, alpha, lw + s(0.4));
+        }
+        PageIcon::Files => {
+            cv.rrect_stroke(cx - s(4.4), cy - s(3.0), s(8.8), s(6.4), s(1.2), accent, alpha, lw);
+            cv.line(cx - s(4.4), cy - s(0.5), cx + s(4.4), cy - s(0.5), accent, alpha, lw);
+        }
+        PageIcon::Clips => {
+            cv.rrect_stroke(cx - s(3.4), cy - s(4.0), s(6.8), s(8.0), s(1.2), accent, alpha, lw);
+            cv.rrect(cx - s(1.9), cy - s(4.9), s(3.8), s(2.0), s(0.8), accent, alpha);
+        }
+        PageIcon::Health => {
+            cv.circle(cx, cy + s(0.9), s(2.5), accent, alpha);
+            cv.line(cx - s(1.9), cy - s(1.5), cx, cy - s(4.0), accent, alpha, lw);
+            cv.line(cx, cy - s(4.0), cx + s(1.9), cy - s(1.5), accent, alpha, lw);
+        }
+        PageIcon::Salary => {
+            cv.circle_stroke(cx, cy, s(4.2), accent, alpha, lw);
+            cv.line(cx, cy - s(2.6), cx, cy + s(2.6), accent, alpha, lw);
+            cv.line(cx - s(2.2), cy - s(1.3), cx + s(2.2), cy - s(1.3), accent, alpha, lw);
+        }
+        PageIcon::Watch => {
+            cv.line(cx - s(3.6), cy + s(3.0), cx - s(3.6), cy - s(1.0), accent, alpha, lw + s(0.4));
+            cv.line(cx, cy + s(3.0), cx, cy - s(3.4), accent, alpha, lw + s(0.4));
+            cv.line(cx + s(3.6), cy + s(3.0), cx + s(3.6), cy + s(0.6), accent, alpha, lw + s(0.4));
+            cv.line(cx - s(4.2), cy + s(3.4), cx + s(4.2), cy + s(3.4), accent, alpha, lw);
+        }
+    }
+}
+
+/// 页标题行：主色专属图标 + 提亮标题；右上角优先显示操作反馈（绿，带淡入淡出），
+/// 否则把统计信息收进胶囊（统一设计语言，避免灰色小字散落）。
+fn draw_label(
+    app: &App,
+    cv: &mut Canvas,
+    w: f32,
+    title: &str,
+    right: Option<String>,
+    alpha: f32,
+    icon: PageIcon,
+) {
     let pad = s(18.0);
     let iw = w - pad * 2.0;
-    cv.text1(pad, s(53.0), iw, s(18.0), title, 9.5, W_SEMI, TXT3, alpha);
+    let accent = crate::theme::main();
+    let title_y = s(52.0);
+    page_icon(cv, icon, pad + s(8.0), title_y + s(10.0), accent, alpha);
+    cv.text1(pad + s(22.0), title_y, iw - s(22.0), s(20.0), title, 11.5, W_SEMI, TXT, alpha);
 
     if let Some(f) = app.flash.as_ref().filter(|f| f.alive()) {
         let fa = f.alpha();
-        // 反馈文字从下方 3px 浮上来
-        let yy = s(53.0) + (1.0 - fa) * s(3.0);
-        cv.text_ex(pad, yy, iw, s(18.0), &f.msg, 9.5, W_MED, GREEN, alpha * fa, 2, 1);
+        let yy = title_y + (1.0 - fa) * s(3.0);
+        cv.text_ex(pad, yy, iw, s(20.0), &f.msg, 9.5, W_MED, GREEN, alpha * fa, 2, 1);
         return;
     }
     if let Some(r) = right {
-        cv.text_ex(pad, s(53.0), iw, s(18.0), &r, 9.5, W_MED, TXT3, alpha, 2, 1);
+        let cap_w = text_w(&r, 9.5) + s(16.0);
+        let bx = pad + iw - cap_w;
+        cv.rrect(bx, title_y + s(1.0), cap_w, s(18.0), s(9.0), ROW, alpha);
+        cv.text_c(bx, title_y + s(1.0), cap_w, s(18.0), &r, 9.5, W_MED, crate::theme::light(), alpha);
     }
 }
 
@@ -987,10 +1060,25 @@ fn empty_hint(cv: &mut Canvas, w: f32, txt: &str, alpha: f32) {
     cv.text_ex(pad, s(BODY_TOP), w - pad * 2.0, s(26.0), txt, 10.5, W_NORMAL, TXT3, alpha, 1, 1);
 }
 
+/// 状态条单项：中性数值 + 弱化单位，语义色交给左侧色点表达
 #[allow(clippy::too_many_arguments)]
-fn mini_stat(cv: &mut Canvas, x: f32, y: f32, w: f32, label: &str, value: &str, color: u32, alpha: f32) {
-    cv.text1(x, y, w, s(12.0), label, 8.5, W_NORMAL, TXT3, alpha);
-    cv.text1(x, y + s(11.0), w, s(18.0), value, 11.5, W_SEMI, color, alpha);
+fn mini_stat(
+    cv: &mut Canvas,
+    x: f32,
+    y: f32,
+    w: f32,
+    label: &str,
+    value: &str,
+    unit: &str,
+    value_col: u32,
+    alpha: f32,
+) {
+    cv.text1(x, y, w, s(12.0), label, 10.0, W_NORMAL, TXT2, alpha);
+    let v = text_w(value, 12.5);
+    cv.text1(x, y + s(12.0), v + s(3.0), s(17.0), value, 12.5, W_SEMI, value_col, alpha);
+    if !unit.is_empty() {
+        cv.text1(x + v + s(5.0), y + s(14.5), w - v - s(5.0), s(14.0), unit, 10.0, W_NORMAL, TXT2, alpha);
+    }
 }
 
 /// 行悬停：柔和高亮随悬停进度淡入淡出，返回当前进度
@@ -1014,9 +1102,18 @@ fn page_overview(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<
     let merged = if app.cfg.modules.schedule { app.merged_schedule() } else { Vec::new() };
     let sched_n = merged.len();
     let undone = if app.cfg.modules.todo { app.store.todos.iter().filter(|t| !t.done).count() } else { 0 };
-    draw_label(app, cv, w, crate::config::panel_name("overview"), Some(format!("{} 项", sched_n + undone)), alpha);
+
+    // 标题行：主色时钟图标 + 提亮标题，右侧反馈优先、否则显示可拆解的计数胶囊
+    let accent = crate::theme::main();
+    let cnt = format!("{} 日程 · {} 待办", sched_n, undone);
+    draw_label(app, cv, w, crate::config::panel_name("overview"), Some(cnt), alpha, PageIcon::Overview);
 
     let row_h = s(26.0);
+    let rail_x = pad;                  // 左侧状态竖条（未过主题色 / 已过中性灰）
+    let time_x = pad + s(10.0);        // 时间列（待办勾选框复用此列，实现左边缘统一）
+    let time_w = s(44.0);
+    let text_x = pad + s(54.0);        // 所有文字统一起点
+    let text_w = iw - s(54.0);
     let mut y = s(BODY_TOP);
     let mut shown = 0usize;
 
@@ -1027,8 +1124,13 @@ fn page_overview(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<
             }
             let mins = clock::parse_hm(&it.time).unwrap_or(0);
             let past = mins < now_min;
-            cv.text_ex(pad, y, s(44.0), row_h, &it.time, 11.0, W_SEMI, if past { TXT3 } else { crate::theme::light() }, alpha, 0, 1);
-            cv.text1(pad + s(50.0), y, iw - s(50.0), row_h, &it.title, 11.5, W_NORMAL, if past { TXT2 } else { TXT }, alpha);
+            // 完成态改由左侧竖条表达（未过=主题色，已过=中性灰），文字保持可读不再整体压暗
+            cv.rrect(rail_x, y + s(4.0), s(3.0), row_h - s(8.0), s(1.5),
+                     if past { mix(TXT3, ROW, 0.35) } else { accent }, alpha * if past { 0.9 } else { 1.0 });
+            cv.text_ex(time_x, y, time_w, row_h, &it.time, 10.5, W_MED,
+                       if past { TXT2 } else { accent }, alpha, 0, 1);
+            cv.text1(text_x, y, text_w, row_h, &it.title, 11.5, W_NORMAL,
+                     if past { TXT2 } else { TXT }, alpha);
             y += row_h;
             shown += 1;
         }
@@ -1041,26 +1143,27 @@ fn page_overview(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<
             if it.done {
                 continue;
             }
+            // 勾选框复用时间列中心，与时间左对齐，消除四套起始点造成的锯齿边缘
             let r = s(6.0) * (1.0 + 0.10 * app.anims.hover_p(&HitId::TodoToggle(idx)));
-            let cxx = pad + r + s(2.0);
+            let cxx = time_x + s(6.0);
             let cyy = y + row_h / 2.0;
             row_hover(app, cv, pad - s(6.0), y + s(1.0), iw + s(12.0), row_h - s(2.0), &HitId::TodoToggle(idx), alpha);
             cv.circle(cxx, cyy, r, ROW2, alpha);
-            cv.circle_stroke(cxx, cyy, r, TXT3, alpha * 0.8, s(1.0));
-            cv.text1(pad + s(20.0), y, iw - s(20.0), row_h, &it.title, 11.5, W_NORMAL, TXT, alpha);
+            cv.circle_stroke(cxx, cyy, r, mix(TXT3, accent, 0.45), alpha * 0.9, s(1.1));
+            cv.text1(text_x, y, text_w, row_h, &it.title, 11.5, W_NORMAL, TXT, alpha);
             push_hit(hits, HitId::TodoToggle(idx), pad, y, iw, row_h);
             y += row_h;
             shown += 1;
         }
     }
     if shown == 0 {
-        cv.text1(pad, y, iw, row_h, "今天没有日程和待办", 11.0, W_NORMAL, TXT3, alpha);
+        cv.text1(text_x, y, text_w, row_h, "今天没有日程和待办", 11.0, W_NORMAL, TXT2, alpha);
     }
 
     // 底部状态条：喝水 | 久坐 | 今日已赚
-    let sy = s(160.0);
-    let sh = s(32.0);
-    cv.rrect(pad, sy, iw, sh, s(10.0), ROW, alpha);
+    let sy = s(158.0);
+    let sh = s(38.0);
+    cv.rrect(pad, sy, iw, sh, s(11.0), ROW, alpha);
     let gap = s(10.0);
     let cw = (iw - gap * 2.0) / 3.0;
 
@@ -1070,13 +1173,27 @@ fn page_overview(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<
     let sal = app.sal.earned_today_f(clock::secs_of_day_f(&st));
     let money = format!("¥{}", crate::modules::salary::fmt_money(sal));
 
+    // 语义色只落在 4px 色点上；数值保持中性，仅金额保留高饱和绿作为唯一强调
+    let warn_idle = idle_min >= app.cfg.health.sedentary_minutes;
+    let dot_y = sy + s(10.0);
+    let col_x = |i: i32| pad + s(14.0) + cw * i as f32;
+
     for i in 1..3 {
-        let dx = pad + s(14.0) + cw * i as f32;
-        cv.line(dx, sy + s(8.0), dx, sy + sh - s(8.0), BORDER, alpha * 0.9, s(1.0));
+        let dx = pad + cw * i as f32;
+        cv.line(dx, sy + s(9.0), dx, sy + sh - s(9.0), BORDER, alpha * 0.8, s(1.0));
     }
-    mini_stat(cv, pad + s(14.0), sy + s(4.0), cw - s(12.0), "喝水", &format!("{}/{} 杯", cups.min(goal), goal), crate::theme::light(), alpha);
-    mini_stat(cv, pad + s(14.0) + cw, sy + s(4.0), cw - s(12.0), "久坐", &format!("{} 分钟", idle_min), if idle_min >= app.cfg.health.sedentary_minutes { ORANGE } else { TXT2 }, alpha);
-    mini_stat(cv, pad + s(14.0) + cw * 2.0, sy + s(4.0), cw - s(12.0), "今日已赚", &money, GREEN, alpha);
+
+    cv.circle(col_x(0) + s(3.0), dot_y, s(3.5), accent, alpha);
+    mini_stat(cv, col_x(0), sy + s(4.0), cw - s(12.0), "喝水",
+              &format!("{}/{}", cups.min(goal), goal), "杯", TXT, alpha);
+
+    cv.circle(col_x(1) + s(3.0), dot_y, s(3.5), if warn_idle { ORANGE } else { TXT3 }, alpha);
+    mini_stat(cv, col_x(1), sy + s(4.0), cw - s(12.0), "久坐",
+              &format!("{}", idle_min), "分钟", if warn_idle { ORANGE } else { TXT }, alpha);
+
+    cv.circle(col_x(2) + s(3.0), dot_y, s(3.5), GREEN, alpha);
+    mini_stat(cv, col_x(2), sy + s(4.0), cw - s(12.0), "今日已赚",
+              &money, "", GREEN, alpha);
 }
 
 // ---- 1 日程 ----
@@ -1089,26 +1206,32 @@ fn page_schedule(app: &App, cv: &mut Canvas, w: f32, alpha: f32) {
     let merged = app.merged_schedule();
     let total = merged.len();
     // 日程页只做展示：注册 0 个命中区，点这里就是普通的翻页
-    draw_label(app, cv, w, crate::config::panel_name("schedule"), None, alpha);
+    draw_label(app, cv, w, crate::config::panel_name("schedule"), Some(format!("{} 项", total)), alpha, PageIcon::Schedule);
 
     if total == 0 {
         empty_hint(cv, w, "还没有日程 · 在设置里订阅外部日历（ICS 或企业微信 CalDAV）", alpha);
         return;
     }
     let row_h = s(27.0);
+    let rail_x = pad;                  // 左侧状态竖条（未过主题色 / 已过中性灰）
+    let time_x = pad + s(10.0);        // 时间列
+    let text_x = pad + s(54.0);        // 标题列，与概览页同一栅格
+    let accent = crate::theme::main();
     let sc = app.panel_scroll.min(panel_scroll_max(app, "schedule"));
     let mut y = s(BODY_TOP) - sc;
     for it in merged.iter() {
         let mins = clock::parse_hm(&it.time).unwrap_or(-1);
         let is_past = mins >= 0 && mins < now_min;
         let is_next = !is_past && mins >= now_min;
-        let tw = s(38.0);
-        cv.rrect(pad, y + s(4.0), tw, row_h - s(8.0), s(8.0), if is_past { ROW } else { crate::theme::dark() }, alpha);
-        cv.text_c(pad, y + s(4.0), tw, row_h - s(8.0), &it.time, 9.5, W_SEMI, if is_past { TXT3 } else { crate::theme::light() }, alpha);
+        // 状态交给竖条与时间色表达，标题始终可读，不再用整块灰胶囊制造「失效感」
+        cv.rrect(rail_x, y + s(5.0), s(3.0), row_h - s(10.0), s(1.5),
+                 if is_past { mix(TXT3, ROW, 0.35) } else { accent }, alpha * if is_past { 0.9 } else { 1.0 });
+        cv.text_ex(time_x, y, s(40.0), row_h, &it.time, 10.5, W_MED,
+                   if is_past { TXT2 } else { accent }, alpha, 0, 1);
         cv.text1(
-            pad + tw + s(10.0),
+            text_x,
             y,
-            iw - tw - s(10.0),
+            iw - s(54.0),
             row_h,
             &it.title,
             11.5,
@@ -1127,7 +1250,7 @@ fn page_todo(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>
     let iw = w - pad * 2.0;
     let total = app.store.todos.len();
     let done = app.store.todos.iter().filter(|t| t.done).count();
-    draw_label(app, cv, w, crate::config::panel_name("todo"), Some(format!("{}/{} 完成", done, total)), alpha);
+    draw_label(app, cv, w, crate::config::panel_name("todo"), Some(format!("{}/{} 完成", done, total)), alpha, PageIcon::Todo);
 
     // ── 「＋ 新增待办」固定按钮（置于标题下，始终可见）──
     let ay = s(BODY_TOP);
@@ -1159,12 +1282,12 @@ fn page_todo(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>
             if it.done != want_done {
                 continue;
             }
-            let cxx = pad + r + s(1.0);
+            let cxx = pad + r + s(3.5);        // 勾选框中心对齐概览页时间列 x
             let cyy = y + row_h / 2.0;
             let hp = row_hover(app, cv, pad - s(6.0), y + s(1.0), iw + s(12.0), row_h - s(2.0), &HitId::TodoToggle(idx), alpha);
             let rr = r * (1.0 + 0.10 * hp);
             if it.done {
-                cv.circle(cxx, cyy, rr, GREEN, alpha * 0.9);
+                cv.circle(cxx, cyy, rr, mix(GREEN, TXT3, 0.35), alpha * 0.9);
                 cv.line(cxx - s(3.0), cyy, cxx - s(0.5), cyy + s(2.6), 0x0F1B12, alpha, s(1.6));
                 cv.line(cxx - s(0.5), cyy + s(2.6), cxx + s(3.4), cyy - s(2.6), 0x0F1B12, alpha, s(1.6));
             } else {
@@ -1175,7 +1298,8 @@ fn page_todo(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>
             let armed = app.todo_del_arm == Some(idx);
             // 标题（右侧预留删除按钮空间；确认态下多留出「确认删除」文字宽度）
             let reserve = if armed { s(78.0) } else { s(34.0) };
-            cv.text1(pad + s(20.0), y, iw - reserve, row_h, &it.title, 11.5, W_NORMAL, if it.done { TXT3 } else { TXT }, alpha);
+            // 完成态文字保持可读（TXT2），用勾选框的柔绿而非压暗文字表达「已完成」
+            cv.text1(pad + s(24.0), y, iw - reserve - s(4.0), row_h, &it.title, 11.5, W_NORMAL, if it.done { TXT2 } else { TXT }, alpha);
 
             if armed {
                 // 二次确认条：整行右侧浮出红色「确认删除」胶囊，必须再点一次才真删
@@ -1225,6 +1349,7 @@ fn page_files(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit
         crate::config::panel_name("files"),
         Some(format!("{}/{} 个", app.store.files.len(), cap)),
         alpha,
+        PageIcon::Files,
     );
 
     // 拖动文件悬停时，页面顶部浮出一条醒目的投放引导
@@ -1250,15 +1375,16 @@ fn page_files(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit
     for (i, f) in app.store.files.iter().enumerate() {
         let armed = app.file_del_arm == Some(i);
         let sz = crate::modules::files::fmt_size(f.size);
-        let szw = text_w(&sz, 9.5);
+        let szw = text_w(&sz, 10.0);
         // 右侧给删除按钮/确认胶囊预留空间
         let del_reserve = if armed { s(78.0) } else { s(28.0) };
         let name_w = iw - szw - del_reserve - s(10.0);
         let hp = row_hover(app, cv, pad - s(6.0), y + s(1.0), iw + s(12.0), row_h - s(2.0), &HitId::FileOpen(i), alpha);
-        cv.rrect(pad, y + s(7.0), s(12.0), row_h - s(14.0), s(3.0), crate::theme::main(), alpha * (0.22 + 0.68 * hp));
-        cv.text1(pad + s(20.0), y, name_w, row_h, &ellipsize(&f.name, 11.5, name_w), 11.5, W_NORMAL, mix(TXT, 0xFFFFFF, hp * 0.6), alpha);
+        // 语义色只落在左侧图标块，数值保持中性
+        cv.rrect(pad + s(2.0), y + s(7.0), s(12.0), row_h - s(14.0), s(3.0), crate::theme::main(), alpha * (0.22 + 0.68 * hp));
+        cv.text1(pad + s(22.0), y, name_w, row_h, &ellipsize(&f.name, 11.5, name_w), 11.5, W_NORMAL, mix(TXT, 0xFFFFFF, hp * 0.6), alpha);
         // 大小文字右移到删除按钮左侧
-        cv.text_ex(pad + s(20.0) + name_w, y, szw + s(4.0), row_h, &sz, 9.5, W_NORMAL, mix(TXT3, TXT2, hp), alpha, 2, 1);
+        cv.text_ex(pad + s(22.0) + name_w, y, szw + s(4.0), row_h, &sz, 10.0, W_NORMAL, mix(TXT2, TXT, hp), alpha, 2, 1);
 
         if armed {
             // 二次确认：红色「确认删除」胶囊
@@ -1296,7 +1422,7 @@ fn page_files(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit
 fn page_clips(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>) {
     let pad = s(18.0);
     let iw = w - pad * 2.0;
-    draw_label(app, cv, w, crate::config::panel_name("clips"), Some(format!("{} 条", app.store.clips.len())), alpha);
+    draw_label(app, cv, w, crate::config::panel_name("clips"), Some(format!("{} 条", app.store.clips.len())), alpha, PageIcon::Clips);
 
     if app.store.clips.is_empty() {
         empty_hint(cv, w, "复制任意文本后会自动出现在这里", alpha);
@@ -1311,10 +1437,11 @@ fn page_clips(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit
             .chars()
             .map(|ch| if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch })
             .collect();
-        let txt = ellipsize(flat.trim(), 11.0, iw - s(16.0));
+        let txt = ellipsize(flat.trim(), 11.5, iw - s(24.0));
         let hp = row_hover(app, cv, pad - s(6.0), y + s(1.0), iw + s(12.0), row_h - s(2.0), &HitId::ClipCopy(i), alpha);
-        cv.circle(pad + s(3.0), y + row_h / 2.0, s(2.0), mix(crate::theme::main(), crate::theme::light(), hp), alpha * (0.8 + 0.2 * hp));
-        cv.text1(pad + s(12.0), y, iw - s(12.0), row_h, &txt, 11.0, W_NORMAL, TXT, alpha);
+        // 语义色只落在圆点，文字统一从 pad+24 起，与其他列表页对齐
+        cv.circle(pad + s(10.0), y + row_h / 2.0, s(2.5), mix(crate::theme::main(), crate::theme::light(), hp), alpha * (0.8 + 0.2 * hp));
+        cv.text1(pad + s(24.0), y, iw - s(24.0), row_h, &txt, 11.5, W_NORMAL, TXT, alpha);
         push_hit_body(hits, HitId::ClipCopy(i), pad, y, iw, row_h);
         y += row_h;
     }
@@ -1327,14 +1454,17 @@ fn page_health(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hi
     let iw = w - pad * 2.0;
     let goal = app.cfg.health.water_goal_cups.max(1);
     let cups = app.store.water_cups;
-    draw_label(app, cv, w, crate::config::panel_name("health"), Some(format!("目标 {} 杯", goal)), alpha);
+    draw_label(app, cv, w, crate::config::panel_name("health"), Some(format!("目标 {} 杯", goal)), alpha, PageIcon::Health);
 
-    // 饮水卡
+    // 饮水卡（本页主角，保留主题色作为唯一高饱和强调）
     let y = s(BODY_TOP);
     let ch = s(58.0);
     cv.rrect(pad, y, iw, ch, s(12.0), ROW, alpha);
-    cv.text1(pad + s(14.0), y + s(8.0), iw - s(120.0), s(14.0), "今日饮水", 9.5, W_NORMAL, TXT2, alpha);
-    cv.text1(pad + s(14.0), y + s(22.0), iw - s(120.0), s(26.0), &format!("{} / {} 杯", cups, goal), 15.0, W_BOLD, crate::theme::light(), alpha);
+    cv.text1(pad + s(14.0), y + s(8.0), iw - s(120.0), s(14.0), "今日饮水", 10.0, W_NORMAL, TXT2, alpha);
+    let water_num = format!("{} / {}", cups, goal);
+    let wnw = text_w(&water_num, 15.0);
+    cv.text1(pad + s(14.0), y + s(22.0), wnw + s(4.0), s(26.0), &water_num, 15.0, W_BOLD, crate::theme::light(), alpha);
+    cv.text1(pad + s(14.0) + wnw + s(7.0), y + s(30.0), s(40.0), s(18.0), "杯", 10.0, W_NORMAL, TXT2, alpha);
 
     let bw = s(72.0);
     let bh = s(26.0);
@@ -1359,25 +1489,25 @@ fn page_health(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hi
     let warn = idle_min >= app.cfg.health.sedentary_minutes;
 
     cv.rrect(pad, y2, half, h2, s(12.0), ROW, alpha);
-    cv.text1(pad + s(12.0), y2 + s(8.0), half - s(24.0), s(14.0), "久坐时长", 9.5, W_NORMAL, TXT2, alpha);
-    cv.text1(pad + s(12.0), y2 + s(22.0), half - s(24.0), s(20.0), &format!("{} 分钟", idle_min), 13.0, W_BOLD, if warn { ORANGE } else { TXT }, alpha);
+    // 语义色只落色点，数值保持中性
+    cv.circle(pad + s(16.0), y2 + s(15.0), s(3.5), if warn { ORANGE } else { TXT3 }, alpha);
+    cv.text1(pad + s(24.0), y2 + s(8.0), half - s(32.0), s(14.0), "久坐时长", 10.0, W_NORMAL, TXT2, alpha);
+    let idle_num = format!("{}", idle_min);
+    let inw = text_w(&idle_num, 13.0);
+    cv.text1(pad + s(12.0), y2 + s(22.0), inw + s(4.0), s(20.0), &idle_num, 13.0, W_BOLD, TXT, alpha);
+    cv.text1(pad + s(12.0) + inw + s(6.0), y2 + s(28.0), s(40.0), s(16.0), "分钟", 10.0, W_NORMAL, TXT2, alpha);
 
     let x2 = pad + half + gap;
     cv.rrect(x2, y2, half, h2, s(12.0), ROW, alpha);
-    cv.text1(x2 + s(12.0), y2 + s(8.0), half - s(24.0), s(14.0), "今日还差", 9.5, W_NORMAL, TXT2, alpha);
     let left = goal.saturating_sub(cups);
-    let left_txt = if left == 0 { "已达标".to_string() } else { format!("{} 杯", left) };
-    cv.text1(
-        x2 + s(12.0),
-        y2 + s(22.0),
-        half - s(24.0),
-        s(20.0),
-        &left_txt,
-        13.0,
-        W_BOLD,
-        if left == 0 { GREEN } else { crate::theme::light() },
-        alpha,
-    );
+    let left_num = if left == 0 { "已达标".to_string() } else { format!("{}", left) };
+    cv.circle(x2 + s(16.0), y2 + s(15.0), s(3.5), if left == 0 { GREEN } else { TXT3 }, alpha);
+    cv.text1(x2 + s(24.0), y2 + s(8.0), half - s(32.0), s(14.0), "今日还差", 10.0, W_NORMAL, TXT2, alpha);
+    let lnw = text_w(&left_num, 13.0);
+    cv.text1(x2 + s(12.0), y2 + s(22.0), lnw + s(4.0), s(20.0), &left_num, 13.0, W_BOLD, TXT, alpha);
+    if left > 0 {
+        cv.text1(x2 + s(12.0) + lnw + s(6.0), y2 + s(28.0), s(40.0), s(16.0), "杯", 10.0, W_NORMAL, TXT2, alpha);
+    }
 }
 
 // ---- 6 薪资 ----
@@ -1390,18 +1520,19 @@ fn page_salary(app: &App, cv: &mut Canvas, w: f32, alpha: f32) {
     let sal = app.sal.earned_today_f(clock::secs_of_day_f(&st));
     let money = format!("¥{}", crate::modules::salary::fmt_money(sal));
     let cur = "¥";
-    draw_label(app, cv, w, crate::config::panel_name("salary"), Some(format!("时薪 {}{:.2}", cur, app.sal.per_sec * 3600.0)), alpha);
+    draw_label(app, cv, w, crate::config::panel_name("salary"), Some(format!("时薪 {}{:.2}", cur, app.sal.per_sec * 3600.0)), alpha, PageIcon::Salary);
 
     // 主数字
     let y = s(BODY_TOP);
     let ch = s(62.0);
     cv.rrect(pad, y, iw, ch, s(12.0), ROW, alpha);
-    cv.text1(pad + s(14.0), y + s(9.0), iw - s(28.0), s(14.0), "今日已赚", 9.5, W_NORMAL, TXT2, alpha);
-    cv.text1(pad + s(14.0), y + s(24.0), iw - s(28.0), s(30.0), &money, 21.0, W_BOLD, GREEN, alpha);
+    cv.text1(pad + s(14.0), y + s(8.0), iw - s(28.0), s(14.0), "今日已赚", 10.0, W_NORMAL, TXT2, alpha);
+    cv.text1(pad + s(14.0), y + s(23.0), iw - s(28.0), s(30.0), &money, 21.0, W_BOLD, GREEN, alpha);
+    // 辅助信息从右下移到卡片右上、字号 9→10 并提亮一档，避免两张小灰字挤在主数字旁
     let rate = format!("每秒 +{}{:.2}", cur, app.sal.per_sec);
-    cv.text_ex(pad, y + s(10.0), iw - s(14.0), s(14.0), &rate, 9.0, W_NORMAL, TXT3, alpha, 2, 1);
+    cv.text_ex(pad, y + s(10.0), iw - s(14.0), s(14.0), &rate, 10.0, W_NORMAL, TXT2, alpha, 2, 1);
     let span = format!("{} – {}", app.cfg.salary.work_start, app.cfg.salary.work_end);
-    cv.text_ex(pad, y + s(26.0), iw - s(14.0), s(14.0), &span, 9.0, W_NORMAL, TXT3, alpha, 2, 1);
+    cv.text_ex(pad, y + s(27.0), iw - s(14.0), s(14.0), &span, 10.0, W_NORMAL, TXT2, alpha, 2, 1);
 
     // 工时进度（扣除午休）
     let worked = app.sal.worked_secs_excl_lunch(secs as f64) as i64;
@@ -1412,9 +1543,10 @@ fn page_salary(app: &App, cv: &mut Canvas, w: f32, alpha: f32) {
     let h2 = s(46.0);
     cv.rrect(pad, y2, iw, h2, s(12.0), ROW, alpha);
     let label = format!("已工作 {}h {:02}m / {}h", worked / 3600, (worked % 3600) / 60, total / 3600);
-    cv.text1(pad + s(14.0), y2 + s(8.0), iw - s(28.0), s(16.0), &label, 10.5, W_MED, TXT, alpha);
+    cv.text1(pad + s(14.0), y2 + s(8.0), iw - s(28.0), s(16.0), &label, 11.0, W_MED, TXT, alpha);
     let ratio = if total > 0 { worked as f32 / total as f32 } else { 0.0 };
-    cv.progress(pad + s(14.0), y2 + s(28.0), iw - s(28.0), s(5.0), ratio, GREEN, ROW2);
+    // 进度条用主题色，与「今日已赚」的绿色强调区分，避免一页两个高饱和绿
+    cv.progress(pad + s(14.0), y2 + s(28.0), iw - s(28.0), s(5.0), ratio, crate::theme::main(), ROW2);
 }
 
 // ---- 8 盯盘助手（A 股红涨绿跌）----
@@ -1427,6 +1559,7 @@ fn page_watch(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit
 
     let holding: Vec<&crate::modules::stock::Item> =
         items.iter().filter(|i| i.qty > 0.0).collect();
+    // 右侧留给「＋ 编辑」按钮，持仓数并入标题，避免胶囊与按钮重叠
     draw_label(
         app,
         cv,
@@ -1434,6 +1567,7 @@ fn page_watch(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit
         &format!("{} · {} 只持仓", crate::config::panel_name("watch"), holding.len()),
         None,
         alpha,
+        PageIcon::Watch,
     );
 
     // ── 标题行右侧「＋ 编辑」小按钮：与标题同一水平，紧凑胶囊 ──
@@ -1444,14 +1578,14 @@ fn page_watch(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit
     let ahp = app.anims.hover_p(&HitId::WatchEdit);
     cv.rrect(ebx, eby, ebw, ebh, s(6.0), mix(0x1E1E25, crate::theme::main(), ahp * 0.5), alpha * (0.85 + 0.15 * ahp));
     cv.rrect_stroke(ebx, eby, ebw, ebh, s(6.0), crate::theme::main(), alpha * (0.5 + 0.5 * ahp), s(1.0));
-    cv.text1(ebx, eby, ebw, ebh, "＋ 编辑", 9.5, W_SEMI, mix(TXT2, crate::theme::tint(), ahp), alpha);
+    cv.text1(ebx, eby, ebw, ebh, "＋ 编辑", 10.0, W_SEMI, mix(TXT2, crate::theme::tint(), ahp), alpha);
     push_hit(hits, HitId::WatchEdit, ebx, eby, ebw, ebh);
 
     if items.is_empty() {
         // 空状态引导：标题行下方即可，不再有独立按钮区
         let hy = s(BODY_TOP);
-        cv.text_ex(pad, hy, iw, s(24.0), "暂无自选，点右上角「＋ 编辑」添加第一条", 10.5, W_NORMAL, TXT3, alpha, 1, 1);
-        cv.text_ex(pad, hy + s(24.0), iw, s(18.0), "每行一条：代码 名称 成本价 数量（可只填代码）· 红涨绿跌", 8.5, W_NORMAL, TXT3, alpha, 1, 1);
+        cv.text_ex(pad, hy, iw, s(24.0), "暂无自选，点右上角「＋ 编辑」添加第一条", 11.0, W_NORMAL, TXT2, alpha, 1, 1);
+        cv.text_ex(pad, hy + s(24.0), iw, s(18.0), "每行一条：代码 名称 成本价 数量（可只填代码）· 红涨绿跌", 9.5, W_NORMAL, TXT3, alpha, 1, 1);
         return;
     }
 
@@ -1468,15 +1602,15 @@ fn page_watch(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit
         // 中间竖向分隔线
         cv.line(pad + half, y + s(8.0), pad + half, y + ch - s(8.0), BORDER, alpha * 0.9, s(1.0));
         // 左栏：持仓浮盈
-        cv.text1(left, y + s(4.0), half - s(18.0), s(12.0), "持仓浮盈", 9.5, W_NORMAL, TXT2, alpha);
+        cv.text1(left, y + s(4.0), half - s(18.0), s(12.0), "持仓浮盈", 10.0, W_NORMAL, TXT2, alpha);
         cv.text1(left, y + s(16.0), half - s(18.0), s(25.0), &format!("¥{:+.2}", fp), 18.0, W_BOLD, pnl_color(fp), alpha);
         // 右栏：今日盈亏
-        cv.text1(right, y + s(4.0), half - s(16.0), s(12.0), "今日盈亏", 9.5, W_NORMAL, TXT2, alpha);
+        cv.text1(right, y + s(4.0), half - s(16.0), s(12.0), "今日盈亏", 10.0, W_NORMAL, TXT2, alpha);
         cv.text1(right, y + s(16.0), half - s(16.0), s(25.0), &format!("¥{:+.2}", pnl), 18.0, W_BOLD, pnl_color(pnl), alpha);
     } else {
-        cv.text1(pad + s(14.0), y + s(9.0), iw - s(28.0), s(13.0), "盯盘盈亏", 9.5, W_NORMAL, TXT2, alpha);
+        cv.text1(pad + s(14.0), y + s(9.0), iw - s(28.0), s(13.0), "盯盘盈亏", 10.0, W_NORMAL, TXT2, alpha);
         cv.text1(pad + s(14.0), y + s(22.0), iw - s(28.0), s(23.0), "暂无持仓 · 仅监控自选", 14.0, W_SEMI, TXT, alpha);
-        cv.text_ex(pad, y + s(13.0), iw - s(28.0), s(14.0), "填成本价与数量后显示收益", 8.5, W_NORMAL, TXT3, alpha, 2, 1);
+        cv.text_ex(pad, y + s(13.0), iw - s(28.0), s(14.0), "填成本价与数量后显示收益", 10.0, W_NORMAL, TXT2, alpha, 2, 1);
     }
 
     // ── 行情列表（可滚动）── 与卡片保持间距，避免首行被卡片圆角遮挡
@@ -1501,7 +1635,7 @@ fn page_watch(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit
         let nm = if it.name.is_empty() { q.map(|x| x.name.as_str()).unwrap_or("") } else { it.name.as_str() };
         let name_text_w = name_w - s(50.0); // 给 6 位代码留出固定宽度
         cv.text1(pad, yy + s(1.0), name_text_w, row_h - s(2.0), nm, 12.5, W_SEMI, TXT, alpha);
-        cv.text1(pad + name_text_w, yy + s(3.0), s(50.0), row_h - s(6.0), &it.code, 10.0, W_NORMAL, TXT3, alpha);
+        cv.text1(pad + name_text_w, yy + s(3.0), s(50.0), row_h - s(6.0), &it.code, 10.5, W_NORMAL, TXT2, alpha);
         // 现价
         let pc = q.map(|x| color_pct(x.chg_pct));
         let price = q.map(|x| format!("{:.2}", x.price)).unwrap_or_else(|| "--".into());
@@ -1590,8 +1724,9 @@ fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, pages: &[&
             }
         }
 
-        let r = base_r + amp * p;
-        let col = if i == idx { crate::theme::main() } else { mix(TXT3, TXT, p) };
+        // 当前页略大 + 主题色，其余降权为幽暗点；hover 波浪仍按原进度放大
+        let r = base_r + amp * p + if i == idx { s(1.2) } else { 0.0 };
+        let col = if i == idx { crate::theme::main() } else { mix(0x3A3A44, TXT, p) };
         if icon_p < 0.999 {
             cv.circle(x, cy, r, col, alpha * (1.0 - icon_p));
         }
@@ -1623,7 +1758,7 @@ fn draw_pager(app: &App, cv: &mut Canvas, w: f32, h: f32, idx: usize, pages: &[&
 
     // 页码淡字贴在右侧（箭头已移除）
     let pg = format!("{}/{}", idx + 1, n);
-    cv.text_ex(w - s(34.0), cy - s(10.0), s(28.0), s(20.0), &pg, 8.5, W_NORMAL, TXT3, alpha * 0.8, 2, 1);
+    cv.text_ex(w - s(34.0), cy - s(10.0), s(28.0), s(20.0), &pg, 9.5, W_NORMAL, TXT2, alpha * 0.8, 2, 1);
 }
 
 /// 8 个页面图标：统一线性笔画，坐标按 24×24 网格缩放到实际图标尺寸

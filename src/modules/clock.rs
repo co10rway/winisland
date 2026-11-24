@@ -16,8 +16,8 @@ pub fn hhmmss(st: &SYSTEMTIME) -> String {
     format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
 }
 
-/// "11月13日 周五"
-pub fn date_cn(st: &SYSTEMTIME) -> String {
+/// "周日 · 11月24日" —— 面板头部把星期前置、弱化日期主体
+pub fn date_cn_weekday_first(st: &SYSTEMTIME) -> String {
     let wk = match st.wDayOfWeek {
         0 => "周日",
         1 => "周一",
@@ -27,7 +27,7 @@ pub fn date_cn(st: &SYSTEMTIME) -> String {
         5 => "周五",
         _ => "周六",
     };
-    format!("{}月{}日 {}", st.wMonth, st.wDay, wk)
+    format!("{} · {}月{}日", wk, st.wMonth, st.wDay)
 }
 
 /// "11/15 周日" —— 胶囊内的紧凑日期（给状态徽标让出宽度）
