@@ -2194,7 +2194,13 @@ unsafe extern "system" fn wheel_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     }
     if code >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL && lparam.0 != 0 {
         let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-        if let Some(idx) = window_zone_at(ms.pt) {
+        // 只吞「光标真正落在分区上」的滚轮。分区是贴桌面浮层，永远在普通应用
+        // 窗口**之下**；几何判定 window_zone_at 只看矩形、不关心谁在上面，一旦
+        // 普通窗口与分区矩形重叠，用户在应用里滚轮就会被这里 LRESULT(1) 吞掉，
+        // 表现为「开启分区后滚轮失效」。普通滚动不受 SetCapture 影响，用
+        // WindowFromPoint 取光标下真正在最顶层的窗口，只有它确属分区才转投；
+        // 否则原样放行，让下面的应用正常收到滚轮。
+        if let Some(idx) = zone_at_topmost(ms.pt) {
             if let Some(hw) = zone_hwnd(idx) {
                 let (w, h) = client_size(hw);
                 let (_f, _v, max_first) = scroll_info(idx, w, h);
@@ -2214,6 +2220,28 @@ unsafe extern "system" fn wheel_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         }
     }
     CallNextHookEx(None, code, wparam, lparam)
+}
+
+/// 光标点是否为某个分区窗口（且它是该点真正的最顶层可见窗口）。
+///
+/// 供滚轮钩子判定用：普通滚动时没有 `SetCapture`，`WindowFromPoint` 会准确返回
+/// 光标下最顶层的窗口。只有它确实是本应用的分区窗口，才认为「滚轮应交给分区」；
+/// 若是应用窗口（分区被压在下面），返回 None，滚轮照常放行给应用。
+fn zone_at_topmost(pt: POINT) -> Option<usize> {
+    let top = unsafe { WindowFromPoint(pt) };
+    if top.0.is_null() {
+        return None;
+    }
+    WIN.with(|ws| {
+        let v = ws.borrow();
+        for (i, hw) in v.iter().enumerate() {
+            let Some(hw) = *hw else { continue };
+            if hw == top {
+                return Some(i);
+            }
+        }
+        None
+    })
 }
 
 fn install_wheel_hook() {
