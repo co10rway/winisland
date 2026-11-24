@@ -10,6 +10,7 @@ pub mod net;
 pub mod occlusion;
 pub mod salary;
 pub mod sched_ics;
+pub mod schedule_add;
 pub mod stock;
 pub mod tray;
 pub mod typing;

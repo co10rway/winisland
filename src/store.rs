@@ -8,10 +8,30 @@ use std::sync::Mutex;
 /// 没有这把锁时「读磁盘→合并→写回」仍可能被邮件线程插队，导致水位被写旧。
 static STORE_IO_LOCK: Mutex<()> = Mutex::new(());
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ScheduleItem {
     pub time: String, // "09:30"
     pub title: String,
+    /// 本条日程的提前提醒分钟数；0 表示用全局 `schedule_lead_minutes`。
+    /// 仅本地手动日程会携带非 0 值，外部订阅均为 0。
+    #[serde(default)]
+    pub remind_min: u32,
+}
+
+/// 本地手动录入的日程（区别于 ICS/CalDAV 外部订阅）。
+/// 带日期，因此可以提前安排到未来某天；提醒在「日期==今天 且 时间临近」时触发。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LocalSchedule {
+    /// "2026-11-24"
+    pub date: String,
+    /// "09:30"
+    pub time: String,
+    /// 内容
+    pub title: String,
+    /// 本条日程的提前提醒分钟数；0 表示用全局 `schedule_lead_minutes`。
+    /// 旧 data.json 无此字段，serde 默认补 0（回落全局）。
+    #[serde(default)]
+    pub remind_min: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -50,6 +70,8 @@ pub struct MailCode {
 #[serde(default)]
 pub struct Store {
     pub todos: Vec<TodoItem>,
+    /// 本地手动录入的日程（日期+时间+内容）。外部订阅日程不落盘在此。
+    pub local_schedules: Vec<LocalSchedule>,
     pub clips: Vec<ClipItem>,
     pub files: Vec<FileItem>,
     pub mail_code: Option<MailCode>,

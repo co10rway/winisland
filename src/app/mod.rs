@@ -149,6 +149,8 @@ pub struct App {
     pub todo_del_arm: Option<usize>,
     /// 文件的「二次确认删除」待确认行下标
     pub file_del_arm: Option<usize>,
+    /// 手动日程的「二次确认删除」待确认下标（对应 store.local_schedules 的下标）
+    pub schedule_del_arm: Option<usize>,
     pub hits: Vec<ui::Hit>,
     #[allow(dead_code)]
     pub mouse: POINT,
@@ -220,16 +222,74 @@ impl App {
         self.panel_open || self.pinned
     }
 
-    /// 外部日程（ICS 订阅 / CalDAV），展示与临近提醒共用这一份。
-    /// 日程不再支持本地 data.json 手动添加，只能外部对接。
+    /// 当前展示 & 临近提醒共用的日程：本地手动录入（当天）+ 外部 ICS/CalDAV 订阅。
+    /// 本地带日期，只取日期==今天的条目的时间参与排序与提醒；
+    /// 外部订阅本身只有今天的条目。
     pub fn merged_schedule(&self) -> Vec<crate::store::ScheduleItem> {
         if !self.cfg.modules.schedule {
             return Vec::new();
         }
-        let mut v = crate::modules::sched_ics::today_items();
+        let today = clock::today_str(&clock::local_time());
+        let mut v = Vec::new();
+        // 本地手动录入的日程：只在「它的日期就是今天」时出现在面板与提醒
+        for it in self.store.local_schedules.iter() {
+            if it.date == today {
+                v.push(crate::store::ScheduleItem {
+                    time: it.time.clone(),
+                    title: it.title.clone(),
+                    remind_min: it.remind_min,
+                });
+            }
+        }
+        // 外部订阅（ICS / CalDAV）
+        v.extend(crate::modules::sched_ics::today_items());
         v.sort_by(|a, b| a.time.cmp(&b.time));
         v.dedup_by(|a, b| a.time == b.time && a.title == b.title);
         v
+    }
+
+    /// 与 `merged_schedule` 相同的合并结果，但为每一行额外附带「它是否是本地手动条目，
+    /// 若是则对应的 store.local_schedules 下标」。外部订阅条目对应 None。
+    /// 排序 / 去重会把本地下标打乱，因此渲染删除按钮时必须用这里的下标，
+    /// 而不能拿合并后的行序去删 local_schedules。
+    pub fn merged_schedule_local(&self) -> Vec<(crate::store::ScheduleItem, Option<usize>)> {
+        if !self.cfg.modules.schedule {
+            return Vec::new();
+        }
+        let today = clock::today_str(&clock::local_time());
+        let mut rows: Vec<(crate::store::ScheduleItem, usize)> = Vec::new();
+        for (idx, it) in self.store.local_schedules.iter().enumerate() {
+            if it.date == today {
+                rows.push((
+                    crate::store::ScheduleItem {
+                        time: it.time.clone(),
+                        title: it.title.clone(),
+                        remind_min: it.remind_min,
+                    },
+                    idx,
+                ));
+            }
+        }
+        rows.extend(crate::modules::sched_ics::today_items().into_iter().map(|s| (s, usize::MAX)));
+        // 仅以时间+标题代表「外包下标」的占位与本地行区分；MAX 表示外部条目
+        rows.sort_by(|a, b| a.0.time.cmp(&b.0.time).then(a.1.cmp(&b.1)));
+        let mut merged: Vec<(crate::store::ScheduleItem, Option<usize>)> = Vec::new();
+        for (item, idx) in rows {
+            if idx == usize::MAX {
+                // 外部条目：与已并入的本地/外部行做去重，重复则跳过
+                let dup = merged.iter().any(|(m, _)| m.time == item.time && m.title == item.title);
+                if !dup {
+                    merged.push((item, None));
+                }
+            } else {
+                // 本地条目：与已并入行去重；若与外部重复，优先保留本地（带可删除下标）
+                let dup = merged.iter().any(|(m, _)| m.time == item.time && m.title == item.title);
+                if !dup {
+                    merged.push((item, Some(idx)));
+                }
+            }
+        }
+        merged
     }
 
     /// 把 vis / hover 状态落到 expanded 上，并启动一次过渡
@@ -515,6 +575,7 @@ pub fn run() {
                 wheel_acc: 0.0,
                 todo_del_arm: None,
                 file_del_arm: None,
+                schedule_del_arm: None,
                 hits: Vec::new(),
                 mouse: POINT { x: 0, y: 0 },
                 hover: None,
@@ -782,6 +843,23 @@ pub fn push_todo(title: &str) {
     });
 }
 
+/// 面板新增本地手动日程（由新增日程对话框回调）：写入 store 并保存、重绘。
+pub fn push_schedule(date: &str, time: &str, title: &str, remind_min: u32) {
+    APP.with(|a| {
+        let mut b = a.borrow_mut();
+        let Some(app) = b.as_mut() else { return };
+        app.store.local_schedules.push(crate::store::LocalSchedule {
+            date: date.to_string(),
+            time: time.to_string(),
+            title: title.to_string(),
+            remind_min,
+        });
+        app.dirty = true;
+        app.save_now_quiet();
+    });
+}
+
+
 /// 面板删除待办（行尾 ×）在 click 中直接处理，这里保留为对外 API。
 #[allow(dead_code)]
 pub fn remove_todo(index: usize) {
@@ -913,9 +991,10 @@ pub fn quit() {
     crate::modules::zones::shutdown();
     // 设置窗口可能开着：先同步藏掉（顺带保存当前页输入），退出后不残留窗口
     crate::settings::close_for_quit();
-    // 两个模态弹窗（编辑自选 / 新增待办）可能开着：主动关掉，避免退出后残留幽灵窗口
+    // 模态弹窗（编辑自选 / 新增待办 / 新增日程）可能开着：主动关掉，避免退出后残留幽灵窗口
     crate::modules::watch_edit::close_for_quit();
     crate::modules::todo_add::close_for_quit();
+    crate::modules::schedule_add::close_for_quit();
     // 看门狗兜底：正常收尾（销毁窗口 → 存盘 → 退出消息循环）应在 1-2 秒内结束。
     // 若主线程在收尾阶段挂死（曾出现设置窗口开着时退出后卡住），3 秒后强制结束进程，
     // 不在屏幕上留"未响应"的幽灵窗口。数据已在 save_now 落盘。
@@ -1327,10 +1406,11 @@ fn tick_second() {
             Some(x) => x,
             None => return,
         };
-        // 面板已收起时，待办/文件的「二次确认删除」态一并失效，避免下次打开误删
+        // 面板已收起时，待办/文件/手动日程的「二次确认删除」态一并失效，避免下次打开误删
         if !app.panel_open {
             app.todo_del_arm = None;
             app.file_del_arm = None;
+            app.schedule_del_arm = None;
         }
         // 打字统计入库
         let st = clock::local_time();
@@ -1360,14 +1440,18 @@ fn tick_second() {
         }
 
         // 日程临近 → 胶囊常亮提醒（同一条日程当天只提醒一次）
-        if app.cfg.modules.schedule && app.reminder.is_none() && app.cfg.schedule_lead_minutes > 0 {
-            let lead = app.cfg.schedule_lead_minutes as i64;
+        if app.cfg.modules.schedule && app.reminder.is_none() {
             let now_min = clock::secs_of_day(&st) / 60;
             let mut due: Option<(String, String)> = None;
             for it in app.merged_schedule().iter() {
                 let Some(m) = clock::parse_hm(&it.time) else { continue };
+                // 每条日程可配置自己的提前量（remind_min：0 = 回落全局 schedule_lead_minutes）
+                let item_lead = if it.remind_min > 0 { it.remind_min as i64 } else { app.cfg.schedule_lead_minutes as i64 };
+                if item_lead <= 0 {
+                    continue;
+                }
                 let diff = m - now_min;
-                if (0..=lead).contains(&diff) {
+                if (0..=item_lead).contains(&diff) {
                     let key = format!("{}|{}|{}", today, it.time, it.title);
                     if !app.store.sched_seen(&key) {
                         due = Some((key, format!("{} · {}", it.time, it.title)));
@@ -1497,6 +1581,18 @@ fn click(h: &HitId) {
         return;
     }
 
+    // 「新增日程」同样在 APP 借用之外处理（模态对话框，会再次触达主窗口事件）
+    if let HitId::ScheduleAdd = h {
+        match crate::modules::schedule_add::prompt() {
+            crate::modules::schedule_add::Result3::Confirm(content, date, time, remind_min) => {
+                push_schedule(&date, &time, &content, remind_min);
+                crate::app::redraw();
+            }
+            crate::modules::schedule_add::Result3::Cancel => {}
+        }
+        return;
+    }
+
     // 「编辑自选持仓」同样在 APP 借用之外处理：模态对话框的消息循环会再次触达
     // 主窗口事件，若此刻还持有 APP 借用会重入冲突。
     if let HitId::WatchEdit = h {
@@ -1522,6 +1618,10 @@ fn click(h: &HitId) {
         let keep_file_arm = matches!(h, HitId::FileDel(i) if app.file_del_arm == Some(*i));
         if !keep_file_arm {
             app.file_del_arm = None;
+        }
+        let keep_sched_arm = matches!(h, HitId::ScheduleDel(i) if app.schedule_del_arm == Some(*i));
+        if !keep_sched_arm {
+            app.schedule_del_arm = None;
         }
         let n = ui::effective_pages(&app.cfg).len().max(1);
         match h {
@@ -1556,6 +1656,7 @@ fn click(h: &HitId) {
                 app.pinned = false;
                 app.leave_at = None;
                 app.todo_del_arm = None;
+                app.schedule_del_arm = None;
                 app.apply_vis();
             }
             HitId::Pin => {
@@ -1585,6 +1686,8 @@ fn click(h: &HitId) {
             }
             // 已在 click 开头单独处理（模态对话框需在 APP 借用之外运行）
             HitId::TodoAdd => {} 
+            // 同上：新增日程的模态对话框也在此借用之外处理
+            HitId::ScheduleAdd => {}
             // 同上：编辑自选持仓的模态对话框也在此借用之外处理
             HitId::WatchEdit => {}
             HitId::TodoDel(i) => {
@@ -1598,6 +1701,20 @@ fn click(h: &HitId) {
                     app.todo_del_arm = None;
                 } else {
                     app.todo_del_arm = Some(*i);
+                }
+            }
+            HitId::ScheduleDel(i) => {
+                // 手动日程删除（仅作用域于本地手动录入项，下标对齐 store.local_schedules）。
+                // 与待办/文件一致的二次确认：第一次点进入确认态，再点同一项才真删。
+                if app.schedule_del_arm == Some(*i) {
+                    if *i < app.store.local_schedules.len() {
+                        app.store.local_schedules.remove(*i);
+                        app.save_now_quiet();
+                        app.flash = Some(Flash::new("已删除该日程", 1500));
+                    }
+                    app.schedule_del_arm = None;
+                } else {
+                    app.schedule_del_arm = Some(*i);
                 }
             }
             HitId::FileOpen(i) => {
@@ -1765,6 +1882,7 @@ fn go_page(app: &mut App, new: usize) {
     // 翻页后行下标可能指向别的条目，清掉未完成的删除确认
     app.todo_del_arm = None;
     app.file_del_arm = None;
+    app.schedule_del_arm = None;
 }
 
 /// 把界面状态同步到各弹簧的目标值。
@@ -2203,9 +2321,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 不管从哪条路径退出（托盘 / 系统关机 / 任务管理器优雅关闭），
             // 都把设置窗口同步藏掉，避免残留
             crate::settings::close_for_quit();
-            // 两个模态弹窗同样主动关闭（这条路径覆盖系统关机等非托盘退出）
+            // 模态弹窗同样主动关闭（这条路径覆盖系统关机等非托盘退出）
             crate::modules::watch_edit::close_for_quit();
             crate::modules::todo_add::close_for_quit();
+            crate::modules::schedule_add::close_for_quit();
             tray::remove(hwnd);
             PostQuitMessage(0);
             LRESULT(0)

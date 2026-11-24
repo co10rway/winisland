@@ -11,9 +11,9 @@ pub(crate) fn preview_app(demo: bool) -> App {
     store.reset_day_if_needed(&clock::today_str(&st));
     if demo {
         crate::modules::sched_ics::inject_demo(vec![
-            crate::store::ScheduleItem { time: "09:30".into(), title: "早会 · 周会同步进度".into() },
-            crate::store::ScheduleItem { time: "14:00".into(), title: "评审灵动岛面板交互稿".into() },
-            crate::store::ScheduleItem { time: "19:30".into(), title: "健身 · 腿日".into() },
+            crate::store::ScheduleItem { time: "09:30".into(), title: "早会 · 周会同步进度".into(), ..Default::default() },
+            crate::store::ScheduleItem { time: "14:00".into(), title: "评审灵动岛面板交互稿".into(), ..Default::default() },
+            crate::store::ScheduleItem { time: "19:30".into(), title: "健身 · 腿日".into(), ..Default::default() },
         ]);
         store.todos = vec![
             crate::store::TodoItem { title: "给设置页补面板轮播配置".into(), done: false },
@@ -65,6 +65,7 @@ pub(crate) fn preview_app(demo: bool) -> App {
         wheel_acc: 0.0,
         todo_del_arm: None,
         file_del_arm: None,
+        schedule_del_arm: None,
         hits: Vec::new(),
         mouse: POINT::default(),
         hover: None,

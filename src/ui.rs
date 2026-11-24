@@ -89,12 +89,16 @@ pub enum HitId {
     Pin,
     /// 待办页「＋ 新增待办」按钮
     TodoAdd,
+    /// 日程页「＋ 新增日程」按钮（弹程序内新增对话框）
+    ScheduleAdd,
     /// 盯盘助手页「＋ 编辑自选持仓」按钮（弹程序内编辑窗口）
     WatchEdit,
     /// 待办行「完成/未完成」切换（点击整行）
     TodoToggle(usize),
     /// 待办行尾「×」删除按钮（悬停显示）
     TodoDel(usize),
+    /// 手动日程行尾「×」删除按钮（仅本地手动条目显示，悬停显示，二次确认）
+    ScheduleDel(usize),
     /// 文件条目「用默认程序直接打开文件」
     FileOpen(usize),
     /// 文件条目行尾「×」删除按钮（悬停显示，二次确认）
@@ -159,9 +163,10 @@ pub fn panel_scroll_max(app: &App, kind: &str) -> f32 {
     if n == 0 {
         return 0.0;
     }
-    // 待办页顶部多一块「+ 新增待办」固定按钮区；盯盘页顶部有「+ 编辑自选持仓」按钮 + 盈亏卡
+    // 待办/日程页顶部多一块「+ 新增」固定按钮区；盯盘页顶部有「+ 编辑自选持仓」按钮 + 盈亏卡
     let top_offset = match kind {
         "todo" => s(TODO_ADD_H) + s(6.0),
+        "schedule" => s(TODO_ADD_H) + s(6.0),
         "watch" => s(WATCH_CARD_H) + s(8.0),
         _ => 0.0,
     };
@@ -936,7 +941,7 @@ fn draw_reminder_bar(
 
 fn draw_page(app: &App, cv: &mut Canvas, kind: &str, w: f32, alpha: f32, hits: &mut Vec<Hit>) {
     match kind {
-        "schedule" => page_schedule(app, cv, w, alpha),
+        "schedule" => page_schedule(app, cv, w, alpha, hits),
         "todo" => page_todo(app, cv, w, alpha, hits),
         "files" => page_files(app, cv, w, alpha, hits),
         "clips" => page_clips(app, cv, w, alpha, hits),
@@ -1198,18 +1203,27 @@ fn page_overview(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<
 
 // ---- 1 日程 ----
 
-fn page_schedule(app: &App, cv: &mut Canvas, w: f32, alpha: f32) {
+fn page_schedule(app: &App, cv: &mut Canvas, w: f32, alpha: f32, hits: &mut Vec<Hit>) {
     let pad = s(18.0);
     let iw = w - pad * 2.0;
     let now_min = clock::secs_of_day(&clock::local_time()) / 60;
-    // 本地日程 + ICS 订阅日程合并展示
-    let merged = app.merged_schedule();
+    // 本地手动日程 + ICS 订阅日程合并展示；每行附「是否本地条目 + 本地下标」以支持删除
+    let merged = app.merged_schedule_local();
     let total = merged.len();
-    // 日程页只做展示：注册 0 个命中区，点这里就是普通的翻页
     draw_label(app, cv, w, crate::config::panel_name("schedule"), Some(format!("{} 项", total)), alpha, PageIcon::Schedule);
 
+    // ── 「＋ 新增日程」固定按钮（置于标题下，始终可见；参考待办页）──
+    let ay = s(BODY_TOP);
+    let ah = s(TODO_ADD_H);
+    let ahp = app.anims.hover_p(&HitId::ScheduleAdd);
+    cv.rrect(pad, ay, iw, ah, s(9.0), mix(0x1E1E25, crate::theme::main(), ahp * 0.5), alpha * (0.85 + 0.15 * ahp));
+    cv.rrect_stroke(pad, ay, iw, ah, s(9.0), crate::theme::main(), alpha * (0.5 + 0.5 * ahp), s(1.0));
+    cv.text1(pad, ay, iw, ah, "＋ 新增日程", 12.0, W_SEMI, mix(TXT2, crate::theme::tint(), ahp), alpha);
+    push_hit(hits, HitId::ScheduleAdd, pad, ay, iw, ah);
+
     if total == 0 {
-        empty_hint(cv, w, "还没有日程 · 在设置里订阅外部日历（ICS 或企业微信 CalDAV）", alpha);
+        let hy = s(BODY_TOP) + s(TODO_ADD_H) + s(6.0);
+        cv.text_ex(pad, hy, iw, s(22.0), "还没有日程 · 点上方「＋ 新增日程」手动添加，或在设置里订阅外部日历", 10.0, W_NORMAL, TXT3, alpha, 1, 1);
         return;
     }
     let row_h = s(27.0);
@@ -1218,20 +1232,29 @@ fn page_schedule(app: &App, cv: &mut Canvas, w: f32, alpha: f32) {
     let text_x = pad + s(54.0);        // 标题列，与概览页同一栅格
     let accent = crate::theme::main();
     let sc = app.panel_scroll.min(panel_scroll_max(app, "schedule"));
-    let mut y = s(BODY_TOP) - sc;
-    for it in merged.iter() {
+    let list_top = s(BODY_TOP) + s(TODO_ADD_H) + s(6.0);
+    let mut y = list_top - sc;
+    cv.push_clip(0.0, list_top - s(2.0), w, (body_clip_bottom() - list_top + s(2.0)).max(0.0));
+    for (it, local_idx) in merged.iter() {
         let mins = clock::parse_hm(&it.time).unwrap_or(-1);
         let is_past = mins >= 0 && mins < now_min;
         let is_next = !is_past && mins >= now_min;
+        // 仅本地手动条目可删除：外部订阅条目不显示删除按钮
+        let is_local = local_idx.is_some();
         // 状态交给竖条与时间色表达，标题始终可读，不再用整块灰胶囊制造「失效感」
+        let row_hover_p = if is_local { row_hover(app, cv, pad - s(6.0), y + s(1.0), iw + s(12.0), row_h - s(2.0), &HitId::ScheduleDel(local_idx.unwrap()), alpha) } else { 0.0 };
         cv.rrect(rail_x, y + s(5.0), s(3.0), row_h - s(10.0), s(1.5),
                  if is_past { mix(TXT3, ROW, 0.35) } else { accent }, alpha * if is_past { 0.9 } else { 1.0 });
         cv.text_ex(time_x, y, s(40.0), row_h, &it.time, 10.5, W_MED,
                    if is_past { TXT2 } else { accent }, alpha, 0, 1);
+        // 标题（右侧为本地条目预留删除按钮空间；确认态多留「确认删除」文字宽度）
+        let armed = local_idx.is_some() && app.schedule_del_arm == *local_idx;
+        let reserve = if armed { s(78.0) } else if is_local { s(34.0) } else { s(10.0) };
+        // 本地手动条目加一个小标记（如 源），与外部订阅区分
         cv.text1(
             text_x,
             y,
-            iw - s(54.0),
+            iw - s(54.0) - reserve - s(4.0),
             row_h,
             &it.title,
             11.5,
@@ -1239,8 +1262,53 @@ fn page_schedule(app: &App, cv: &mut Canvas, w: f32, alpha: f32) {
             if is_past { TXT2 } else { TXT },
             alpha,
         );
+
+        // 本地条目若配了「提前提醒」提前量，在右侧（删除按钮左侧）显示小徽标
+        if is_local && !armed && it.remind_min > 0 {
+            let idx = local_idx.unwrap();
+            let badge = format!("提前 {} 分", it.remind_min);
+            // 徽标画在标题区右侧、删除按钮旁边：细胶囊，主题色描边
+            let bw = s(52.0);
+            let bx = pad + iw - s(28.0) - bw - s(4.0);
+            let by = y + s(4.5);
+            let bh = row_h - s(9.0);
+            cv.rrect(bx, by, bw, bh, s(7.0), mix(accent, ROW, 0.15), alpha * 0.9);
+            cv.rrect_stroke(bx, by, bw, bh, s(7.0), mix(accent, TXT3, 0.4), alpha * 0.6, s(0.8));
+            cv.text_ex(bx, by, bw, bh, &badge, 8.5, W_MED, mix(accent, TXT, 0.35), alpha, 1, 1);
+            let _ = idx;
+        }
+
+        // 删除按钮（仅本地条目）：悬停显示 ×，二次确认显示「确认删除」胶囊
+        if is_local {
+            let idx = local_idx.unwrap();
+            if armed {
+                let by = y + s(2.5);
+                let bh = row_h - s(5.0);
+                let bw = s(64.0);
+                let bx = pad + iw - bw;
+                cv.rrect(bx, by, bw, bh, s(6.0), 0xE2453E, alpha * 0.95);
+                cv.text_ex(bx, by, bw, bh, "确认删除", 10.0, W_SEMI, 0xFFFFFF, alpha, 1, 1);
+            } else {
+                let del_x = pad + iw - s(24.0);
+                let dhp = app.anims.hover_p(&HitId::ScheduleDel(idx));
+                let dvisible = dhp.max(row_hover_p);
+                if dvisible > 0.004 {
+                    let dcx = del_x + s(8.0);
+                    let dcy = y + row_h / 2.0;
+                    cv.circle(dcx, dcy, s(8.5), mix(0x2C2C36, 0xFF5A5A, dhp), alpha * 0.95 * dvisible);
+                    cv.line(dcx - s(3.2), dcy, dcx + s(3.2), dcy, 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+                    cv.line(dcx - s(3.2), dcy - s(3.2), dcx + s(3.2), dcy + s(3.2), 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+                    cv.line(dcx - s(3.2), dcy + s(3.2), dcx + s(3.2), dcy - s(3.2), 0xFFFFFF, alpha * 0.75 * dvisible, s(1.6));
+                }
+            }
+            // 命中区：本地条目的删除按钮（确认态下扩展到「确认删除」胶囊）
+            let del_w = if armed { s(64.0) } else { s(28.0) };
+            let del_x0 = pad + iw - del_w;
+            push_hit_body_from(hits, HitId::ScheduleDel(idx), del_x0, y, del_w, row_h, list_top);
+        }
         y += row_h;
     }
+    cv.pop_clip();
 }
 
 // ---- 2 待办 ----

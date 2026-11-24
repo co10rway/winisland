@@ -84,7 +84,7 @@ pub fn init() {
         .filter_map(|it| {
             let time = it.get("time")?.as_str()?.to_string();
             let title = it.get("title")?.as_str()?.to_string();
-            Some(ScheduleItem { time, title })
+            Some(ScheduleItem { time, title, ..Default::default() })
         })
         .collect();
     *events().lock().unwrap() = items;
@@ -405,6 +405,7 @@ fn parse_ics(body: &str, off_min: i64, today: (i64, i64, i64)) -> Vec<ScheduleIt
                                 out.push(ScheduleItem {
                                     time: format!("{:02}:{:02}", mins / 60, mins % 60),
                                     title: sum.clone(),
+                                    ..Default::default()
                                 });
                             }
                         }
