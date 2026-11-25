@@ -382,13 +382,8 @@ thread_local! {
 
 pub fn run() {
     unsafe {
-        // DPI 感知
+        // DPI 感知（渲染缩放在主窗口创建后按窗口所在监视器动态跟随，见 sync_dpi）
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        // 渲染缩放用主显示器 DPI
-        let hdc = windows::Win32::Graphics::Gdi::GetDC(None);
-        let dpi = windows::Win32::Graphics::Gdi::GetDeviceCaps(Some(hdc), windows::Win32::Graphics::Gdi::LOGPIXELSX);
-        windows::Win32::Graphics::Gdi::ReleaseDC(None, hdc);
-        let _ = render::SCALE.set((dpi.max(96) as f32) / 96.0);
 
         // --preview：离屏渲染每个面板页到 BMP（UI 开发用，渲染完退出）
         if std::env::args().any(|a| a == "--preview") {
@@ -607,6 +602,8 @@ pub fn run() {
                 placed: (99_999, 99_999, 0, 0),
             })
         });
+        // 启动时按窗口所在监视器 DPI 设定渲染缩放（默认 1.0 会令高 DPI 屏第一帧偏小）
+        sync_dpi();
 
         // OLE 拖放必须在注册线程调用 OleInitialize（它比 CoInitializeEx 多初始化
         // OLE 拖放/剪贴板所需的设施）。主线程此前从未初始化 COM，
@@ -1106,6 +1103,21 @@ fn ensure_layered_style(hwnd: HWND) {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         if ex & (WS_EX_LAYERED.0 as isize) == 0 {
             let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_LAYERED.0 as isize));
+        }
+    }
+}
+
+/// 按窗口所在监视器的 DPI 更新全局渲染缩放，若变化则用新缩放重排窗口并重绘。
+/// 启动时设一次；DPI 变化（显示缩放调整 / 窗口跨屏）时由 WM_DPICHANGED 再触发。
+///
+/// 窗口锚定在屏幕顶部居中、每次 redraw 都用 render::si() 按当前缩放重算尺寸与位置，
+/// 所以这里只需更新缩放，下一帧 redraw 会自然落到正确尺寸/位置上。
+fn sync_dpi() {
+    let dpi = APP.with(|a| a.borrow().as_ref().map(|app| unsafe { GetDpiForWindow(app.hwnd) as f32 }));
+    if let Some(dpi) = dpi {
+        if render::set_scale(dpi) {
+            diag_log(&format!("DPI changed -> {} (scale {:.2})", dpi, dpi / 96.0));
+            redraw();
         }
     }
 }
@@ -2309,6 +2321,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     redraw();
                 }
             });
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            // 显示缩放调整 / 窗口跨屏时：按窗口新 DPI 更新缩放并就地重排重绘。
+            // lParam 指向系统建议矩形，但我们锚定屏幕顶部居中、redraw 每次都会按
+            // 新缩放重算尺寸与位置，无需采纳系统矩形。
+            sync_dpi();
             LRESULT(0)
         }
         WM_CLIPBOARDUPDATE => {

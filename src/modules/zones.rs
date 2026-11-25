@@ -1141,35 +1141,54 @@ fn seed_if_needed() {
     crate::app::save_now();
 }
 
-/// 保证分区窗口完整落在屏幕内、不小于最小尺寸。
+/// 取包含指定屏幕坐标的监视器的工作区（不含任务栏），返回屏幕坐标。
+/// 找不到（极端情况）时回退到主屏全屏。这是多显示器下正确收边的关键：
+/// 旧实现硬编码主屏（GetSystemMetrics + SPI_GETWORKAREA），副屏上的分区会被
+/// 错误地当成越界、被拖回主屏。
+fn monitor_work_area(x: i32, y: i32) -> RECT {
+    unsafe {
+        let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        if mon.0.is_null() {
+            let sw = GetSystemMetrics(SM_CXSCREEN);
+            let sh = GetSystemMetrics(SM_CYSCREEN);
+            return RECT { left: 0, top: 0, right: sw, bottom: sh };
+        }
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            mi.rcWork
+        } else {
+            let sw = GetSystemMetrics(SM_CXSCREEN);
+            let sh = GetSystemMetrics(SM_CYSCREEN);
+            RECT { left: 0, top: 0, right: sw, bottom: sh }
+        }
+    }
+}
+
+/// 保证分区窗口完整落在**它自己所在的监视器**内、不小于最小尺寸。
 ///
 /// 不再自动撑高：旧做法会把面板养到屏幕 88% 高、两列铺满桌面 →
 /// 壁纸几乎被全覆盖（用户反馈「看不到壁纸」）。现在内容超出可视区
 /// 改用**滚轮翻页**（见 `scroll_zone`），面板保持用户设定的紧凑尺寸。
+///
+/// 多显示器：每个分区按其中心点归属的监视器收边（副屏分区留在副屏，
+/// 不会被主屏工作区矩形拖回主屏）。
 fn fit_zones() {
-    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-    // 桌面工作区（不含任务栏），避免分区压到任务栏上
-    let mut wa = RECT::default();
-    let ok = unsafe {
-        SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            Some(&mut wa as *mut _ as *mut c_void),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-        .is_ok()
-    };
-    let (left, top, right, bottom) = if ok && wa.right > wa.left && wa.bottom > wa.top {
-        (wa.left, wa.top, wa.right, wa.bottom)
-    } else {
-        (0, 0, sw, sh)
-    };
     crate::app::with_cfg(|c| {
-        // 上限：高度不超过屏高 55%、宽度不超过 8 列图标。
-        // 超出部分靠滚轮翻页（0.13.0 曾自动撑高 / 加宽，旧配置里可能存着超大尺寸）
-        let max_h = ((sh as f32 * 0.55) as i32).max(MIN_H);
-        let max_w = (8 * CELL_W + 2 * PAD).max(MIN_W);
         for z in c.zones.iter_mut() {
+            // 分区归属监视器用中心点判定（分区可能部分跨屏，中心更稳）
+            let wa = monitor_work_area(z.x + z.w / 2, z.y + z.h / 2);
+            let left = wa.left;
+            let top = wa.top;
+            let right = wa.right;
+            let bottom = wa.bottom;
+            let sh = bottom - top;
+            // 上限：高度不超过屏高 55%、宽度不超过 8 列图标。
+            // 超出部分靠滚轮翻页（0.13.0 曾自动撑高 / 加宽，旧配置里可能存着超大尺寸）
+            let max_h = ((sh as f32 * 0.55) as i32).max(MIN_H);
+            let max_w = (8 * CELL_W + 2 * PAD).max(MIN_W);
             z.w = z.w.max(MIN_W);
             if !z.collapsed {
                 z.h = z.h.max(MIN_H);

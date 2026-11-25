@@ -43,6 +43,7 @@ const EM_SETSEL: u32 = 0x00B1;
 const VK_ESCAPE: u32 = 0x1B;
 const EC_LEFTMARGIN: usize = 0x0001;
 const EN_CHANGE: u32 = 0x0300;
+const EN_SETFOCUS: u32 = 0x0100;
 const GWLP_WNDPROC: i32 = -4;
 const WM_CHAR: u32 = 0x0102;
 const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
@@ -549,6 +550,35 @@ fn scroll_max() -> f32 {
     (n * ROW_H - (LIST_BOT - LIST_TOP)).max(0.0)
 }
 
+/// 滚动让指定行【完整】落入可视区 [LIST_TOP, LIST_BOT]，用于焦点跟随。
+///
+/// 列表可能比可视区高、需要滚轮翻页；但此前「Tab 跳跃聚焦 / 点击被滚动挡住的
+/// EDIT」都不会自动滚 —— 行还停在可视区外，用户看不见自己正在输入的那一行
+/// （尤其是行数多时，底部焦点行滚出列表底部，输入就像「凭空打字」）。
+/// 逻辑坐标下该行可见 ⇔ `(i+1)*ROW_H - view ≤ sc ≤ i*ROW_H`，据此上滚/下滚。
+fn reveal_row(idx: usize) {
+    let cur = SCROLL.with(|c| c.get());
+    let top = idx as f32 * ROW_H;
+    let bot = top + ROW_H;
+    let view = LIST_BOT - LIST_TOP;
+    let max = scroll_max();
+    let mut next = cur;
+    if top - next < 0.0 {
+        // 该行顶已在可视区之上（滚过头了）→ 上滚
+        next = top;
+    } else if bot - next > view {
+        // 该行底在可视区之下 → 下滚
+        next = bot - view;
+    }
+    next = next.clamp(0.0, max);
+    if (next - cur).abs() > 0.01 {
+        SCROLL.with(|c| c.set(next));
+        unsafe {
+            position_edits();
+        }
+    }
+}
+
 fn slot_y(i: usize, sc: f32) -> f32 {
     s(LIST_TOP + i as f32 * ROW_H - sc)
 }
@@ -953,6 +983,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         _ => {}
                     }
+                } else if notify == EN_SETFOCUS {
+                    // Tab 跳跃 / 点击聚焦被滚动挡住的 EDIT 时，自动把该行滚回可视区。
+                    reveal_row(idx);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)

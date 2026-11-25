@@ -14,12 +14,31 @@ use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 use windows::core::{w, Interface, PCWSTR};
 
 /// 全局 UI 缩放（DPI/96）
-pub static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-pub fn s(v: f32) -> f32 {
-    v * SCALE.get().copied().unwrap_or(1.0)
+/// 渲染缩放。DPI 感知（PER_MONITOR_AWARE_V2）下随窗口所在监视器动态变更，
+/// 存 1/1000 的定点数以便线程安全读写。默认 1.0。
+static SCALE_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
+/// 按 DPI（每英寸点数）更新全局渲染缩放。窗口移到别的监视器 / DPI 变化时调用。
+/// 返回值表示缩放是否真的变化（未变时调用方可跳过重绘）。
+pub fn set_scale(dpi: f32) -> bool {
+    let milli = ((dpi.max(96.0) / 96.0) * 1000.0).round() as u32;
+    let milli = milli.max(1000);
+    let prev = SCALE_MILLI.swap(milli, std::sync::atomic::Ordering::Relaxed);
+    prev != milli
 }
+
+fn scale() -> f32 {
+    SCALE_MILLI.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+}
+
+/// DPI 缩放后的浮点尺寸
+pub fn s(v: f32) -> f32 {
+    v * scale()
+}
+
+/// DPI 缩放后的整数尺寸
 pub fn si(v: f32) -> i32 {
-    (v * SCALE.get().copied().unwrap_or(1.0)) as i32
+    (v * scale()) as i32
 }
 
 /// 候选 UI 字体族（按优先级）。首选「微软雅黑 UI」；DirectWrite 对主字体缺字的

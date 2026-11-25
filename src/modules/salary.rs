@@ -29,15 +29,38 @@ impl SalaryCalc {
         }
     }
 
-    /// 已工作秒数（**扣除午休**，按秒连续，截止现在、不超过下班）
+    /// 已工作秒数（**扣除午休**，按秒连续，截止现在、不超过下班）。
+    ///
+    /// 正常班次（end≥start）：只统计 [start, now]∩[start,end]，并只扣落在
+    /// 工作窗口内的午休（不强依赖设置校验，午休即使配置到窗口外也不误扣）。
+    ///
+    /// 跨零点班次（end<start，如 22:00–06:00）：班次横跨 [start, 24h) 与 [0, end)
+    /// 两段，分别累计「到 now 为止已上过的时长」并各扣午休重叠。
     pub fn worked_secs_excl_lunch(&self, now: f64) -> f64 {
         let s = self.start_min as f64 * 60.0;
-        let e = self.end_min.max(self.start_min) as f64 * 60.0;
-        let now = now.clamp(s, e);
+        let e = self.end_min as f64 * 60.0;
         let lo = self.lunch_start * 60.0;
         let hi = (self.lunch_end * 60.0).max(lo);
-        let overlap = (now.min(hi) - lo).max(0.0);
-        (now - s - overlap).max(0.0)
+        let day = 24.0 * 3600.0;
+
+        if e >= s {
+            // 正常单段班次
+            let now = now.clamp(s, e);
+            let overlap = seg_overlap(lo, hi, s, now);
+            (now - s - overlap).max(0.0)
+        } else {
+            // 跨零点：段 A [s, 24h) ∪ 段 B [0, e)
+            let mut worked = 0.0;
+            if now >= s {
+                worked += now - s;
+                worked -= seg_overlap(lo, hi, s, now.min(day));
+            }
+            if now < e {
+                worked += now; // 段 B 从 0 点到 now
+                worked -= seg_overlap(lo, hi, 0.0, now);
+            }
+            worked.max(0.0)
+        }
     }
 
     /// 今日已赚（按毫秒级时间连续增长，午餐时间不计入）
@@ -45,32 +68,68 @@ impl SalaryCalc {
         self.per_sec * self.worked_secs_excl_lunch(now)
     }
 
-    /// 今日工作进度 0..1（从上午上班到下班的时间轴）
+    /// 今日工作进度 0..1：正常班次按 [start,end] 线性；跨零点按
+    /// 「班次总时长 = (24h-start)+end」的展开轴计算。
     pub fn progress(&self, now_min: f64) -> f32 {
-        let span = (self.end_min as f64 - self.start_min as f64).max(1.0);
-        (((now_min - self.start_min as f64) / span) as f32).clamp(0.0, 1.0)
+        let s = self.start_min as f64;
+        let e = self.end_min as f64;
+        let day_min = 24.0 * 60.0;
+        if e >= s {
+            let span = (e - s).max(1.0);
+            (((now_min - s) / span) as f32).clamp(0.0, 1.0)
+        } else {
+            // 跨零点展开轴：now 在 [s,1440) 映射 (now-s)，在 [0,e) 映射 (now + (1440-s))
+            let span = ((day_min - s) + e).max(1.0);
+            let pos = if now_min >= s {
+                now_min - s
+            } else if now_min < e {
+                now_min + (day_min - s)
+            } else {
+                return 0.0;
+            };
+            ((pos / span) as f32).clamp(0.0, 1.0)
+        }
     }
 
     /// 距下一个休息节点（按秒）：返回 (标签, 剩余秒)
-    /// - 还没到午休 → 距午休还有
-    /// - 午休中 → 午休剩余
-    /// - 下午工作中 → 距下班还有
-    /// - 已下班 → 已下班
+    /// - 还没到午休 → 距午休还有；午休中 → 午休剩余
+    /// - 下午工作中 → 距下班还有；已下班 → 已下班
     pub fn next_break_secs(&self, now: f64) -> (&'static str, f64) {
         let ls = self.lunch_start * 60.0;
         let le = (self.lunch_end * 60.0).max(ls);
-        let e = self.end_min.max(self.start_min) as f64 * 60.0;
-        if now < ls {
-            ("距午休还有", (ls - now).max(0.0))
-        } else if now < le {
-            ("午休剩余", (le - now).max(0.0))
-        } else if now < e {
-            ("距下班还有", (e - now).max(0.0))
+        let s = self.start_min as f64 * 60.0;
+        let e = self.end_min as f64 * 60.0;
+        let day = 24.0 * 3600.0;
+
+        if e >= s {
+            // 正常班次
+            if now < ls {
+                ("距午休还有", (ls - now).max(0.0))
+            } else if now < le {
+                ("午休剩余", (le - now).max(0.0))
+            } else if now < e {
+                ("距下班还有", (e - now).max(0.0))
+            } else {
+                ("已下班", (now - e).max(0.0))
+            }
         } else {
-            // 已下班：统计下班后经过的秒数（时分秒实时跳动）
-            ("已下班", (now - e).max(0.0))
+            // 跨零点：无午休语义，直接算距下班；段 A 内需绕零点
+            if now < e {
+                ("距下班还有", (e - now).max(0.0))
+            } else if now < s {
+                // 两段之间（e~s）不在本班次
+                ("未上班", 0.0)
+            } else {
+                // 段 A [s,24h) 中：距绕零点后的下班
+                ("距下班还有", ((day - now) + e).max(0.0))
+            }
         }
     }
+}
+
+/// 区间 [a,b] 与 [x,y] 的交集长度；三者均以「秒」为单位的一维时间。
+fn seg_overlap(a: f64, b: f64, x: f64, y: f64) -> f64 {
+    (b.min(y) - a.max(x)).max(0.0)
 }
 
 /// "3h04m12s" / "4m12s" / "12s" —— 秒级时长
@@ -138,5 +197,43 @@ mod tests {
         let (lbl, s) = c.next_break_secs(17.0 * 3600.0);
         assert_eq!(lbl, "距下班还有");
         assert!((s - 3600.0).abs() < 0.01, "距下班 1 小时, got {s}");
+    }
+
+    #[test]
+    fn lunch_within_work_window_only() {
+        // 正常班次 9–18、午休 12–13：11:30 应计满 2.5h
+        let c = calc();
+        let w = c.worked_secs_excl_lunch(11.5 * 3600.0);
+        assert!((w - 2.5 * 3600.0).abs() < 1.0, "11:30 已工作 2.5h, got {w}");
+        // 14:00：4h 工作 + 1h 午休 = 5h 墙钟 → 计 4h
+        let w = c.worked_secs_excl_lunch(14.0 * 3600.0);
+        assert!((w - 4.0 * 3600.0).abs() < 1.0, "14:00 已工作 4h, got {w}");
+    }
+
+    #[test]
+    fn lunch_outside_work_window_not_subtracted() {
+        // 午休起点早于上班（8:00–9:00），但上班是 9:00——不应误扣：
+        // 只是把算法写健壮（设置里本也校验午休落在窗口内）。
+        let c = SalaryCalc { per_sec: 1.0, start_min: 9 * 60, end_min: 18 * 60, lunch_start: 8.0 * 60.0, lunch_end: 9.0 * 60.0 };
+        let w = c.worked_secs_excl_lunch(10.0 * 3600.0);
+        assert!((w - 1.0 * 3600.0).abs() < 1.0, "09:00-10:00 应计 1h, got {w}");
+    }
+
+    #[test]
+    fn cross_midnight_shift() {
+        // 夜班 22:00–06:00，无午休
+        let c = SalaryCalc { per_sec: 1.0, start_min: 22 * 60, end_min: 6 * 60, lunch_start: 12.0 * 60.0, lunch_end: 13.0 * 60.0 };
+        // 23:00：段 A 已上 1h
+        let w = c.worked_secs_excl_lunch(23.0 * 3600.0);
+        assert!((w - 1.0 * 3600.0).abs() < 1.0, "23:00 应计 1h, got {w}");
+        // 05:30：段 B 已上到 05:30
+        let w = c.worked_secs_excl_lunch(5.5 * 3600.0);
+        assert!((w - 5.5 * 3600.0).abs() < 1.0, "05:30 应计 5.5h, got {w}");
+        // 12:00：不在班次
+        let w = c.worked_secs_excl_lunch(12.0 * 3600.0);
+        assert!((w - 0.0).abs() < 1.0, "12:00 不应计, got {w}");
+        // 进度：22:00 为 0，06:00 为 1
+        assert!((c.progress(22.0 * 60.0) - 0.0).abs() < 1e-4, "22:00 进度 0");
+        assert!((c.progress(6.0 * 60.0) - 1.0).abs() < 1e-4, "06:00 进度 1");
     }
 }
