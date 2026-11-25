@@ -21,9 +21,18 @@ pub fn is_enabled() -> bool {
         }
         let mut buf = [0u8; 1024];
         let mut len = buf.len() as u32;
-        let ok = RegQueryValueExW(hkey, VALUE_NAME, None, None, Some(buf.as_mut_ptr()), Some(&mut len)) == WIN32_ERROR(0);
+        // 不仅要「值存在」，还要校验路径与当前 exe 一致：应用被移动/改名后，
+        // 注册表里的旧路径指向已不存在的文件，再判「已开启」会误导用户。
+        let stored = if RegQueryValueExW(hkey, VALUE_NAME, None, None, Some(buf.as_mut_ptr()), Some(&mut len))
+            == WIN32_ERROR(0)
+        {
+            let n = (len as usize).min(buf.len());
+            String::from_utf8_lossy(&buf[..n]).trim_end_matches('\0').to_string()
+        } else {
+            String::new()
+        };
         let _ = RegCloseKey(hkey);
-        ok
+        stored == exe_path()
     }
 }
 

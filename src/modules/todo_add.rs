@@ -17,9 +17,9 @@ use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateFontW, CreateSolidBrush, EndPaint, InvalidateRect,
+    BeginPaint, BitBlt, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, InvalidateRect,
     SetBkColor, SetBkMode, SetTextColor, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
-    DEFAULT_PITCH, FW_NORMAL, HDC, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    DEFAULT_PITCH, FW_NORMAL, HDC, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -148,6 +148,7 @@ pub fn prompt() -> Result2 {
             let _ = DestroyWindow(hwnd);
             WIN.with(|c| c.set(0));
             EDIT.with(|c| c.set(0));
+            free_resources();
             crate::app::set_island_topmost(true);
             PostQuitMessage(0);
             return Result2::Cancel;
@@ -156,6 +157,7 @@ pub fn prompt() -> Result2 {
         let txt = RESULT.with(|c| c.borrow().clone());
         WIN.with(|c| c.set(0));
         EDIT.with(|c| c.set(0));
+        free_resources();
         crate::app::set_island_topmost(true);
         if txt.is_empty() {
             Result2::Cancel
@@ -224,6 +226,22 @@ unsafe fn build_edit_ui(parent: HWND) {
     let wide = HSTRING::from("输入待办内容，回车添加");
     let _ = SendMessageW(h, crate::modal::EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(wide.as_ptr() as isize)));
     EDIT.with(|c| c.set(h.0 as isize));
+}
+
+/// 释放「新增待办」弹窗会话期内创建的 GDI 对象（字体 + 背景画刷）。
+/// 每次打开都新建 HFONT/HBRUSH，若不在弹窗关闭后释放会持续泄漏 GDI 句柄，
+/// 长时运行可能逼近进程句柄上限（约 1 万）。调用时机在弹窗销毁之后。
+unsafe fn free_resources() {
+    let f = EDIT_FONT.with(|c| c.get());
+    if f != 0 {
+        let _ = DeleteObject(HGDIOBJ(f as *mut core::ffi::c_void));
+        EDIT_FONT.with(|c| c.set(0));
+    }
+    let b = EDIT_BRUSH.with(|c| c.get());
+    if b != 0 {
+        let _ = DeleteObject(HGDIOBJ(b as *mut core::ffi::c_void));
+        EDIT_BRUSH.with(|c| c.set(0));
+    }
 }
 
 /// 退出程序时主动关闭可能开着的弹窗（避免残留）

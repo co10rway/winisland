@@ -30,7 +30,9 @@ use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE, DWMSBT_NONE, DWMWCP_DONOTROUND,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM};
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Dxgi::{
+    IDXGIDevice, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+};
 
 /// 背板类型。解析自 config 的 `backdrop` 字段。
 /// 背板类型（两态）。v0.17.2 起 Mica/Acrylic 合并为单一「毛玻璃」：
@@ -204,6 +206,14 @@ impl Glassy {
 
     pub fn device(&self) -> &IDCompositionDesktopDevice {
         &self.device
+    }
+
+    /// 该错误是否由 D3D/DComp 设备丢失引起（GPU 重置 / 驱动更新 / 远程会话切换）。
+    /// 这类错误下重试没有意义——整条 D3D11 设备链已失效，必须重建后才能恢复毛玻璃。
+    /// 调用方需先把 `Box<dyn Error>` 向下转型为 `windows::core::Error` 再传入。
+    pub fn is_device_lost(e: &windows::core::Error) -> bool {
+        let h = e.code();
+        h == DXGI_ERROR_DEVICE_REMOVED || h == DXGI_ERROR_DEVICE_RESET
     }
 
     pub fn surface(&self) -> &IDCompositionSurface {

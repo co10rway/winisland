@@ -14,7 +14,9 @@ use windows::Win32::Graphics::Imaging::{
     WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom,
     WICDecodeMetadataCacheOnLoad,
 };
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
+
+use std::sync::Mutex;
 use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETDESKWALLPAPER};
 
 /// 模糊后的一帧 BGRA 像素（预乘无关，上传 D2D 时用 premultiplied）。
@@ -165,4 +167,46 @@ pub fn capture_blurred(w: u32, h: u32, radius: usize) -> Result<BlurredWallpaper
     let mut pixels = decode_scaled(&path, w, h)?;
     box_blur_rgba(&mut pixels, w as usize, h as usize, radius);
     Ok(BlurredWallpaper { pixels, w, h })
+}
+
+/// 异步壁纸抓取。抓图 + 解码 + 模糊较耗时，若放在 UI 帧线程同步执行会造成掉帧，
+/// 这里把工作搬到后台线程，只把「是否已有结果」暴露给渲染层轮询。
+///
+/// - 尺寸未变化时不会重复触发后台抓取（结果按尺寸缓存，一次消费）。
+/// - 命中已完成结果返回 `Some`（渲染层取出后置入自身像素缓存）；
+/// - 仍在抓取/失败返回 `None`，渲染层本帧退回纯色半透明底，下一帧再来取。
+pub fn request_blur(w: u32, h: u32, radius: usize) -> Option<BlurredWallpaper> {
+    static REQ: Mutex<Option<(u32, u32, usize)>> = Mutex::new(None);
+    static DONE: Mutex<Option<BlurredWallpaper>> = Mutex::new(None);
+
+    // 1) 有已完成且尺寸匹配的结果 → 取出并消费（清空，交给渲染层缓存）
+    {
+        let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(b) = done.take() {
+            if b.w == w && b.h == h {
+                return Some(b);
+            }
+        }
+    }
+    // 2) 尺寸变化 → 派后台线程抓取；尺寸相同 → 已在途，直接返回 None
+    let mut req = REQ.lock().unwrap_or_else(|e| e.into_inner());
+    if req.as_ref().map(|r| *r) != Some((w, h, radius)) {
+        *req = Some((w, h, radius));
+        let (rw, rh, rr) = (w, h, radius);
+        std::thread::spawn(move || {
+            // 后台线程需先初始化 COM（WIC 依赖），失败则本次抓取作废
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            if let Ok(b) = capture_blurred(rw, rh, rr) {
+                if let Ok(mut d) = DONE.lock() {
+                    *d = Some(b);
+                }
+            }
+            unsafe {
+                CoUninitialize();
+            }
+        });
+    }
+    None
 }

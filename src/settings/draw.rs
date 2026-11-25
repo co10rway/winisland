@@ -345,7 +345,10 @@ fn draw_row(cv: &mut Canvas, row: &Row, page: usize, pl: &Placed, cx: f32, cw: f
             }
             let on = if page == 0 && row.slot == 1 {
                 crate::app::with_cfg(|c| c.auto_collapse)
-            } else if page == 0 {
+            } else if page == 0 && row.slot == 2 {
+                // 打字统计开关：显示 modules.typing 的真实状态（勿读 autostart）
+                crate::app::with_cfg(|c| c.modules.typing)
+            } else if page == 0 && row.slot == 0 {
                 crate::app::with_cfg(|c| c.autostart)
             } else if page == 7 && row.slot == 1 {
                 // 桌面分区：开机自启（slot 0 的启用开关走通用 module_enabled）

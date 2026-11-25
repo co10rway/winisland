@@ -834,6 +834,12 @@ pub fn push_todo(title: &str) {
     APP.with(|a| {
         let mut b = a.borrow_mut();
         let Some(app) = b.as_mut() else { return };
+        // 上限保护：待办无界增长会拖垮落盘与渲染，超限时丢弃最旧项
+        const CAP: usize = 200;
+        if app.store.todos.len() >= CAP {
+            let drop = app.store.todos.len() + 1 - CAP;
+            app.store.todos.drain(..drop);
+        }
         app.store.todos.push(crate::store::TodoItem {
             title: title.to_string(),
             done: false,
@@ -848,6 +854,12 @@ pub fn push_schedule(date: &str, time: &str, title: &str, remind_min: u32) {
     APP.with(|a| {
         let mut b = a.borrow_mut();
         let Some(app) = b.as_mut() else { return };
+        // 上限保护：本地日程无界增长会拖垮落盘与渲染，超限时丢弃最旧项
+        const CAP: usize = 200;
+        if app.store.local_schedules.len() >= CAP {
+            let drop = app.store.local_schedules.len() + 1 - CAP;
+            app.store.local_schedules.drain(..drop);
+        }
         app.store.local_schedules.push(crate::store::LocalSchedule {
             date: date.to_string(),
             time: time.to_string(),
@@ -1167,8 +1179,25 @@ pub fn redraw() {
                     match r {
                         Ok(()) => keep_glassy = Some(g),
                         Err(e) => {
-                            diag_log(&format!("glassy: 渲染失败，回退分层自绘: {e}"));
-                            fell_back = true;
+                            let dev_lost = e
+                                .as_ref()
+                                .downcast_ref::<windows::core::Error>()
+                                .is_some_and(crate::modules::glassy::Glassy::is_device_lost);
+                            if dev_lost {
+                                // GPU 设备丢失：整条 D3D11/DComp 链已失效，重试无意义，
+                                // 立即重建链路；成功则下一帧恢复毛玻璃，失败再回退分层。
+                                diag_log(&format!("glassy: 设备丢失({e})，重建 DirectComposition 链路"));
+                                match crate::modules::glassy::Glassy::enable(hwnd, w, h) {
+                                    Ok(g2) => keep_glassy = Some(g2),
+                                    Err(e2) => {
+                                        diag_log(&format!("glassy: 重建失败，回退分层自绘: {e2}"));
+                                        fell_back = true;
+                                    }
+                                }
+                            } else {
+                                diag_log(&format!("glassy: 渲染失败，回退分层自绘: {e}"));
+                                fell_back = true;
+                            }
                         }
                     }
                 }
@@ -2161,6 +2190,13 @@ fn anim_step() {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Explorer 重启时系统广播 "TaskbarCreated"，托盘图标会被清空；
+    // 注册该消息并在收到时重新添加托盘图标，避免资源管理器重启后托盘丢失。
+    static TASKBAR_MSG: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if msg == *TASKBAR_MSG.get_or_init(|| unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) }) {
+        tray::add(hwnd);
+        return LRESULT(0);
+    }
     match msg {
         WM_TIMER => {
             if wparam.0 == TIMER_TICK {

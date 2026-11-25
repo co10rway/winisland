@@ -231,8 +231,8 @@ fn parse_body(txt: &str) -> Vec<Quote> {
 
 /// 取最近一次成功行情快照（主轮询结果 + 编辑窗口按需查询的新代码）
 pub fn snapshot() -> Vec<Quote> {
-    let mut out = shared().quotes.lock().unwrap().clone();
-    let extra = extra_quotes().lock().unwrap();
+    let mut out = shared().quotes.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let extra = extra_quotes().lock().unwrap_or_else(|e| e.into_inner());
     for q in extra.values() {
         // 主快照里已有的代码优先（主轮询数据更新），不重复追加
         if !out.iter().any(|x| x.code == q.code) {
@@ -256,7 +256,7 @@ pub fn request_lookup(code: &str) {
         return;
     }
     {
-        let mut tried = lookup_tried().lock().unwrap();
+        let mut tried = lookup_tried().lock().unwrap_or_else(|e| e.into_inner());
         if !tried.insert(pure.clone()) {
             return;
         }
@@ -265,10 +265,10 @@ pub fn request_lookup(code: &str) {
         let qs = fetch(&[full]);
         if qs.is_empty() {
             // 拉取失败允许下次再试（不把失败永久记进 tried）
-            lookup_tried().lock().unwrap().remove(&pure);
+            lookup_tried().lock().unwrap_or_else(|e| e.into_inner()).remove(&pure);
             return;
         }
-        let mut extra = extra_quotes().lock().unwrap();
+        let mut extra = extra_quotes().lock().unwrap_or_else(|e| e.into_inner());
         for q in qs {
             extra.insert(q.code.clone(), q);
         }
@@ -296,7 +296,7 @@ pub fn name_from_snapshot(code: &str) -> String {
 
 /// 清空「当天已提醒」记录（设置里改阈值后调用，让新阈值立即生效）
 pub fn reset_alerts() {
-    alerted().lock().unwrap().clear();
+    alerted().lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// 今日盈亏（加权）：Σ (现价 - 昨收) × 数量，仅统计持仓（qty>0）
@@ -327,7 +327,7 @@ pub fn next_alert() -> Option<String> {
     let quotes = snapshot();
     let items = read_items();
     let today = crate::modules::clock::today_str(&crate::modules::clock::local_time());
-    let mut seen = alerted().lock().unwrap();
+    let mut seen = alerted().lock().unwrap_or_else(|e| e.into_inner());
     for it in &items {
         // 每支股票独立阈值：0 = 这支不提醒
         if it.alert <= 0.0 {
@@ -396,8 +396,8 @@ pub fn spawn() {
                 // 交易时段里价格实时变，间隔秒数短；行情接口免费，拉取内容仅自选代码
                 let q = fetch(&codes);
                 if !q.is_empty() {
-                    *shared().quotes.lock().unwrap() = q;
-                    *shared().last_ts.lock().unwrap() = crate::modules::files::now_unix();
+                    *shared().quotes.lock().unwrap_or_else(|e| e.into_inner()) = q;
+                    *shared().last_ts.lock().unwrap_or_else(|e| e.into_inner()) = crate::modules::files::now_unix();
                     shared().dirty.store(true, Ordering::Relaxed);
                     BOOTSTRAPPED.store(true, Ordering::Relaxed);
                 }

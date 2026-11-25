@@ -30,6 +30,15 @@ static LAST_SYNC: AtomicI64 = AtomicI64::new(0);
 /// 后台线程完成后的重绘请求（redraw 用 thread_local，不能跨线程直接调）
 static NEED_REDRAW: AtomicBool = AtomicBool::new(false);
 
+/// RAII：离开作用域（含 panic）即复位 RUNNING 同步标志，
+/// 防止同步线程异常退出后日历被永久判定为「正在同步」而停止刷新。
+struct RunningReset;
+impl Drop for RunningReset {
+    fn drop(&mut self) {
+        RUNNING.store(false, Ordering::Relaxed);
+    }
+}
+
 fn note() -> &'static RwLock<String> {
     NOTE.get_or_init(|| RwLock::new(String::new()))
 }
@@ -87,15 +96,15 @@ pub fn init() {
             Some(ScheduleItem { time, title, ..Default::default() })
         })
         .collect();
-    *events().lock().unwrap() = items;
-    *events_day().write().unwrap() = today;
+    *events().lock().unwrap_or_else(|e| e.into_inner()) = items;
+    *events_day().write().unwrap_or_else(|e| e.into_inner()) = today;
 }
 
 /// 今天的订阅日程（跨天自动清空）
 pub fn today_items() -> Vec<ScheduleItem> {
     let today = day_str(&crate::modules::clock::local_time());
-    let mut ev = events().lock().unwrap();
-    if events_day().read().unwrap().as_str() != today {
+    let mut ev = events().lock().unwrap_or_else(|e| e.into_inner());
+    if events_day().read().unwrap_or_else(|e| e.into_inner()).as_str() != today {
         ev.clear();
         return Vec::new();
     }
@@ -105,8 +114,8 @@ pub fn today_items() -> Vec<ScheduleItem> {
 /// 离屏预览（--demo）注入演示日程；正常运行不会调用
 pub fn inject_demo(items: Vec<ScheduleItem>) {
     let today = day_str(&crate::modules::clock::local_time());
-    *events().lock().unwrap() = items;
-    *events_day().write().unwrap() = today;
+    *events().lock().unwrap_or_else(|e| e.into_inner()) = items;
+    *events_day().write().unwrap_or_else(|e| e.into_inner()) = today;
 }
 
 /// 自动刷新节流：到间隔就同步所有已启用的来源（在 UI 线程调用，只做判断）
@@ -142,6 +151,10 @@ pub fn sync_all_async(sub: &crate::config::ScheduleSub) {
     let list: Vec<(&'static str, crate::config::CalSource)> =
         sources(sub).into_iter().filter(|(_, s)| s.configured()).collect();
     std::thread::spawn(move || {
+        // RAII：无论线程正常结束还是 panic，离开作用域时都复位 RUNNING。
+        // 原先在线程末尾手动 store(false)，一旦中间 panic 就会永久卡死在 RUNNING，
+        // 导致日历从此不再同步。这里用作兜底。
+        let _reset = RunningReset;
         STATE.store(SYNC_RUN, Ordering::Relaxed);
         set_note("正在同步外部日历…");
         let st = crate::modules::clock::local_time();
@@ -183,8 +196,8 @@ pub fn sync_all_async(sub: &crate::config::ScheduleSub) {
             }
             set_note(&n);
             save_cache(&st, &items);
-            *events().lock().unwrap() = items;
-            *events_day().write().unwrap() = day_str(&st);
+            *events().lock().unwrap_or_else(|e| e.into_inner()) = items;
+            *events_day().write().unwrap_or_else(|e| e.into_inner()) = day_str(&st);
         }
         NEED_REDRAW.store(true, Ordering::Relaxed);
     });
@@ -281,12 +294,23 @@ fn parse_dt(v: &str) -> Option<(i64, i64, i64, i64, i64, bool)> {
     if b.len() < 15 || b[8] != b'T' {
         return None; // 含 VALUE=DATE 的全天事件
     }
-    let num = |s: &str| s.parse::<i64>().ok();
-    let y = num(&v[0..4])?;
-    let m = num(&v[4..6])?;
-    let d = num(&v[6..8])?;
-    let hh = num(&v[9..11])?;
-    let mm = num(&v[11..13])?;
+    // 只用字节索引 + 数字校验（不再对 str 做 v[a..b] 切片）：
+    // 不可信 ICS 输入若在日期段混入多字节字符，按字符边界切片会直接 panic。
+    let rd = |s: &[u8]| -> Option<i64> {
+        let mut n = 0i64;
+        for &c in s {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            n = n * 10 + (c - b'0') as i64;
+        }
+        Some(n)
+    };
+    let y = rd(&b[0..4])?;
+    let m = rd(&b[4..6])?;
+    let d = rd(&b[6..8])?;
+    let hh = rd(&b[9..11])?;
+    let mm = rd(&b[11..13])?;
     Some((y, m, d, hh, mm, v.ends_with('Z')))
 }
 

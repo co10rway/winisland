@@ -64,7 +64,10 @@ pub fn last_status() -> String {
 }
 
 pub fn spawn(shared: SharedMail) {
-    std::thread::spawn(move || loop {
+    std::thread::spawn(move || {
+        // 连续失败次数，用于退避，避免反复无效重试打爆服务器；成功一轮后清零
+        let mut consec_fail: u32 = 0;
+        loop {
         let cfg_all = crate::config::Config::load();
         let cfg = cfg_all.mail;
         let enabled = cfg_all.modules.mailcode;
@@ -80,25 +83,33 @@ pub fn spawn(shared: SharedMail) {
         }
         // 必须兜住 panic：poll_once 里任何一处切片/解析崩溃都会让线程直接退出，
         // 之后再也不轮询（表现为「诊断停在某个时间、收到邮件却不通知」）。
-        // 用 catch_unwind 把每轮包起来，出错只跳过这一轮，30 秒后照常重试。
+        // 用 catch_unwind 把每轮包起来，出错只跳过这一轮，稍后照常重试。
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             poll_once(&cfg, &shared)
         }));
         match result {
             Ok(Ok(diag)) => {
+                consec_fail = 0;
                 let wait = cfg.poll_seconds.clamp(10, 600) as u64;
                 // 状态里带上拉取诊断，用户能直接看到监听是否在跑、拉到几封、卡在哪
                 set_status(&shared, format!("监听中 · 每 {wait} 秒 · {diag}"));
                 std::thread::sleep(Duration::from_secs(wait));
             }
             Ok(Err(e)) => {
-                set_status(&shared, format!("连接失败：{e}（30 秒后重试）"));
-                std::thread::sleep(Duration::from_secs(30));
+                consec_fail = consec_fail.saturating_add(1);
+                // 退避：30s → 60s → 120s → … 封顶 10 分钟，成功一轮后重置，
+                // 避免凭据错误/服务器拒连时持续高频打爆服务器。
+                let backoff = Duration::from_secs(30u64.saturating_mul(1u64 << consec_fail.min(5)).min(600));
+                set_status(&shared, format!("连接失败：{e}（{backoff:?} 后重试）"));
+                std::thread::sleep(backoff);
             }
             Err(_) => {
-                set_status(&shared, "内部解析异常，本轮跳过（30 秒后重试）");
-                std::thread::sleep(Duration::from_secs(30));
+                consec_fail = consec_fail.saturating_add(1);
+                let backoff = Duration::from_secs(30u64.saturating_mul(1u64 << consec_fail.min(5)).min(600));
+                set_status(&shared, format!("内部解析异常，本轮跳过（{backoff:?} 后重试）"));
+                std::thread::sleep(backoff);
             }
+        }
         }
     });
 }
@@ -117,8 +128,14 @@ fn connect(cfg: &crate::config::Mail) -> Result<ImapConn<TlsStream>, String> {
     let tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let tcp = std::net::TcpStream::connect((cfg.imap_host.trim(), cfg.imap_port))
-        .map_err(|e| format!("无法连接 {}:{} —— {e}", cfg.imap_host.trim(), cfg.imap_port))?;
+    let tcp = std::net::TcpStream::connect_timeout(
+        &std::net::ToSocketAddrs::to_socket_addrs(&(cfg.imap_host.trim(), cfg.imap_port))
+            .map_err(|e| format!("无法解析 {}:{} —— {e}", cfg.imap_host.trim(), cfg.imap_port))?
+            .next()
+            .ok_or_else(|| format!("无法解析 {}:{}（无地址）", cfg.imap_host.trim(), cfg.imap_port))?,
+        Duration::from_secs(10),
+    )
+    .map_err(|e| format!("无法连接 {}:{}（10 秒超时）—— {e}", cfg.imap_host.trim(), cfg.imap_port))?;
     tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(20))).ok();
     let tls = rustls::ClientConnection::new(Arc::new(tls_config), server_name)
@@ -286,11 +303,22 @@ fn poll_once(cfg: &crate::config::Mail, shared: &SharedMail) -> Result<String, S
             s.latest = Some(mc);
             s.seq = s.seq.saturating_add(1);
         }
-    } else if let Ok(mut s) = shared.lock() {
+    } else {
         // 没有新验证码时保留已有展示内容，不覆盖
-        if s.latest.is_none() {
+        // 先判断是否需要兜底，在锁外读盘（避免持 SharedMail 锁做磁盘 IO）
+        let en = shared
+            .lock()
+            .ok()
+            .map(|s| s.latest.is_none())
+            .unwrap_or(false);
+        if en {
             // 用 store 里可能存在的历史值兜底（不含则空）
-            s.latest = crate::store::Store::load().mail_code.clone();
+            let hist = crate::store::Store::load().mail_code.clone();
+            if let Ok(mut s) = shared.lock() {
+                if s.latest.is_none() {
+                    s.latest = hist;
+                }
+            }
         }
     }
 

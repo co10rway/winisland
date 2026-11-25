@@ -279,21 +279,23 @@ impl Canvas {
     fn ensure_blur(&mut self, g: &crate::modules::glassy::Glassy, w: u32, h: u32) {
         // 半径 12：保留可见的壁纸纹理，呈现通透磨砂感（原 Acrylic 配方）。
         let radius: usize = 12;
-        // 1) 像素缓存：尺寸不够时重新抓取（放大 1.2 倍减少重抓次数）
+        // 1) 像素缓存：尺寸不够时触发（后台）抓取。抓图/解码/模糊在后台线程执行，
+        //    不在 UI 帧线程同步阻塞；结果就绪后的下一帧取到并建位图。
         if self.blur_pixels.is_empty() || w > self.blur_pw || h > self.blur_ph {
             let cw = (w * 6 / 5).max(w + 16);
             let ch = (h * 6 / 5).max(h + 16);
-            match crate::modules::wallpaper::capture_blurred(cw, ch, radius) {
-                Ok(b) => {
+            match crate::modules::wallpaper::request_blur(cw, ch, radius) {
+                Some(b) => {
                     self.blur_pixels = b.pixels;
                     self.blur_pw = b.w;
                     self.blur_ph = b.h;
                     self.has_blur = true;
                     self.blur_bmp_gen = 0; // 强制重建位图
                 }
-                Err(_) => {
+                // 仍在后台抓取 / 失败：本帧退回纯色半透明底，下一帧再来取。
+                None => {
                     self.has_blur = false;
-                    return;
+                    return; // 无像素可上传，直接返回，下帧重试
                 }
             }
         }

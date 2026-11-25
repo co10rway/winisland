@@ -603,7 +603,16 @@ fn icon_of(name: &str) -> isize {
         }
     };
     let h = if ok != 0 { fi.hIcon.0 as isize } else { 0 };
-    ICONS.with(|m| m.borrow_mut().insert(name.to_string(), h));
+    let old = ICONS.with(|m| m.borrow_mut().insert(name.to_string(), h));
+    // 缓存命中已有旧图标（同名校验失败后被替换）：先销毁旧的 HICON，
+    // 避免 SHGetFileInfoW + SHGFI_ICON 返回的句柄永不释放而泄漏 GDI 图标。
+    if let Some(old) = old {
+        if old != 0 && old != h {
+            unsafe {
+                let _ = DestroyIcon(HICON(old as *mut core::ffi::c_void));
+            }
+        }
+    }
     h
 }
 
@@ -904,6 +913,17 @@ fn teardown() {
                 }
             }
         }
+    });
+    // 释放所有懒加载缓存的桌面项 HICON（GDI 图标句柄）
+    ICONS.with(|m| {
+        for h in m.borrow().values() {
+            if *h != 0 {
+                unsafe {
+                    let _ = DestroyIcon(HICON(*h as *mut core::ffi::c_void));
+                }
+            }
+        }
+        m.borrow_mut().clear();
     });
 }
 

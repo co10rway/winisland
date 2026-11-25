@@ -56,7 +56,13 @@ pub fn set_text(hwnd: HWND, text: &str) -> bool {
             }
             std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
             let _ = GlobalUnlock(h);
-            Some(SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0))).is_ok())
+            // 成功后系统接管句柄（不释放）；失败时 ownership 回到我们手上，必须释放，
+            // 否则每次写入失败都会泄漏一块 HGLOBAL。
+            let set_ok = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0))).is_ok();
+            if !set_ok {
+                let _ = GlobalFree(Some(h));
+            }
+            Some(set_ok)
         })()
         .unwrap_or(false);
         let _ = CloseClipboard();

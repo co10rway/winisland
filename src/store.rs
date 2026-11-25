@@ -100,10 +100,32 @@ impl Store {
     /// 与 `load()` 相同，但解析失败时返回 `None`，供「合并磁盘字段」场景区分
     /// 「磁盘上没有邮件状态」和「文件正在被后台写入、暂时读坏了」——
     /// 后者若当成空状态合并，会反而把 UID 水位清掉。
+    ///
+    /// 解析失败（JSON 损坏）时**绝不静默清空**：先保留损坏现场（.bak 若尚不存在
+    /// 则先把损坏文件拷贝留底），再尝试从 .bak 恢复最近一次完好版本。
     pub fn try_load() -> Option<Store> {
         let p = crate::config::data_path();
         let txt = std::fs::read_to_string(&p).ok()?;
-        serde_json::from_str::<Store>(&txt).ok()
+        match serde_json::from_str::<Store>(&txt) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("[winisland] data.json 解析失败: {e}");
+                let bk = p.with_extension("json.bak");
+                // .bak 恒为「上次完好版本」；仅在 bak 不存在时才用损坏文件留底，
+                // 避免把坏内容覆盖掉原有备份。
+                if !bk.exists() {
+                    let _ = std::fs::copy(&p, &bk);
+                }
+                if let Ok(bt) = std::fs::read_to_string(&bk) {
+                    if let Ok(s) = serde_json::from_str::<Store>(&bt) {
+                        eprintln!("[winisland] 已从 {bk:?} 恢复 data.json");
+                        return Some(s);
+                    }
+                }
+                // 无可用备份：退回空 Store；损坏现场已留底可人工排查。
+                None
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -113,6 +135,7 @@ impl Store {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
+        rotate_backup(&p);
         if let Ok(txt) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(&p, txt);
         }
@@ -136,6 +159,7 @@ impl Store {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
+        rotate_backup(&p);
         if let Ok(txt) = serde_json::to_string_pretty(&merged) {
             let _ = std::fs::write(&p, txt);
         }
@@ -171,6 +195,17 @@ impl Store {
         if self.sched_ack.len() > 200 {
             let cut = self.sched_ack.len() - 200;
             self.sched_ack.drain(0..cut);
+        }
+    }
+}
+
+/// 写盘前把现有 data.json 轮转到 .bak（仅在当前文件仍可解析时），
+/// 使 .bak 恒为「上一次成功保存的完好版本」。若写入中途崩溃致 data.json 损坏，
+/// 启动时即可从 .bak 恢复，避免整份数据丢失。
+fn rotate_backup(p: &std::path::Path) {
+    if let Ok(txt) = std::fs::read_to_string(p) {
+        if serde_json::from_str::<Store>(&txt).is_ok() {
+            let _ = std::fs::copy(p, p.with_extension("json.bak"));
         }
     }
 }
